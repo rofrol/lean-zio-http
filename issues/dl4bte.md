@@ -3,3 +3,7 @@ Confirm from the server the connection state the worst-case memory scenario meas
 Seen in item byurlg (review rounds 20261116-173605-0774 and 20261116-174223-e47d, sol): `bench/boundary`'s scenario `memoryFull` (bench/boundary/main.go) infers each connection's state at the RSS sample from socket queues read with lsof: before it, the server has read all 8,192 bytes; after it, the server has not sent all responses. That does not exclude a connection whose bytes arrived in two receives, the second taken from the socket but not yet handed to Lean at the sample (it then holds the bytes in the loop's receive buffer and no response). README.md, "Memory", states this caveat.
 
 Question: should the server get a test setting that acknowledges each connection's state (phase, buffered length, response length) so the scenario establishes it before and through the sample? Options: a trace line per state change under a new flag (costs a zig/glue/Lean change and must not itself allocate per operation, unlike --trace) | keep the caveat as stated.
+
+Recommendation (consult round 20261116-183449-f682, sol, under the user's delegation of 2026-11-16): keep the caveat now; server instrumentation needs your approval, and a trace line alone would not show the state persists through the sample.
+Question: Should the server get a test setting that acknowledges each connection's state?
+Options: keep the caveat | add the acknowledged state under a new flag
