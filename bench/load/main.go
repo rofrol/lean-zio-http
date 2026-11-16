@@ -5,6 +5,16 @@
 // elapsed until the last connection finished its outstanding request. A
 // server that stalls keeps the run from ending; that is a failure to trace,
 // never a result.
+//
+// The connections are opened before the measurement, which therefore excludes
+// connection setup: each connection sends one warm-up request (checked like
+// every other) and waits for its response, the event that shows the server
+// accepted it, with at most setupWindow connections awaiting that first
+// response at a time; the clock starts once every connection has answered.
+// The window keeps the burst of new connections within the listen queue of
+// the machine the load runs on: macOS holds at most 128 unaccepted connections
+// (kern.ipc.somaxconn) and resets the rest (README, "The dusty failure at 256
+// connections").
 package main
 
 import (
@@ -19,6 +29,10 @@ import (
 	"time"
 )
 
+// setupWindow: the most connections awaiting their warm-up response at once,
+// the listen queue's capacity on macOS (kern.ipc.somaxconn = 128).
+const setupWindow = 128
+
 func main() {
 	url := flag.String("url", "", "URL to request")
 	c := flag.Int("c", 64, "connections")
@@ -27,39 +41,57 @@ func main() {
 	flag.Parse()
 	expected := []byte(*want)
 
-	tr := &http.Transport{MaxIdleConnsPerHost: *c, MaxConnsPerHost: *c, DisableCompression: true}
-	// Redirects are not followed: a 3xx is a failure, like any status but 200.
-	cl := &http.Client{Transport: tr, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	// get sends one request on cl and returns why it failed, or "".
+	get := func(cl *http.Client) string {
+		r, err := cl.Get(*url)
+		if err != nil {
+			return err.Error()
+		}
+		body, err := io.ReadAll(r.Body)
+		r.Body.Close()
+		switch {
+		case err != nil:
+			return "reading body: " + err.Error()
+		case r.StatusCode != 200:
+			return fmt.Sprintf("status %d", r.StatusCode)
+		case !bytes.Equal(body, expected):
+			return fmt.Sprintf("unexpected body %q", body)
+		}
+		return ""
+	}
 
 	var mu sync.Mutex
 	var lat []time.Duration
 	var failures []string
-	start := time.Now()
-	end := start.Add(*d)
-	var wg sync.WaitGroup
+	window := make(chan struct{}, setupWindow)
+	var opened, done sync.WaitGroup
+	measuring := make(chan struct{})
+	var end time.Time // written before measuring is closed
 	for i := 0; i < *c; i++ {
-		wg.Add(1)
+		opened.Add(1)
+		done.Add(1)
 		go func() {
-			defer wg.Done()
+			defer done.Done()
+			// Each connection has its own transport, so that the warm-up
+			// request opens this connection and no later request takes it
+			// over from another one.
+			cl := &http.Client{
+				Transport: &http.Transport{MaxIdleConnsPerHost: 1, MaxConnsPerHost: 1, DisableCompression: true},
+				// Redirects are not followed: a 3xx is a failure, like any status but 200.
+				CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+			}
+			window <- struct{}{}
+			fail := get(cl)
+			<-window
+			if fail != "" {
+				fail = "warm-up: " + fail
+			}
+			opened.Done()
+			<-measuring
 			var l []time.Duration
-			var fail string
 			for fail == "" && time.Now().Before(end) {
 				t := time.Now()
-				r, err := cl.Get(*url)
-				if err != nil {
-					fail = err.Error()
-					break
-				}
-				body, err := io.ReadAll(r.Body)
-				r.Body.Close()
-				switch {
-				case err != nil:
-					fail = "reading body: " + err.Error()
-				case r.StatusCode != 200:
-					fail = fmt.Sprintf("status %d", r.StatusCode)
-				case !bytes.Equal(body, expected):
-					fail = fmt.Sprintf("unexpected body %q", body)
-				default:
+				if fail = get(cl); fail == "" {
 					l = append(l, time.Since(t))
 				}
 			}
@@ -71,7 +103,11 @@ func main() {
 			mu.Unlock()
 		}()
 	}
-	wg.Wait()
+	opened.Wait()
+	start := time.Now()
+	end = start.Add(*d)
+	close(measuring)
+	done.Wait()
 	elapsed := time.Since(start)
 	if len(failures) > 0 {
 		fmt.Printf("FAILED: %d connections failed, first: %s\n", len(failures), failures[0])

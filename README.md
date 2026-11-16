@@ -367,7 +367,12 @@ lock is released: the query is answered, then `stopped` and status 0).
 Reading the numbers: the load generator runs on the same machine, so at 64
 and more connections it is the limit; compare the 1-connection rows and the
 CPU per request. The servers differ in features and limits (above), and
-closed-loop latency hides queueing under overload. Acceptance runs belong on
+closed-loop latency hides queueing under overload. The numbers exclude
+connection setup: `bench/load` opens every connection with one warm-up
+request before the clock starts (item vma67w, at the end of "The dusty
+failure at 256 connections" below); only the server CPU per request still
+includes those warm-up requests, `bench.sh` samples it around the whole run,
+at most 256 requests against hundreds of thousands. Acceptance runs belong on
 Linux with HttpArena's tooling (item 53rwgc).
 
 ## `Std.Http.Protocol.H1` compared with the hand-written parser (item 7bccgi)
@@ -573,12 +578,20 @@ Evidence (2026-11-16, diagnostic scripts outside the repository, not tests):
 What it means for the numbers: a run that passed had no reset, so these
 resets did not bias dusty's or Go's numbers from runs that passed (the
 caveats under "Reading the numbers" above still apply to them). `bench.sh`
-still fails at 256 connections now and then for this reason (in the loop
-above, about one run in four for dusty and one in ten for Go): of its two
-runs for this item, the first passed and the second failed at dusty c=256
-with `read: connection reset by peer` on 4 connections. Why Lean's
-loop drains the queue fast enough and dusty's does not was not traced: more
-accept loops in dusty did not remove the failures. A fix in the load generator
-(open the connections before the measurement, with at most 128 of them
-waiting for their first response at a time, a response being what shows the
-server accepted the connection) is proposed as a follow-up, not made here.
+failed at 256 connections now and then for this reason (in the loop above,
+about one run in four for dusty and one in ten for Go): of its two runs for
+this item, the first passed and the second failed at dusty c=256 with
+`read: connection reset by peer` on 4 connections. Why Lean's loop drains
+the queue fast enough and dusty's does not was not traced: more accept loops
+in dusty did not remove the failures.
+
+The fix (item vma67w): `bench/load` now opens its connections before the
+measurement. Each connection, with its own transport so that no other
+request takes it over, sends one warm-up request and waits for its response,
+the event that shows the server accepted it; at most 128 connections await
+that first response at a time, and the clock starts once every connection
+has answered. No delays or retries are involved, and the measured numbers
+exclude connection setup. With it, the same 30-iteration loop (fresh server,
+then 256 and 512 connections for 3 s; 2026-11-16) failed 0 of 30 runs at
+each count for dusty (3 accept loops) and for Go, and a c=512 run held 512
+established connections on both the generator's and Go's side.
