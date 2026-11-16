@@ -1,16 +1,9 @@
 import Serve
+import FixtureBody
 
 /-! A test server for the Zig/Lean boundary (bench/boundary): `Http.handle`'s
 framing and validation with one route, `GET /` and `HEAD /`, whose body is
-`fixtureBody`, larger than the loop's 8192-byte send buffer and no multiple of
-it, so every response takes several sends and ends with a short one. -/
-
-/-- 70,001 bytes: byte `i` is `a` + (i mod 26). bench/boundary expects exactly this. -/
-def fixtureBody : ByteArray := Id.run do
-  let mut b := ByteArray.emptyWithCapacity 70001
-  for i in [0:70001] do
-    b := b.push (97 + (i % 26).toUInt8)
-  return b
+`fixtureBody` (FixtureBody.lean). -/
 
 def fixtureRoute (buf : ByteArray) (h : Head) : Nat × ByteArray × Bool :=
   match route buf h with

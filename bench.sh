@@ -2,7 +2,10 @@
 # Builds the three servers, the checks and the load generator; runs the Lean
 # unit tests, the Zig/Lean boundary tests (bench/boundary, which start the
 # fixture server themselves) and the end-to-end checks against the Lean
-# server; then measures
+# server, each twice: with the hand-written parser (lsrv) and with the
+# toolchain's Std.Http.Protocol.H1 behind an adapter (lsrv-h1); compares the
+# two parsers' verdicts (lsrv-compare) and their cost per request
+# (lsrv-bench); then measures
 # each server: requests per second, latency, and server CPU time per request
 # at 1, 64 and 256 keep-alive connections, 10 s per run, all on this machine.
 # Any failing test, check or load run stops the script with a nonzero status.
@@ -15,7 +18,7 @@ LEAN_INCLUDE="$(cd lean && lean --print-prefix)/include"
 (cd zig && zig build -Doptimize="${ZIG_OPTIMIZE:-ReleaseSafe}" -Dlean-include="$LEAN_INCLUDE")
 # Lake does not track libzsrv.a (passed through moreLinkArgs), so drop the
 # executables to make them link against the library just built.
-rm -f lean/.lake/build/bin/lsrv lean/.lake/build/bin/lsrv-fixture
+rm -f lean/.lake/build/bin/lsrv*
 (cd lean && lake build)
 (cd dusty-hello && zig build -Doptimize=ReleaseFast)
 (cd bench/load && go build -o load .)
@@ -80,10 +83,20 @@ measure() {
 }
 
 lean/.lake/build/bin/lsrv-test
+lean/.lake/build/bin/lsrv-compare >"$tmp/compare.txt" || { cat "$tmp/compare.txt"; exit 1; }
+sed -n '1,/^## Malformed/p' "$tmp/compare.txt"
+grep -E '^[0-9]+ requests: [0-9]+ verdicts' "$tmp/compare.txt"
+lean/.lake/build/bin/lsrv-bench
 bench/boundary/boundary
+bench/boundary/boundary -fixture lean/.lake/build/bin/lsrv-fixture-h1
 start lean-zio ready lean/.lake/build/bin/lsrv 8
 bench/check/check -addr 127.0.0.1:8083
 measure lean-zio 8083
+stop
+
+start lean-h1 ready lean/.lake/build/bin/lsrv-h1 8
+bench/check/check -addr 127.0.0.1:8083
+measure lean-h1 8083
 stop
 
 start go ready bench/goserver/server

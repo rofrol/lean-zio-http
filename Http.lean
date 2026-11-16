@@ -199,7 +199,9 @@ def statusLine : Nat → ByteArray
   | 400 => "HTTP/1.1 400 Bad Request\r\n".toUTF8
   | 404 => "HTTP/1.1 404 Not Found\r\n".toUTF8
   | 413 => "HTTP/1.1 413 Content Too Large\r\n".toUTF8
+  | 414 => "HTTP/1.1 414 URI Too Long\r\n".toUTF8
   | 431 => "HTTP/1.1 431 Request Header Fields Too Large\r\n".toUTF8
+  | 505 => "HTTP/1.1 505 HTTP Version Not Supported\r\n".toUTF8
   | _ => "HTTP/1.1 501 Not Implemented\r\n".toUTF8
 
 def hdrTextPlain := "Content-Type: text/plain; charset=utf-8\r\n".toUTF8

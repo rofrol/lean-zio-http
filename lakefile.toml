@@ -1,9 +1,9 @@
 name = "lsrv"
-defaultTargets = ["lsrv", "lsrv-fixture", "lsrv-test"]
+defaultTargets = ["lsrv", "lsrv-fixture", "lsrv-test", "lsrv-h1", "lsrv-fixture-h1", "lsrv-bench", "lsrv-compare"]
 
 [[lean_lib]]
 name = "Http"
-roots = ["Http", "Conn", "Serve"]
+roots = ["Http", "Conn", "Serve", "H1Adapter", "FixtureBody", "Corpus"]
 
 [[lean_exe]]
 name = "lsrv"
@@ -18,3 +18,21 @@ moreLinkArgs = ["../zig/zig-out/lib/libzsrv.a"]
 [[lean_exe]]
 name = "lsrv-test"
 root = "Test"
+
+[[lean_exe]]
+name = "lsrv-h1"
+root = "MainH1"
+moreLinkArgs = ["../zig/zig-out/lib/libzsrv.a"]
+
+[[lean_exe]]
+name = "lsrv-fixture-h1"
+root = "FixtureH1"
+moreLinkArgs = ["../zig/zig-out/lib/libzsrv.a"]
+
+[[lean_exe]]
+name = "lsrv-bench"
+root = "Bench"
+
+[[lean_exe]]
+name = "lsrv-compare"
+root = "Compare"
