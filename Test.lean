@@ -58,7 +58,7 @@ def splitHead : String :=
 /-- An adapter under test, with `App.Hello` unless a case names another application. -/
 structure Adapter where
   name : String
-  handle : Handler → Nat → ByteArray → Reply
+  handle : Response.OwnFields → Handler → Nat → ByteArray → Reply
 
 def h1 : Adapter := { name := "H1", handle := H1Adapter.handle }
 def hand : Adapter := { name := "hand-written", handle := HandParser.handle }
@@ -183,7 +183,7 @@ def expectClose (what : String) (a : Conn.Action) : Check Unit :=
 partial send, the rest of the send, the peer closing, and an event after
 close. -/
 def connScenario (ad : Adapter) : Check Unit := do
-  let h := ad.handle App.Hello.app 0
+  let h := ad.handle {} App.Hello.app 0
   let w := s!"conn {ad.name}"
   let part1 := bytes "GET / HTTP/1.1\r\nHo"
   let (s1, a1) := Conn.step h Conn.initial (.received part1)
@@ -209,7 +209,7 @@ def connScenario (ad : Adapter) : Check Unit := do
 sent once, also across a partial send and a body arriving in two parts, and
 the final response follows the body. -/
 def continueScenario : Check Unit := do
-  let h := H1Adapter.handle App.Fixture.app 0
+  let h := H1Adapter.handle {} App.Fixture.app 0
   let head := bytes "POST /echo HTTP/1.1\r\nHost: a\r\nExpect: 100-continue\r\nContent-Length: 5\r\n\r\n"
   let (s1, a1) := Conn.step h Conn.initial (.received head)
   let some (interim, _) ← expectSend "100-continue: the head" a1 | return
@@ -232,7 +232,7 @@ def continueScenario : Check Unit := do
 head over `maxHeadBytes` followed by the largest body, in receives of 1460
 bytes, is answered with 431 before the buffer fills, not closed silently. -/
 def limitScenario (ad : Adapter) : Check Unit := do
-  let h := ad.handle App.Hello.app 0
+  let h := ad.handle {} App.Hello.app 0
   let b := bytes (splitHead ++ big maxBodyBytes)
   let mut s := Conn.initial
   let mut off := 0
@@ -250,7 +250,7 @@ def limitScenario (ad : Adapter) : Check Unit := do
 
 /-- The shutdown: a declined receive closes the connection in every live phase. -/
 def refusedScenario : Check Unit := do
-  let h := H1Adapter.handle App.Hello.app 0
+  let h := H1Adapter.handle {} App.Hello.app 0
   expectClose "refused while reading" (Conn.step h Conn.initial .refused).2
   let (s, _) := Conn.step h Conn.initial (.received (bytes "GET / HTTP/1.1\r\nHo"))
   expectClose "refused with a partial request" (Conn.step h s .refused).2
@@ -268,7 +268,7 @@ then sends the response; a request pipelined behind it waits in the buffer
 (no receive while querying) and is answered right after. A lost connection
 answers 503; a failure report while querying closes. -/
 def queryScenario : Check Unit := do
-  let h := H1Adapter.handle App.Db.app 0
+  let h := H1Adapter.handle {} App.Db.app 0
   let req := "GET /chain HTTP/1.1\r\nHost: a\r\n\r\n"
   let next := "GET / HTTP/1.1\r\nHost: a\r\n\r\n"
   let (s1, a1) := Conn.step h Conn.initial (.received (bytes (req ++ next)))
@@ -295,7 +295,7 @@ def queryScenario : Check Unit := do
 
 def adapterCases (ad : Adapter) : Check Unit := do
   for c in cases do
-    let r := ad.handle c.app 0 (bytes c.request)
+    let r := ad.handle {} c.app 0 (bytes c.request)
     let (kind, status) := if ad.name == hand.name then c.hand.getD (c.kind, c.status) else (c.kind, c.status)
     let want := c.consumes.getD (if kind == 0 then 0 else (bytes c.request).size)
     if resultKind r != kind || statusOf r != status || consumed r != want then
@@ -303,16 +303,100 @@ def adapterCases (ad : Adapter) : Check Unit := do
   for req in framed do
     let b := bytes req
     for k in [0:b.size] do
-      if resultKind (ad.handle App.Hello.app 0 (b.extract 0 k)) != 0 then
+      if resultKind (ad.handle {} App.Hello.app 0 (b.extract 0 k)) != 0 then
         fail s!"{ad.name} prefix {k} of {repr req} did not ask for more bytes"
   -- HEAD: the GET's Content-Length, no body.
-  let r := responseOf (ad.handle App.Hello.app 0 (bytes "HEAD / HTTP/1.1\r\nHost: a\r\n\r\n"))
+  let r := responseOf (ad.handle {} App.Hello.app 0 (bytes "HEAD / HTTP/1.1\r\nHost: a\r\n\r\n"))
   if !r.endsWith "\r\nContent-Length: 13\r\n\r\n" then fail s!"{ad.name} HEAD: {repr r}"
+
+/-! ## Header fields on the server's own responses (`Response.OwnFields`) -/
+
+/-- Two own fields, one name repeated in another spelling, kept in order. -/
+def own : Response.OwnFields :=
+  { fields := #[("X-Robots-Tag", "noindex, nofollow"), ("x-robots-tag", "noarchive")] }
+
+/-- The statuses only the server writes in `cases`: the parsers' rejections,
+CONNECT's 501 and the 500 that replaces an application's response. -/
+def ownStatuses : List String := ["400", "413", "414", "431", "500", "501", "505"]
+
+/-- With `own`, every case answers the same bytes as without, except that a
+response the server writes itself carries `own`'s fields right after its
+Content-Type; the application's responses and the interim `100 Continue` are
+unchanged. -/
+def ownFieldCases (ad : Adapter) : Check Unit := do
+  let lines := String.join (own.fields.toList.map fun (n, v) => s!"{n}: {v}\r\n")
+  let ct := "Content-Type: text/plain; charset=utf-8\r\n"
+  for c in cases do
+    let r0 := responseOf (ad.handle {} c.app 0 (bytes c.request))
+    let r1 := responseOf (ad.handle own c.app 0 (bytes c.request))
+    let status := ((statusOf (ad.handle {} c.app 0 (bytes c.request))).splitOn " ")[1]?.getD ""
+    let want := if ownStatuses.contains status then r0.replace ct (ct ++ lines) else r0
+    if ownStatuses.contains status && !r0.contains ct then fail s!"{ad.name} {c.name}: no Content-Type in {repr r0}"
+    if r1 != want then fail s!"{ad.name} own fields, {c.name}: {repr r1}, want {repr want}"
+  -- The status does not decide: the application's own 400, 500 and 501 carry no own fields.
+  for status in [400, 500, 501] do
+    let app : Handler := fun _ => .done { status, headers := #[Response.contentType], body := "x".toUTF8 }
+    let req := bytes "GET / HTTP/1.1\r\nHost: a\r\n\r\n"
+    let r0 := responseOf (ad.handle {} app 0 req)
+    let r1 := responseOf (ad.handle own app 0 req)
+    if !r0.startsWith s!"HTTP/1.1 {status} " || !r0.endsWith "\r\n\r\nx" || r1 != r0 then
+      fail s!"{ad.name} own fields, the application's {status}: {repr r1}"
+
+/-- `n` bytes of `c`, a character of `w` bytes in UTF-8. -/
+def fill (c : Char) (w n : Nat) : String := String.ofList (List.replicate (n / w) c)
+
+/-- The rule on own fields, at its boundaries; the size bound keeps every
+response of the server's own within `maxResponseBytes`. -/
+def ownFieldRule : Check Unit := do
+  -- Written `XY: ` value CRLF: 6 bytes besides the value.
+  let atCap := Response.maxOwnFieldBytes - 6
+  let valid : List (String × Array (String × String)) := [
+    ("none", #[]),
+    ("a field at the byte cap", #[("XY", fill 'a' 1 atCap)]),
+    ("two-byte characters at the byte cap", #[("XY", fill 'ą' 2 atCap)]),
+    ("obs-text and HTAB inside", #[("X", "a\tbé")]),
+    ("a repeated name", #[("Set-Cookie", "a=1"), ("set-cookie", "b=2")])]
+  let invalid : List (String × Array (String × String)) := [
+    ("a byte over the cap", #[("XY", fill 'a' 1 (atCap + 1))]),
+    ("a two-byte character over the cap", #[("XY", fill 'ą' 2 (atCap + 2))]),
+    ("two fields over the cap together", #[("XY", fill 'a' 1 (atCap / 2)), ("XY", fill 'a' 1 (atCap / 2))]),
+    ("CR LF in a value", #[("X", "a\r\nY: b")]),
+    ("LF in a value", #[("X", "a\nb")]),
+    ("NUL in a value", #[("X", "a" ++ String.singleton (Char.ofNat 0) ++ "b")]),
+    ("DEL in a value", #[("X", "a" ++ String.singleton (Char.ofNat 127))]),
+    ("a leading space", #[("X", " a")]),
+    ("a trailing tab", #[("X", "a\t")]),
+    ("an empty name", #[("", "a")]),
+    ("a space in a name", #[("X Y", "a")]),
+    ("CR LF in a name", #[("X\r\nY", "a")]),
+    ("Content-Type", #[("content-TYPE", "text/html")]),
+    ("an owned field", #[("Connection", "keep-alive")]),
+    ("Date", #[("DATE", "x")])]
+  for (what, fs) in valid do
+    if !Response.ownFieldsValid fs then fail s!"own fields, {what}: rejected"
+  for (what, fs) in invalid do
+    if Response.ownFieldsValid fs then fail s!"own fields, {what}: accepted"
+  -- Every response the server writes itself fits the bounded output with
+  -- fields of exactly the cap, at the widest Date (the year 9999).
+  let fs := #[("XY", fill 'a' 1 atCap)]
+  for status in [400, 413, 414, 431, 501, 505] do
+    let r := Response.write 253402300799 { status, headers := #[Response.contentType] ++ fs } true false
+    if r.size > maxResponseBytes then fail s!"own fields: {status} is {r.size} bytes"
+  let e := Response.internalError {}
+  for headOnly in [false, true] do
+    let r := Response.write 253402300799 { e with headers := e.headers ++ fs } true headOnly
+    if r.size > maxResponseBytes then fail s!"own fields: the 500 is {r.size} bytes"
+
+-- Fields the rule rejects cannot make an `OwnFields`: its `valid` is then false.
+example : Response.ownFieldsValid #[("X", "a\r\nY: b")] = false := by decide +kernel
+example : Response.ownFieldsValid #[("Content-Type", "text/html")] = false := by decide +kernel
 
 def main : IO UInt32 := do
   let ((), failures) ← (do
+    ownFieldRule
     for ad in [h1, hand] do
       adapterCases ad
+      ownFieldCases ad
       connScenario ad
       limitScenario ad
     continueScenario

@@ -33,7 +33,10 @@ structure Request where
 Connection, writes no body for HEAD, and replaces a response that breaks
 `Server.Response.check` (a status outside 200-599, a field it owns or with
 invalid bytes, a body with 204, 205 or 304, or more than `maxResponseBytes` in
-all) by 500. A CONNECT request gets 501 and never reaches the application. -/
+all) by 500. A CONNECT request gets 501 and never reaches the application.
+Those responses, and the parser's rejections, carry the header fields the
+composition root gives the adapter (`Server.Response.OwnFields`), not this
+response's. -/
 structure Response where
   status : Nat
   /-- Extra header fields, such as Content-Type. -/

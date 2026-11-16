@@ -96,8 +96,8 @@ def fragmentCorpus : List (String × String) :=
 def main : IO UInt32 := do
   let mut failures := 0
   let adapters : List (String × (ByteArray → Nat) × (ByteArray → Reply)) :=
-    [("hand-written", handParse, HandParser.handle App.Hello.app 0),
-     ("H1", h1Parse, H1Adapter.handle App.Hello.app 0)]
+    [("hand-written", handParse, HandParser.handle {} App.Hello.app 0),
+     ("H1", h1Parse, H1Adapter.handle {} App.Hello.app 0)]
   IO.println "request | bytes | parser | parse ns | parse allocs | handle ns | handle allocs"
   for (name, req) in Corpus.requests do
     let b := req.toUTF8

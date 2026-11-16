@@ -180,11 +180,11 @@ def toRequest (buf : ByteArray) (h : Head) : Server.Request :=
     body := buf.extract h.bodyStart (h.bodyStart + h.contentLength) }
 
 /-- `Server.H1Adapter.handle` with this parser. -/
-def handle (app : Handler) (now : Nat) (buf : ByteArray) : Reply :=
+def handle (own : Server.Response.OwnFields) (app : Handler) (now : Nat) (buf : ByteArray) : Reply :=
   match parse buf with
   | .needMore => .needMore
-  | .bad status => .respond buf.size (Server.Response.error now status) true
+  | .bad status => .respond buf.size (Server.Response.error own now status) true
   | .ok h =>
-    Server.Response.reply (h.bodyStart + h.contentLength) (Server.Response.answer now app (toRequest buf h) h.close)
+    Server.Response.reply (h.bodyStart + h.contentLength) (Server.Response.answer own now app (toRequest buf h) h.close)
 
 end Server.HandParser

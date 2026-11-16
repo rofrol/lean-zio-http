@@ -129,8 +129,40 @@ def write (now : Nat) (r : Response) (close headOnly : Bool) : ByteArray := Id.r
   o := o.append crlf2
   return if headOnly || noBody r.status then o else o.append r.body
 
-def internalError : Response :=
-  { status := 500, headers := #[("Content-Type", "text/plain; charset=utf-8")],
+/-! ## Header fields on the library's own responses -/
+
+/-- The most bytes the own fields take written (`Name: value` and CRLF each).
+Every response the library writes itself then fits `maxResponseBytes`, so
+none becomes a silent close (`lsrv-test` writes each with fields of exactly
+this size). -/
+def maxOwnFieldBytes : Nat := 4096
+
+/-- Whether `fs` may go on the library's own responses: valid names and values
+as `check` requires of the application's fields (so no CR, LF or NUL), none
+the writer owns, no Content-Type (the library sets its own), and at most
+`maxOwnFieldBytes` written. Names keep their spelling and order; a name may
+repeat. -/
+def ownFieldsValid (fs : Array (String × String)) : Bool :=
+  fs.all (fun (n, v) => validName n && validValue v &&
+    !ownedFields.contains n.toLower && n.toLower != "content-type") &&
+  fs.foldl (fun a (n, v) => a + n.utf8ByteSize + v.utf8ByteSize + 4) 0 ≤ maxOwnFieldBytes
+
+/-- Header fields the server adds to every final response it writes itself,
+below the application: the parser's rejections (`error`), the 501 for CONNECT
+and the 500 that replaces an invalid application response (`render`). Not
+the application's responses, nor the interim `100 Continue`. The composition
+root chooses them and passes them to the adapter, e.g.
+`server_exports (Server.H1Adapter.handle { fields := #[("X-Robots-Tag",
+"noindex, nofollow")] } app)`; `valid` is proved by the kernel when the root
+is built, so fields that break `ownFieldsValid` fail the build. -/
+structure OwnFields where
+  fields : Array (String × String) := #[]
+  valid : ownFieldsValid fields = true := by decide +kernel
+
+def contentType : String × String := ("Content-Type", "text/plain; charset=utf-8")
+
+def internalError (own : OwnFields) : Response :=
+  { status := 500, headers := #[contentType] ++ own.fields,
     body := "500 internal server error\n".toUTF8 }
 
 /-- Whether the application's response may be written as it is. -/
@@ -141,20 +173,20 @@ def check (r : Response) : Bool :=
   -- 205 carries no content either; it is written with `Content-Length: 0` (RFC 9110 15.3.6).
   (r.status != 205 || r.body.isEmpty)
 
-/-- The bytes for the application's response `r`, or for `internalError` when
+/-- The bytes for the application's response `r`, or for `internalError own` when
 `r` fails `check` or its bytes exceed `maxResponseBytes`; the second component
 says whether the connection closes after it (always after a 500 of ours). -/
-def render (now : Nat) (r : Response) (close headOnly : Bool) : ByteArray × Bool :=
+def render (own : OwnFields) (now : Nat) (r : Response) (close headOnly : Bool) : ByteArray × Bool :=
   if check r then
     let bytes := write now r close headOnly
     if bytes.size ≤ maxResponseBytes then (bytes, close)
-    else (write now internalError true headOnly, true)
-  else (write now internalError true headOnly, true)
+    else (write now (internalError own) true headOnly, true)
+  else (write now (internalError own) true headOnly, true)
 
-/-- The response to a request the parser rejected with `status`; the
-connection always closes after it. -/
-def error (now : Nat) (status : Nat) : ByteArray :=
-  write now { status, headers := #[("Content-Type", "text/plain; charset=utf-8")] } true false
+/-- The response to a request the parser rejected with `status`, with the
+own fields; the connection always closes after it. -/
+def error (own : OwnFields) (now : Nat) (status : Nat) : ByteArray :=
+  write now { status, headers := #[contentType] ++ own.fields } true false
 
 /-- The bytes answering a request the adapter framed, and whether the
 connection closes after them, once the application's queries are answered: the
@@ -163,9 +195,9 @@ application's response (`render`; no body for HEAD), except that CONNECT gets
 connection into a tunnel (RFC 9110 9.3.6), which this server does not
 implement, so no `Response` may stand for one. The Date header is the time
 the request was framed. -/
-def answer (now : Nat) (app : Handler) (req : Request) (close : Bool) : Await (ByteArray × Bool) :=
-  if req.method == "CONNECT" then .done (error now 501, true)
-  else (app req).map fun r => render now r close (req.method == "HEAD")
+def answer (own : OwnFields) (now : Nat) (app : Handler) (req : Request) (close : Bool) : Await (ByteArray × Bool) :=
+  if req.method == "CONNECT" then .done (error own now 501, true)
+  else (app req).map fun r => render own now r close (req.method == "HEAD")
 
 /-- The adapter's reply for a framed request of `consumed` bytes: the response
 at once, or the query it waits for. -/

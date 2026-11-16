@@ -26,7 +26,9 @@ the requiring package. An executable that runs the transport also links
 libpq: give it `moreLinkArgs := #["-lpq"]` and put `pg_config --libdir` on
 `LIBRARY_PATH`. Its composition root imports `Server.Transport`, one adapter
 (`Server.H1Adapter`) and the application, and declares
-`server_exports (Server.H1Adapter.handle app)`; see `Main.lean`. Pin the same
+`server_exports (Server.H1Adapter.handle own app)`, where `own`
+(`Server.Response.OwnFields`, `{}` for none) holds header fields for the
+responses the server writes itself; see `Main.lean` and `Fixture.lean`. Pin the same
 Lean toolchain as `lean-toolchain` here.
 
 ## Modules

@@ -131,14 +131,15 @@ def toRequest (buf : ByteArray) (h : Request.Head) (body : ByteArray) : Server.R
     headers := h.headers.toArray.map fun (n, v) => (n.value, v.value)
     body }
 
-/-- Answers the bytes buffered on a connection with the application's `app`.
+/-- Answers the bytes buffered on a connection with the application's `app`;
+the responses the server writes itself carry `own`'s fields.
 `now` is the wall clock in Unix seconds, for the Date header. -/
-def handle (app : Handler) (now : Nat) (buf : ByteArray) : Reply :=
+def handle (own : Server.Response.OwnFields) (app : Handler) (now : Nat) (buf : ByteArray) : Reply :=
   match parse buf with
   | .needMore => .needMore
   | .awaitingBody => .continue Server.Response.continueBytes
-  | .bad status => .respond buf.size (Server.Response.error now status) true
+  | .bad status => .respond buf.size (Server.Response.error own now status) true
   | .ok h body consumed close =>
-    Server.Response.reply consumed (Server.Response.answer now app (toRequest buf h body) close)
+    Server.Response.reply consumed (Server.Response.answer own now app (toRequest buf h body) close)
 
 end Server.H1Adapter

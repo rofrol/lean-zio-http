@@ -355,7 +355,7 @@ func expectEOF(r io.Reader, what string) error {
 // expectations sends a POST with `Expect: 100-continue`, waits for the
 // interim response before sending the body, and checks the echoed body; then
 // asks for /too-big, whose body exceeds the bounded output, and expects 500
-// and the server's close.
+// with the fixture's own field X-Robots-Tag, and the server's close.
 func expectations(addr string) (int64, string, error) {
 	c, err := dial(addr)
 	if err != nil {
@@ -391,6 +391,9 @@ func expectations(addr string) (int64, string, error) {
 	io.ReadAll(resp.Body)
 	if resp.StatusCode != 500 {
 		return 2, "", fmt.Errorf("/too-big: status %d, want 500", resp.StatusCode)
+	}
+	if got := resp.Header.Values("X-Robots-Tag"); len(got) != 1 || got[0] != "noindex, nofollow" {
+		return 2, "", fmt.Errorf("/too-big: X-Robots-Tag %q, want the fixture's own field", got)
 	}
 	return 2, "", expectEOF(r2, "after the 500")
 }

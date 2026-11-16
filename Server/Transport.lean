@@ -35,7 +35,7 @@ def onAnswer (adapter : Adapter) (now : UInt64) (s : Conn.State) (r : Query.Resu
 
 set_option hygiene false in
 /-- Writes the loop's entry points for `adapter` in the executable that uses
-it: `server_exports (Server.H1Adapter.handle App.Hello.app)`. Unhygienic, so
+it: `server_exports (Server.H1Adapter.handle {} App.Hello.app)`. Unhygienic, so
 the export names reach the C symbol table as written. -/
 macro "server_exports " adapter:term : command => `(
   @[export ekk_conn_open] def connOpen (_ : UInt8) : Server.Conn.State × Server.Conn.Action :=
