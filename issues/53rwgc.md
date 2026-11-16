@@ -9,3 +9,5 @@ Run HttpArena's HTTP/1.1 profiles that the server owns with its pinned Linux scr
 Question: Where may these runs happen: on vps.frolow.dev (shared, 2 vCPUs, the production host; load tests there need the user's consent), on the 2010 MacBook (x86_64 Guix System on the LAN, 2 cores), or on a rented Linux machine?
 Options: vps.frolow.dev at a quiet hour | the 2010 MacBook | a rented machine
 Checked 2026-11-16: the handoff note forbids load tests on vps.frolow.dev without the user's consent; D2 asks for the VPS's CPU allocation.
+
+Sol (consult round 20261116-145342-a8e2) on the MacBook: useful for Linux diagnostics, not for D2 acceptance, since two cores cannot give the server two CPUs and the load generator separate cores. Recommendation: a rented machine.
