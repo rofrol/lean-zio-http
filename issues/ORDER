@@ -1,6 +1,5 @@
 ## Next, in order
 
-byurlg Measure the server's worst-case memory per connection, with full input and output at once
 xihdtw Linux pending-connection accept errors end the server process
 k6oulx Configurable header fields on the server's own error responses
 
@@ -8,6 +7,9 @@ k6oulx Configurable header fields on the server's own error responses
 
 jl63fo Point issues i35sos and tc5rsx at zig/src/pg.c instead of zig/src/glue.c
 vvxfl6 The stop notification can wake a loop that has already ended (zio Async.notify racing Loop.deinit)
+kaslrv Run the worst-case memory scenario on Linux
+dl4bte Confirm from the server the connection state the worst-case memory scenario measures
+xlto7s Attribute the per-connection memory the README's allowance does not cover
 
 ## Needs a decision
 

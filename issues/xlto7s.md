@@ -1,0 +1,5 @@
+Attribute the per-connection memory the README's allowance does not cover
+
+Seen in item byurlg: `bench/boundary`'s `memoryFull` measures 90.6 to 90.9 KiB of resident set per added connection (from 50 to 100 connections, each sending a 60,121-byte response with at least about 7,400 bytes buffered, M1, 2026-11-16). The parts README.md "Memory" names add up to about 83 KiB in that state (the loop's connection 16.6, the buffer about 7.8, the response 58.7); the other about 7.8 KiB exceeds the 2 KiB the stated bound allows for allocator and object headers. The stated bound (about 98 KiB) still holds because the buffer cannot be at `inCap` while a response is sent, but the allowance is not established.
+
+Question: should the gap be traced (allocator size classes, fragmentation from the 16 KiB initial buffer freed at the first extract, transient parse allocations) and the allowance restated? Related to es53kx (capacities). Options: trace with malloc statistics (e.g. malloc_zone_statistics) around the scenario | restate the allowance from the measurement | leave as measured.
