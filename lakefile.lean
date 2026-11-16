@@ -81,7 +81,7 @@ lean_lib App where
 lean_lib TestSupport where
   roots := #[`Corpus]
 
--- The server executables link libpq (zig/src/pg.zig, glue.c); bench.sh puts
+-- The server executables link libpq (zig/src/pg.zig, pg.c); bench.sh puts
 -- its directory (pg_config --libdir) in LIBRARY_PATH.
 @[default_target] lean_exe lsrv where
   root := `Main

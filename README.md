@@ -62,7 +62,7 @@ neither the transport nor `Std.Http`. The handler is pure: it answers
 and continues with `k` on its result (`Await` is a monad, so a handler
 writes `match ← Await.run q with ...`). This replaced `Request → Response`
 with no compatibility layer. The PostgreSQL adapter is part of the loop
-(`zig/src/pg.zig` and `zig/src/glue.c`, section "PostgreSQL"); Lean sees
+(`zig/src/pg.zig` and `zig/src/pg.c`); Lean sees
 only `Server.Query` values.
 
 - `zig/` (the transport's loop): a static library, built ReleaseSafe by
@@ -235,6 +235,21 @@ else meanwhile; the loop serves its other connections (`Conn.step_query`,
   `client_encoding=UTF8`. It must name a Unix socket directory or a
   `hostaddr`: libpq resolves a host name synchronously, which would block
   the loop.
+- **Tests.** `bench/dbcheck` runs `lsrv-db` against the private cluster.
+  What a real cluster cannot force is tested deterministically by
+  `zig build test` in `zig/` (`bench.sh` runs it). `src/pg_test.zig` runs
+  `pg.zig`'s pool on a real loop and real sockets with a scripted fake in
+  place of `pg.c`: a partial flush with both polls outstanding and the
+  write completion arriving after the slot went idle, a session ended
+  (COPY) with both polls outstanding, and synchronous chains of 10,000
+  failing queries (no slots, the database down) that stay iterative.
+  `src/pg_glue_test.c` runs `pg.c` and the real libpq against a fake
+  PostgreSQL server on a Unix socket, each reply delivered whole, a message
+  at a time and a byte at a time: command boundaries and Sync, errors,
+  COPY in and out, a transaction left open, a connection lost mid-reply.
+  A chain of queries that fail synchronously, each asked again from its
+  error, runs entirely inside the `submit` that started it: the loop serves
+  nothing else until the chain ends.
 - **Not bounded yet:** libpq gathers a whole result before the size check,
   so a query returning more than 1 MiB costs that memory until it is
   refused; a query or a connection attempt has no deadline, so a stuck

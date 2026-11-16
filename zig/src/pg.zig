@@ -1,7 +1,7 @@
 // The PostgreSQL pool of one loop: at most `size` libpq connections, owned
 // by the loop's thread and driven by its zio.ev in libpq's non-blocking mode,
 // so a query never blocks the loop. Queries and results are Lean values
-// (Server/Query.lean); glue.c makes the libpq calls and builds the
+// (Server/Query.lean); pg.c makes the libpq calls and builds the
 // results. The pool knows nothing of HTTP: a query comes with a `Waiter`
 // (embedded in the connection that asked) and its result goes to the
 // waiter's `deliver` (README, "PostgreSQL").
@@ -27,7 +27,7 @@ const zio = @import("zio");
 const ev = zio.ev;
 const os = zio.os;
 
-/// glue.c's `ekk_pg`: a libpq connection and the statements prepared on it.
+/// pg.c's `ekk_pg`: a libpq connection and the statements prepared on it.
 const Session = opaque {};
 const Lean = ?*anyopaque; // a Lean object: Server.Query or Server.Query.Result
 
