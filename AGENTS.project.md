@@ -13,12 +13,14 @@ and that the queue items about the server move here:
   queue item after item with `rr2 queue` (rr2's README, "Usage" and "The queue
   item after item"); rr2 runs the agent in its own worktree and integrates
   the result. A session does not do a queue item by hand in the main checkout.
-- An rr2 run makes every change to this repository's files. The coordinating
+- An rr2 run makes every change to this repository's files outside `issues/`;
+  every change to `issues/` goes through `rr2 issue`. The coordinating
   session does only what acts outside the repository (publishing, pushing,
   opening an upstream issue) and changes `issues/` through `rr2 issue`. An
-  item that only acts outside the repository or only changes `issues/`
-  carries the line `Done by: the coordinating session` after its title; that
-  session does it and finishes it with `rr2 issue finish ID`.
+  item that acts outside the repository, changes `issues/`, or both, and
+  changes no other file, carries the line `Done by: the coordinating session`
+  after its title; that session does it and finishes it with
+  `rr2 issue finish ID`.
 - Change `issues/` only with `rr2 issue add|move|edit|finish`, never by hand.
 
 ## Architecture map
