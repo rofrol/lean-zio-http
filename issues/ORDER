@@ -1,6 +1,5 @@
 ## Next, in order
 
-vvxfl6 The stop notification can wake a loop that has already ended (zio Async.notify racing Loop.deinit)
 ho2lwl Deinitialize a loop only after every stop notify on it has returned (zio subset contract)
 u4moqo Move the toolchain to the first nightly with lean4 PR 16417 (Std.Http RFC fixes)
 
