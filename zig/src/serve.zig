@@ -1,41 +1,74 @@
-// Spike: one zio.ev loop per thread, all accepting on one listening socket;
-// the bytes buffered on a connection go to Lean through glue.c, which frames,
-// parses and answers the request.
+// Spike: one zio.ev loop per thread, all accepting on one listening socket.
+// The loop keeps no protocol or buffering state: each connection holds a Lean
+// state (lean/Conn.lean), reports the outcome of every operation to it through
+// glue.c, and performs the action it answers (receive, send, close).
 const std = @import("std");
 const zio = @import("zio");
 const ev = zio.ev;
 const os = zio.os;
 const net = os.net;
 
-extern fn ekk_call(req: [*]const u8, n: usize, out: [*]u8, cap: usize) usize;
+/// Conn.Action as decoded by glue.c.
+const Action = extern struct {
+    kind: u8, // 0 recv, 1 send, 2 close, 3 none
+    room: usize, // recv: most bytes to receive
+    len: usize, // send: bytes glue.c copied into out
+};
+
+const State = ?*anyopaque; // a Lean Conn.State, owned by the connection
+
+extern fn ekk_open(state: *State, out: [*]u8, cap: usize, act: *Action) void;
+extern fn ekk_recv(state: *State, data: [*]const u8, n: usize, out: [*]u8, cap: usize, act: *Action) void;
+extern fn ekk_sent(state: *State, n: usize, out: [*]u8, cap: usize, act: *Action) void;
+extern fn ekk_fail(state: *State, out: [*]u8, cap: usize, act: *Action) void;
+extern fn ekk_free(state: State) void;
 extern fn ekk_thread_init() void;
 extern fn ekk_thread_fini() void;
 
 const alloc = std.heap.c_allocator;
 
-// Must hold the largest request Lean accepts: maxHeadBytes + CRLFCRLF + maxBodyBytes
-// in lean/Main.lean (8192 + 4 + 8192). A buffer that fills while Lean still wants
-// more bytes closes the connection.
-const in_cap = 8192 + 4 + 8192;
-// Lean's result: a 5-byte prefix (kind, consumed as u32 LE) and the response.
+// One receive takes at most min(room, recv_cap) bytes; Lean buffers them.
+const recv_cap = 8192;
+// One send writes at most out_cap bytes; Lean asks again for the rest.
 const out_cap = 8192;
-const prefix_len = 5;
 
 const Conn = struct {
     fd: ev.Backend.NetHandle,
     loop: *ev.Loop,
+    state: State = null,
     comp: union { recv: ev.NetRecv, send: ev.NetSend, close: ev.NetClose } = undefined,
-    in: [in_cap]u8 = undefined,
-    in_len: usize = 0,
+    in: [recv_cap]u8 = undefined,
     out: [out_cap]u8 = undefined,
     out_len: usize = 0,
-    out_off: usize = 0,
-    close_after: bool = false,
     recv_iov: [1]os.iovec = undefined,
     send_iov: [1]os.iovec_const = undefined,
 
-    fn startRecv(self: *Conn) void {
-        self.comp = .{ .recv = ev.NetRecv.init(self.fd, .fromSlice(self.in[self.in_len..], &self.recv_iov), .{}) };
+    /// Performs the action Lean answered.
+    fn apply(self: *Conn, act: Action) void {
+        switch (act.kind) {
+            0 => {
+                if (act.room == 0) return self.fail(); // excluded by Conn.step_recv
+                self.startRecv(@min(act.room, recv_cap));
+            },
+            1 => {
+                if (act.len == 0) return self.fail(); // excluded by Conn.step_send
+                self.out_len = act.len;
+                self.startSend();
+            },
+            2 => self.close(),
+            // `none` answers only events after close, and none are reported then (Conn.step_close).
+            else => @panic("Lean answered none for a live connection"),
+        }
+    }
+
+    fn fail(self: *Conn) void {
+        var act: Action = undefined;
+        ekk_fail(&self.state, &self.out, out_cap, &act);
+        self.apply(act);
+    }
+
+    fn startRecv(self: *Conn, n: usize) void {
+        self.comp = .{ .recv = ev.NetRecv.init(self.fd, .fromSlice(self.in[0..n], &self.recv_iov), .{}) };
         self.comp.recv.c.callback = recvCb;
         self.comp.recv.c.userdata = self;
         self.loop.add(&self.comp.recv.c);
@@ -43,34 +76,14 @@ const Conn = struct {
 
     fn recvCb(_: *ev.Loop, c: *ev.Completion) void {
         const self: *Conn = @ptrCast(@alignCast(c.userdata.?));
-        const n = self.comp.recv.getResult() catch return self.close();
-        if (n == 0) return self.close();
-        self.in_len += n;
-        self.process();
-    }
-
-    fn process(self: *Conn) void {
-        // Lean frames, parses and answers; result = kind, consumed (u32 LE), response.
-        const m = ekk_call(&self.in, self.in_len, &self.out, self.out.len);
-        if (m == std.math.maxInt(usize) or m < prefix_len) return self.close();
-        const kind = self.out[0];
-        if (kind == 0) {
-            if (self.in_len == self.in.len) return self.close();
-            return self.startRecv();
-        }
-        const consumed: usize = std.mem.readInt(u32, self.out[1..prefix_len], .little);
-        // A respond result must consume what it answered and carry a response.
-        if (kind > 2 or consumed == 0 or consumed > self.in_len or m == prefix_len) return self.close();
-        std.mem.copyForwards(u8, self.in[0 .. self.in_len - consumed], self.in[consumed..self.in_len]);
-        self.in_len -= consumed;
-        self.close_after = kind == 2;
-        self.out_len = m;
-        self.out_off = prefix_len;
-        self.startSend();
+        const n = self.comp.recv.getResult() catch return self.fail();
+        var act: Action = undefined;
+        ekk_recv(&self.state, &self.in, n, &self.out, out_cap, &act);
+        self.apply(act);
     }
 
     fn startSend(self: *Conn) void {
-        self.comp = .{ .send = ev.NetSend.init(self.fd, .fromSlice(self.out[self.out_off..self.out_len], &self.send_iov), .{}) };
+        self.comp = .{ .send = ev.NetSend.init(self.fd, .fromSlice(self.out[0..self.out_len], &self.send_iov), .{}) };
         self.comp.send.c.callback = sendCb;
         self.comp.send.c.userdata = self;
         self.loop.add(&self.comp.send.c);
@@ -78,13 +91,10 @@ const Conn = struct {
 
     fn sendCb(_: *ev.Loop, c: *ev.Completion) void {
         const self: *Conn = @ptrCast(@alignCast(c.userdata.?));
-        const n = self.comp.send.getResult() catch return self.close();
-        if (n == 0) return self.close(); // no progress on a nonempty send
-        self.out_off += n;
-        if (self.out_off < self.out_len) return self.startSend();
-        if (self.close_after) return self.close();
-        if (self.in_len > 0) return self.process();
-        self.startRecv();
+        const n = self.comp.send.getResult() catch return self.fail();
+        var act: Action = undefined;
+        ekk_sent(&self.state, n, &self.out, out_cap, &act);
+        self.apply(act);
     }
 
     fn close(self: *Conn) void {
@@ -96,6 +106,7 @@ const Conn = struct {
 
     fn closeCb(_: *ev.Loop, c: *ev.Completion) void {
         const self: *Conn = @ptrCast(@alignCast(c.userdata.?));
+        ekk_free(self.state);
         alloc.destroy(self);
     }
 };
@@ -118,7 +129,9 @@ const Acceptor = struct {
             net.setNoDelay(fd, true) catch {};
             if (alloc.create(Conn)) |conn| {
                 conn.* = .{ .fd = fd, .loop = loop };
-                conn.startRecv();
+                var act: Action = undefined;
+                ekk_open(&conn.state, &conn.out, out_cap, &act);
+                conn.apply(act);
             } else |_| net.close(fd);
         } else |_| {} // spike: every accept error is retried; production must classify them
         self.start();

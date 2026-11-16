@@ -7,24 +7,31 @@ from [zio](https://github.com/lalinsky/zio) instead of Lean's `Std.Async`.
 It is not production code; what production needs beyond it is listed in the
 item.
 
-- `zig/`: a static library. One `zio.ev` loop per thread, all accepting on
-  one listening socket on 127.0.0.1:8083; it prints `ready` once every loop
-  has registered its acceptor. The loop only moves bytes: it hands everything
-  buffered on a connection to Lean through `src/glue.c` and sends what Lean
-  returns, after checking the result's prefix. Its input buffer holds exactly
-  the largest request Lean accepts (8192 + 4 + 8192 bytes). Worker threads
-  call `lean_initialize_thread`, which libleanrt exports but `lean.h` does not
-  declare.
+- `zig/`: a static library; `bench.sh` builds it in ReleaseSafe (bounds and
+  overflow checks) unless `ZIG_OPTIMIZE` says otherwise. One `zio.ev` loop per thread, all
+  accepting on one listening socket on 127.0.0.1:8083; it prints `ready` once
+  every loop has registered its acceptor. The loop keeps no protocol or
+  buffering state: each connection holds a Lean `Conn.State`, reports the
+  outcome of every operation to it through `src/glue.c`, and performs the
+  action it answers. Worker threads call `lean_initialize_thread`, which
+  libleanrt exports but `lean.h` does not declare.
+- `lean/Conn.lean`: the connection's lifecycle as one state type (reading,
+  writing, closed) and a pure `step` over the loop's events, generic over the
+  request handler, with theorems: the buffer never exceeds the largest
+  accepted request, a closed connection stays closed and asks for nothing,
+  the close action always leaves it closed, every receive has room and every
+  send has at least one byte. What the theorems assume about the loop is in
+  the module's docstring.
 - `lean/Http.lean`: the protocol work. It frames requests (head up to 8 KiB,
   Content-Length body up to 8 KiB, pipelining), validates the request line and
   every header field, applies Content-Length, Host, Connection and
   Transfer-Encoding rules (chunked bodies get 501), routes GET and HEAD `/`
   (methods compared case-sensitively), and builds Content-Type, Date,
-  Content-Length and Connection headers. Its result starts with a 5-byte
-  prefix: the kind (need more bytes, respond, respond and close) and the
-  number of bytes consumed. `lean/Main.lean` starts the loops;
-  `lean/Test.lean` tests `handle` without sockets (statuses, every proper
-  prefix of complete requests, limits at their exact boundaries, dates).
+  Content-Length and Connection headers; `handle` answers need-more or a
+  response with the bytes it consumes. `lean/Main.lean` starts the loops;
+  `lean/Test.lean` tests `handle` and `Conn.step` without sockets (statuses,
+  every proper prefix of complete requests, limits at their exact boundaries,
+  dates, and one connection through split receives and a partial send).
 - `dusty-hello/`: the same route on dusty, the HTTP library on zio.
 - `bench/`: Go's `net/http` with the same route (`goserver`), end-to-end
   checks over real sockets (`check`), and a closed-loop keep-alive load

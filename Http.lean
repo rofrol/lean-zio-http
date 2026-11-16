@@ -1,13 +1,9 @@
 /-! Spike: the HTTP/1.1 protocol work of the server, done in Lean.
-The zio.ev loop (Zig) only moves bytes: it hands Lean everything buffered on a
-connection; Lean frames the request (head and Content-Length body), validates
-the request line and header fields, applies the connection rules, routes, and
-builds the whole response with Content-Type, Date and Content-Length.
-
-Result encoding returned to the loop (`ekk_handle`):
-  byte 0      kind: 0 need more bytes, 1 respond and keep going, 2 respond and close
-  bytes 1..4  bytes of the buffer consumed by this request (little endian)
-  bytes 5..   the response -/
+`handle` looks at the bytes buffered on a connection: it frames the request
+(head and Content-Length body), validates the request line and header fields,
+applies the connection rules, routes, and builds the whole response with
+Content-Type, Date and Content-Length. `Conn.lean` owns the connection and
+calls it. -/
 
 /-! ## Limits (Go's net/http: 1 MiB of headers; ours are smaller, stated here) -/
 def maxHeadBytes : Nat := 8192
@@ -214,7 +210,7 @@ def crlf2 := "\r\n\r\n".toUTF8
 def helloBody := "Hello, World!".toUTF8
 def notFoundBody := "404 page not found\n".toUTF8
 
-/-- Builds the response into `out` (which already holds the 5-byte result prefix). -/
+/-- Appends the response to `out`. -/
 def respond (out : ByteArray) (now : Nat) (status : Nat) (body : ByteArray) (close head : Bool) : ByteArray :=
   let o := out.append (statusLine status)
   let o := o.append hdrTextPlain
@@ -231,17 +227,20 @@ def route (buf : ByteArray) (h : Head) : Nat × ByteArray × Bool :=
   let isHead := h.methodEnd == 4 && buf[0]! == 72 && buf[1]! == 69 && buf[2]! == 65 && buf[3]! == 68
   if isRoot && (isGet || isHead) then (200, helloBody, isHead) else (404, notFoundBody, isHead)
 
-def prefixed (kind : UInt8) (consumed : Nat) : ByteArray :=
-  let c := consumed.toUInt32
-  (((((ByteArray.emptyWithCapacity 192).push kind).push c.toUInt8).push (c >>> 8).toUInt8).push
-    (c >>> 16).toUInt8).push (c >>> 24).toUInt8
+/-- What `handle` decides about the bytes buffered on a connection. -/
+inductive Reply where
+  /-- The request is not complete yet. -/
+  | needMore
+  /-- Send `response` for the first `consumed` bytes; close afterwards when `close`. -/
+  | respond (consumed : Nat) (response : ByteArray) (close : Bool)
 
-@[export ekk_handle]
-def handle (now : UInt64) (buf : ByteArray) : ByteArray :=
+def emptyResponse : ByteArray := ByteArray.emptyWithCapacity 192
+
+/-- `now` is the wall clock in Unix seconds, for the Date header. -/
+def handle (now : Nat) (buf : ByteArray) : Reply :=
   match parse buf with
-  | .needMore => prefixed 0 0
-  | .bad status => respond (prefixed 2 buf.size) now.toNat status ByteArray.empty true false
+  | .needMore => .needMore
+  | .bad status => .respond buf.size (respond emptyResponse now status ByteArray.empty true false) true
   | .ok h =>
     let (status, body, isHead) := route buf h
-    let kind : UInt8 := if h.close then 2 else 1
-    respond (prefixed kind (h.bodyStart + h.contentLength)) now.toNat status body h.close isHead
+    .respond (h.bodyStart + h.contentLength) (respond emptyResponse now status body h.close isHead) h.close

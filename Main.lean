@@ -1,6 +1,7 @@
-import Http
+import Conn
 
-/-! Spike entry point: starts the zio.ev loops (zig/src/serve.zig), which call `Http.handle`. -/
+/-! Spike entry point: starts the zio.ev loops (zig/src/serve.zig), which drive
+each connection through the entry points of `Conn.lean`. -/
 
 @[extern "ekk_serve"]
 opaque serve (port : UInt16) (threads : UInt32) : UInt8

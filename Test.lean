@@ -1,19 +1,21 @@
-import Http
+import Conn
 
 /-! Tests of `handle` (Http.lean) without sockets: framing of every proper
 prefix, limits at their exact boundaries, status codes, connection rules,
 and the Date header. Exit status 1 when any check fails. -/
 
-def resultKind (r : ByteArray) : UInt8 := r[0]!
+/-- 0 need more, 1 respond and keep going, 2 respond and close. -/
+def resultKind : Reply → UInt8
+  | .needMore => 0
+  | .respond _ _ close => if close then 2 else 1
 
-def consumed (r : ByteArray) : Nat :=
-  r[1]!.toNat + r[2]!.toNat * 256 + r[3]!.toNat * 65536 + r[4]!.toNat * 16777216
+def consumed : Reply → Nat
+  | .needMore => 0
+  | .respond n _ _ => n
 
-def responseText (r : ByteArray) : String :=
-  String.fromUTF8! (r.extract 5 r.size)
-
-def statusOf (r : ByteArray) : String :=
-  ((responseText r).splitOn "\r\n").head!
+def statusOf : Reply → String
+  | .needMore => ""
+  | .respond _ r _ => ((String.fromUTF8! r).splitOn "\r\n").head!
 
 structure Case where
   name : String
@@ -72,8 +74,43 @@ def dates : List (Nat × String) := [
   (1793580020, "Mon, 02 Nov 2026 00:40:20 GMT")
 ]
 
-def main : IO UInt32 := do
+/-- One connection through `Conn.step` with `handle`: a request split in two
+receives, a partial send, the rest of the send, the peer closing, and an event
+after close. Returns the number of failed expectations. -/
+def connScenario : IO Nat := do
+  let h := handle 0
   let mut failures := 0
+  let part1 := bytes "GET / HTTP/1.1\r\nHo"
+  let (s1, a1) := Conn.step h Conn.initial (.received part1)
+  match a1 with
+  | .recv room => if room != Conn.inCap - part1.size then IO.println s!"FAIL conn: room {room}"; failures := failures + 1
+  | _ => IO.println "FAIL conn: a partial request did not ask to receive"; failures := failures + 1
+  let (s2, a2) := Conn.step h s1 (.received (bytes "st: a\r\n\r\n"))
+  let some resp := (match a2 with | .send d 0 => some d | _ => none)
+    | IO.println "FAIL conn: a complete request did not send from offset 0"; return failures + 1
+  if s2.buf.size != 0 then IO.println "FAIL conn: the request was not consumed"; failures := failures + 1
+  let (s3, a3) := Conn.step h s2 (.sent 10)
+  match a3 with
+  | .send d 10 => if d.size != resp.size then IO.println "FAIL conn: the rest is another response"; failures := failures + 1
+  | _ => IO.println "FAIL conn: a partial send did not continue at offset 10"; failures := failures + 1
+  let (s4, a4) := Conn.step h s3 (.sent (resp.size - 10))
+  match a4 with
+  | .recv room => if room != Conn.inCap then IO.println s!"FAIL conn: room {room} after the response"; failures := failures + 1
+  | _ => IO.println "FAIL conn: a finished send did not go back to receiving"; failures := failures + 1
+  let (s5, a5) := Conn.step h s4 (.received ByteArray.empty)
+  match a5 with
+  | .close => pure ()
+  | _ => IO.println "FAIL conn: the peer closing did not close"; failures := failures + 1
+  match (Conn.step h s5 (.sent 1)).2 with
+  | .none => pure ()
+  | _ => IO.println "FAIL conn: an event after close was acted on"; failures := failures + 1
+  match (Conn.step h Conn.initial (.sent 1)).2 with
+  | .close => pure ()
+  | _ => IO.println "FAIL conn: a send report while reading did not close"; failures := failures + 1
+  return failures
+
+def main : IO UInt32 := do
+  let mut failures ← connScenario
   for c in cases do
     let r := handle 0 (bytes c.request)
     let want := c.consumes.getD (bytes c.request).size

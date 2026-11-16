@@ -8,7 +8,9 @@ set -eu
 cd "$(dirname "$0")"
 # The include directory of the toolchain lean/lean-toolchain pins.
 LEAN_INCLUDE="$(cd lean && lean --print-prefix)/include"
-(cd zig && zig build -Drelease=true -Dlean-include="$LEAN_INCLUDE")
+# ZIG_OPTIMIZE picks the build of the loop and zio: ReleaseSafe (bounds and
+# overflow checks) unless set; it measured no slower than ReleaseFast.
+(cd zig && zig build -Doptimize="${ZIG_OPTIMIZE:-ReleaseSafe}" -Dlean-include="$LEAN_INCLUDE")
 # Lake does not track libzsrv.a (passed through moreLinkArgs), so drop the
 # executable to make it link against the library just built.
 rm -f lean/.lake/build/bin/lsrv

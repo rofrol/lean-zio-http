@@ -3,6 +3,7 @@ defaultTargets = ["lsrv", "lsrv-test"]
 
 [[lean_lib]]
 name = "Http"
+roots = ["Http", "Conn"]
 
 [[lean_exe]]
 name = "lsrv"

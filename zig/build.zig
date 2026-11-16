@@ -2,7 +2,7 @@ const std = @import("std");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
-    const optimize = b.standardOptimizeOption(.{ .preferred_optimize_mode = .ReleaseFast });
+    const optimize = b.standardOptimizeOption(.{});
     const lean_include = b.option([]const u8, "lean-include", "Lean include directory") orelse @panic("-Dlean-include required");
     const zio = b.dependency("zio", .{ .target = target, .optimize = optimize });
     const mod = b.createModule(.{
