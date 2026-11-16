@@ -3,6 +3,7 @@
 lpgru3 Controlled-interleaving tests for the zio contracts the graceful shutdown relies on
 byurlg Measure the server's worst-case memory per connection, with full input and output at once
 xihdtw Linux pending-connection accept errors end the server process
+k6oulx Configurable header fields on the server's own error responses
 
 ## Proposed
 
