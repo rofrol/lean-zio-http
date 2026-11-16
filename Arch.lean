@@ -31,12 +31,14 @@ def rule (m : Name) : Option (Name → Bool) :=
   -- Composition roots: one transport, one adapter, one application each.
   | `Main | `Fixture | `MainDb => some fun i => i ∈ [`Server.Transport, `Server.H1Adapter] || under `App i
   | `MainHand | `FixtureHand => some fun i => i ∈ [`Server.Transport, `Server.HandParser] || under `App i
+  -- The applications see the handler interface (and through it the query
+  -- values), never the transport or an adapter. Each one is named with the
+  -- imports it has: a new application fails until it is placed here.
+  | `App.Hello => some (· == `Server.Handler)
+  | `App.Fixture | `App.Db => some (· ∈ [`Server.Handler, `App.Hello])
   -- Tests and measurement tools may import anything.
   | `Test | `Bench | `Compare | `Corpus | `Arch => some fun _ => true
-  | _ =>
-    -- The application sees the handler interface and the query values only.
-    if under `App m then some fun i => i ∈ [`Server.Handler, `Server.Query] || under `App i
-    else none
+  | _ => none
 
 /-- The `.lean` files under `dir`, skipping Lake's build directory, as module names. -/
 partial def modules (root dir : System.FilePath) : IO (Array (Name × System.FilePath)) := do

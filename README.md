@@ -34,7 +34,9 @@ Lean toolchain as `lean-toolchain` here.
 Lake libraries (`lakefile.lean`) and what each may import. `lsrv-arch`
 (`Arch.lean`) reads the imports of every `.lean` file of the package and
 fails on an import its module's rule does not allow, and on a file no rule
-names; `bench.sh` runs it.
+names, so a new module, an application included, fails until its row is
+added; `bench.sh` runs it, and runs it on a fixture package whose forbidden
+imports it must report.
 
 | module | role | may import |
 |---|---|---|
@@ -46,7 +48,9 @@ names; `bench.sh` runs it.
 | `Server.Response` | writes and checks responses, for both adapters | contracts |
 | `Server.H1Adapter` | the production HTTP/1.1 adapter, `Std.Http.Protocol.H1` (D1) | contracts, `Server.Response`, `Std.Http.Protocol.H1` |
 | `Server.HandParser` | the hand-written parser: test comparator and rollback until item 53rwgc, then deleted (D1) | contracts, `Server.Response` |
-| `App.*` | applications: `App.Hello` (the benchmark route), `App.Fixture` (the boundary tests' route), `App.Db` (the PostgreSQL tests' and benchmark's routes) | `Server.Handler`, `Server.Query`, `App.*` |
+| `App.Hello` | the benchmark application | `Server.Handler` |
+| `App.Fixture` | the boundary tests' application | `Server.Handler`, `App.Hello` |
+| `App.Db` | the PostgreSQL tests' and benchmark's application | `Server.Handler`, `App.Hello` |
 | `Main`, `Fixture`, `MainDb` | composition roots `lsrv`, `lsrv-fixture`, `lsrv-db`: H1 and one application | `Server.Transport`, `Server.H1Adapter`, `App.*` |
 | `MainHand`, `FixtureHand` | `lsrv-hand`, `lsrv-fixture-hand`: the same with the hand-written parser | `Server.Transport`, `Server.HandParser`, `App.*` |
 | `Test`, `Bench`, `Compare`, `Corpus`, `Arch` | tests and measurements | anything |

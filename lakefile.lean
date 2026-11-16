@@ -73,7 +73,7 @@ lean_lib ServerHttp where
   roots := #[`Server.Response, `Server.H1Adapter, `Server.HandParser]
 
 -- Example applications the tests and benchmarks run: import only
--- Server.Handler and Server.Query (and each other).
+-- Server.Handler and the applications Arch.lean names for each.
 lean_lib App where
   roots := #[`App.Hello, `App.Fixture, `App.Db]
 

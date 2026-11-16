@@ -101,6 +101,22 @@ measure() {
 
 .lake/build/bin/lsrv-test
 .lake/build/bin/lsrv-arch
+# The check must also fail where it should: on a fixture package with an
+# application importing the transport and an application no rule names,
+# beside one that keeps its rule. It reports exactly those two.
+arch="$tmp/arch"
+mkdir -p "$arch/App"
+printf 'import Server.Handler\nimport App.Hello\n' >"$arch/App/Db.lean"
+printf 'import Server.Handler\nimport Server.Transport\n' >"$arch/App/Hello.lean"
+printf 'import Server.Handler\n' >"$arch/App/Rogue.lean"
+status=0
+.lake/build/bin/lsrv-arch "$arch" >"$tmp/arch.txt" || status=$?
+expected="FAIL App.Hello imports Server.Transport
+FAIL App.Rogue ($arch/App/Rogue.lean): no boundary rule names this module
+3 modules, 2 violations"
+if [ "$status" != 1 ] || [ "$(cat "$tmp/arch.txt")" != "$expected" ]; then
+  echo "lsrv-arch on its fixture exited $status, printing:"; cat "$tmp/arch.txt"; exit 1
+fi
 .lake/build/bin/lsrv-compare >"$tmp/compare.txt" || { cat "$tmp/compare.txt"; exit 1; }
 sed -n '1,/^## Malformed/p' "$tmp/compare.txt"
 grep -E '^[0-9]+ requests: [0-9]+ verdicts' "$tmp/compare.txt"
