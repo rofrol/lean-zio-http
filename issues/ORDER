@@ -2,8 +2,6 @@
 
 ## Proposed
 
-msr26a Decide whether the per-connection bound counts the loop connection's malloc block, not its struct size
-
 ## Needs a decision
 
 53rwgc Linux acceptance runs for the Lean HTTP server
@@ -22,3 +20,4 @@ kaslrv Run the worst-case memory scenario on Linux
 dl4bte Confirm from the server the connection state the worst-case memory scenario measures
 3pund6 Decide what follows from the classification of Linux pending-connection accept errnos (xihdtw)
 sa6jpb Decide whether the interim 100 Continue carries the own header fields
+msr26a Decide whether the per-connection bound counts the loop connection's malloc block, not its struct size
