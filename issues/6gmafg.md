@@ -1,7 +1,0 @@
-Deterministic tests for the PostgreSQL pool's callback orderings and query chains
-
-Moved on 2026-11-16 from ekklesiai.org's queue, where it was item 644oei (moved by its item m4jfmv). Item ids and decisions (D1, D2) named below are ekklesiai.org's; paths are this repository's.
-
-Raised by review (consult rounds 20261116-080638-b725 and 20261116-082558-b657) in aazqxm: dbcheck runs against a real cluster and cannot force (a) a partial `PQflush` with both readiness completions outstanding and the write completion arriving after the slot went idle (`sendReady`, zig/src/pg.zig), (b) fragmented input across command boundaries and Sync (`last_null` in `ekk_pg_collect`), (c) COPY teardown, (d) a long synchronous chain of failing queries (zero slots or database down) staying iterative and not monopolizing the loop. Each needs a controlled fake (a socketpair-backed fake server or a test hook in the pool). Also decide whether a handler's synchronous error chain needs a scheduling boundary.
-
-Decided 2026-11-16 by this session with sol (consult round 20261116-145342-a8e2), under the user's delegation of that day to decide with sol what comes next: approved for the tests only: deterministic tests (a socketpair-backed fake server or a test-only hook) for (a) to (d). Whether a handler's synchronous error chain needs a scheduling boundary changes execution behavior and is not part of this item; it is a separate question in Needs a decision. Report what (d) shows as evidence for that question.

@@ -1,11 +1,12 @@
 ## Next, in order
 
-6gmafg Deterministic tests for the PostgreSQL pool's callback orderings and query chains
 lpgru3 Controlled-interleaving tests for the zio contracts the graceful shutdown relies on
 byurlg Measure the server's worst-case memory per connection, with full input and output at once
 xihdtw Linux pending-connection accept errors end the server process
 
 ## Proposed
+
+jl63fo Point issues i35sos and tc5rsx at zig/src/pg.c instead of zig/src/glue.c
 
 ## Needs a decision
 
