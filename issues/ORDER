@@ -1,8 +1,8 @@
 ## Next, in order
 
-xlto7s Attribute the per-connection memory the README's allowance does not cover
-
 ## Proposed
+
+msr26a Decide whether the per-connection bound counts the loop connection's malloc block, not its struct size
 
 ## Needs a decision
 
