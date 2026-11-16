@@ -632,6 +632,252 @@ func memory(path, addr string) (string, error) {
 	return fmt.Sprintf("resident set %d KiB idle, %d KiB with %d heads held: %.1f KiB per connection (bound %d KiB)", base, held, n, per, perConnBound), nil
 }
 
+// tcpQueues maps each established TCP connection of processes `pids`, by
+// its "local->foreign" address pair, to its receive and send queue lengths:
+// bytes the kernel holds that the process has not read, and bytes the process
+// wrote that the peer has not acknowledged. From lsof(8)'s -T q (QR, QS);
+// macOS's `netstat -an -p tcp` lists no TCP sockets (seen on Darwin 27.2).
+func tcpQueues(pids ...int) (map[string][2]int, error) {
+	ps := make([]string, len(pids))
+	for i, p := range pids {
+		ps[i] = strconv.Itoa(p)
+	}
+	// -F: one field per line, a file's name ("n") before its TCP info ("T").
+	out, err := exec.Command("lsof", "-nP", "-a", "-p", strings.Join(ps, ","), "-iTCP", "-sTCP:ESTABLISHED", "-Tqs", "-F", "nT").Output()
+	if err != nil {
+		return nil, err
+	}
+	qs := map[string][2]int{}
+	seen := map[string]int{} // per name: bit 1 QR read, bit 2 QS read
+	name := ""
+	for _, line := range strings.Split(string(out), "\n") {
+		switch {
+		case strings.HasPrefix(line, "n"):
+			name = line[1:]
+		case strings.HasPrefix(line, "TQR="), strings.HasPrefix(line, "TQS="):
+			v, err := strconv.Atoi(line[4:])
+			if err != nil || name == "" {
+				return nil, fmt.Errorf("lsof line %q", line)
+			}
+			q, bit := qs[name], 1
+			if line[2] == 'R' {
+				q[0] = v
+			} else {
+				q[1], bit = v, 2
+			}
+			qs[name] = q
+			seen[name] |= bit
+		}
+	}
+	// A connection without both sizes is left out, so a caller finds it
+	// missing instead of reading a size of 0 that lsof never reported.
+	for name, bits := range seen {
+		if bits != 3 {
+			delete(qs, name)
+		}
+	}
+	return qs, nil
+}
+
+// awaitBytes waits until c has received data it has not read, without
+// reading it (a peek), so the receive window it advertises stays as small.
+func awaitBytes(c *net.TCPConn) error {
+	rc, err := c.SyscallConn()
+	if err != nil {
+		return err
+	}
+	var n int
+	var perr error
+	b := make([]byte, 1)
+	err = rc.Read(func(fd uintptr) bool {
+		n, _, perr = syscall.Recvfrom(int(fd), b, syscall.MSG_PEEK)
+		return perr != syscall.EAGAIN
+	})
+	if err == nil {
+		err = perr
+	}
+	if err == nil && n == 0 {
+		err = io.EOF
+	}
+	return err
+}
+
+// memoryFull measures the retained memory of connections each holding a
+// whole response being sent and a buffered tail of pipelined bytes, the most
+// Lean holds per connection at once when it sends (README, "Memory"). A
+// connection takes its input only while it is not sending, and the loop
+// receives at most 8,192 bytes (recv_cap, zig/src/serve.zig) at a time, so
+// while it sends a response its buffer holds at most the rest of the receive
+// that completed the request: less than 8,192 bytes, never `inCap`. Each
+// client writes exactly 8,192 bytes at once: `gets` pipelined GETs of the
+// 60,001-byte body, then the start of a request that never completes. It
+// never reads, so the server's sends stall once the kernel holds what it
+// can. Before the measurement the client has
+// seen the first response's first byte (a peek), and lsof shows for every
+// connection nothing queued towards the server in either socket: the server
+// has read all 8,192 bytes, and the client sends no more. After it, lsof
+// shows that the server has not sent all but the last GET's responses. So at
+// the measurement each connection had read all 8,192 bytes, and since a
+// complete GET was still unanswered it was sending one whole response
+// (Conn.step answers each completed send at once with the next one) with
+// those bytes less the GETs it consumed buffered. The GETs consumed are
+// bounded by the response bytes sent, so the summary gives the fewest bytes
+// any connection can have held buffered. Not excluded by these observations:
+// a connection whose 8,192 bytes arrived in two receives, the second taken
+// from the socket but not yet handed to Lean at the measurement, which then
+// held its second part in the loop's receive buffer and no response. The
+// queues show what the sockets hold, not the connection's state; only an
+// acknowledgement from the server would. macOS only (lsof's queue sizes).
+func memoryFull(path, addr string) (string, error) {
+	// 100 connections: the kernel holds hundreds of KB of stalled responses
+	// per connection, and 200 already made macOS deny network memory
+	// ("requests for memory denied" in netstat -m), 1,000 to a failed send.
+	const n = 100
+	const gets = 100
+	const perConnBound = (16640 + 16388 + 65536 + 2048) / 1024 // as in memory
+	if runtime.GOOS != "darwin" {
+		return "skipped: the socket queues are read with lsof's -T q, checked on macOS only", nil
+	}
+	s, err := start(path, "1", "--max-conns", "1100")
+	if err != nil {
+		return "", err
+	}
+	defer s.stop()
+	// The keep-alive response's size on the wire (its head and the fixture's
+	// body), from one exchange before the baseline.
+	c0, err := dial(addr)
+	if err != nil {
+		return "", err
+	}
+	io.WriteString(c0, get)
+	r0 := bufio.NewReader(c0)
+	respSize := bodySize
+	for {
+		line, err := r0.ReadString('\n')
+		if err != nil {
+			c0.Close()
+			return "", err
+		}
+		respSize += len(line)
+		if line == "\r\n" {
+			break
+		}
+	}
+	got := make([]byte, bodySize)
+	_, err = io.ReadFull(r0, got)
+	c0.Close()
+	if err != nil || !bytes.Equal(got, body) || r0.Buffered() != 0 {
+		return "", fmt.Errorf("the response to a GET is not the fixture's body: %v", err)
+	}
+	base, err := rssKiB(s.cmd.Process.Pid)
+	if err != nil {
+		return "", err
+	}
+	const write = 8192 // recv_cap
+	payload := strings.Repeat(get, gets) + "GET / HTTP/1.1\r\nHost: a\r\nX: "
+	payload += strings.Repeat("a", write-len(payload))
+	conns := make([]*net.TCPConn, n)
+	defer func() {
+		for _, c := range conns {
+			if c != nil {
+				c.Close()
+			}
+		}
+	}()
+	// fill opens conns[lo:hi], each writing the payload and seeing its first
+	// response byte, then checks, for conns[:hi], that every byte the client
+	// wrote has reached the server's socket (nothing unacknowledged) and
+	// then, in a later reading, that the server has read it all (nothing
+	// unread), and returns the server's resident set.
+	fill := func(lo, hi int) (int, error) {
+		err := parallel(hi-lo, 32, func(k int) error {
+			c, err := dial(addr)
+			if err != nil {
+				return err
+			}
+			conns[lo+k] = c
+			if _, err := io.WriteString(c, payload); err != nil {
+				return err
+			}
+			if err := awaitBytes(c); err != nil {
+				return fmt.Errorf("first response byte: %w", err)
+			}
+			return nil
+		})
+		if err != nil {
+			return 0, err
+		}
+		for _, side := range []int{0, 1} {
+			qs, err := tcpQueues(s.cmd.Process.Pid, os.Getpid())
+			if err != nil {
+				return 0, fmt.Errorf("lsof: %w", err)
+			}
+			for i, c := range conns[:hi] {
+				cl, sv := c.LocalAddr().String(), c.RemoteAddr().String()
+				cq, ok1 := qs[cl+"->"+sv]
+				sq, ok2 := qs[sv+"->"+cl]
+				if !ok1 || !ok2 {
+					return 0, fmt.Errorf("connection %d (%s): not among lsof's established connections", i, cl)
+				}
+				if side == 0 && cq[1] != 0 {
+					return 0, fmt.Errorf("connection %d: %d bytes of the client's unacknowledged", i, cq[1])
+				}
+				if side == 1 && sq[0] != 0 {
+					return 0, fmt.Errorf("connection %d: %d bytes unread by the server; it has not read all %d bytes", i, sq[0], write)
+				}
+			}
+		}
+		return rssKiB(s.cmd.Process.Pid)
+	}
+	// Two measurements, after half the connections and after all: their
+	// difference is the resident set the second half added, without the
+	// apparent fixed component that (all - idle) / n would spread over the
+	// connections (about 500 KiB on the M1).
+	half, err := fill(0, n/2)
+	if err != nil {
+		return "", err
+	}
+	held, err := fill(n/2, n)
+	if err != nil {
+		return "", err
+	}
+	// After it: the server has not sent all but the last response. Bytes it
+	// sent are unacknowledged in its socket or unread in the client's. Each
+	// reading takes the sockets one by one, so the client's is taken from a
+	// second, later reading: the client never reads, so its count only grows,
+	// and the sum is never below what the server had sent when its own socket
+	// was read (a byte received and not yet acknowledged counts twice).
+	after, err := tcpQueues(s.cmd.Process.Pid, os.Getpid())
+	if err != nil {
+		return "", fmt.Errorf("lsof: %w", err)
+	}
+	later, err := tcpQueues(s.cmd.Process.Pid, os.Getpid())
+	if err != nil {
+		return "", fmt.Errorf("lsof: %w", err)
+	}
+	least := write // the fewest bytes any connection held buffered
+	for i, c := range conns {
+		cl, sv := c.LocalAddr().String(), c.RemoteAddr().String()
+		cq, ok1 := later[cl+"->"+sv]
+		sq, ok2 := after[sv+"->"+cl]
+		if !ok1 || !ok2 {
+			return "", fmt.Errorf("connection %d (%s): not among lsof's established connections", i, cl)
+		}
+		sent := cq[0] + sq[1]
+		if sent >= (gets-1)*respSize {
+			return "", fmt.Errorf("connection %d: up to %d response bytes sent, of %d responses; the sends did not stall", i, sent, gets)
+		}
+		least = min(least, write-(sent/respSize+1)*len(get))
+	}
+	per := float64(held-half) / (n - n/2)
+	summary := fmt.Sprintf("resident set %d KiB idle, %d KiB with %d and %d KiB with %d connections, each with all its bytes read and not all responses sent (so sending a %d-byte response with at least %d bytes buffered, unless a receive had not reached Lean): %.1f KiB per added connection (bound %d KiB)",
+		base, half, n/2, held, n, respSize, least, per, perConnBound)
+	if per > perConnBound {
+		return "", fmt.Errorf("%s: over the bound", summary)
+	}
+	return summary, nil
+}
+
 type scenario struct {
 	name string
 	args []string
@@ -756,6 +1002,7 @@ func main() {
 			return crashPoint(p, a, "--crash-after-send", 3, 21, "--chunk", "7")
 		}, false},
 		{"memory of 1000 connections holding a head", nil, false, false, nil, memory, true},
+		{"memory of 100 connections each sending a response with a pipelined tail buffered", nil, false, false, nil, memoryFull, false},
 	}
 	failed, ran := 0, 0
 	for _, sc := range scenarios {
@@ -778,7 +1025,9 @@ func main() {
 func runScenario(path, addr string, sc scenario) error {
 	if sc.custom != nil {
 		summary, err := sc.custom(path, addr)
-		if err == nil {
+		if err == nil && strings.HasPrefix(summary, "skipped: ") {
+			fmt.Printf("skipped %s: %s\n", sc.name, strings.TrimPrefix(summary, "skipped: "))
+		} else if err == nil {
 			fmt.Printf("ok %s: %s\n", sc.name, summary)
 		}
 		return err

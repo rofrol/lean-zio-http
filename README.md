@@ -309,12 +309,45 @@ may hold more capacity than its length, so the bound on allocated memory is
 the stated one only up to that slack (at most about twice the lengths).
 Transient allocations during one
 parse are not in this bound; each loop runs one parse at a time, so they are
-bounded per loop, not per connection. Measured by `bench/boundary` (1,000
-connections, each holding an 8,000-byte head while it waits for its body
-after `100 Continue`): 42.4 KiB per connection of resident set growth on the
-M1 (2026-11-16), under the stated bound. That measurement holds heads and
-the interim response only; it does not fill each connection's input buffer
-and output at once, so it does not establish the worst case.
+bounded per loop, not per connection.
+
+The buffer and a full response are not both at their maximum at once: a
+connection receives only while it is not sending, and the loop receives at
+most 8,192 bytes at a time (`recv_cap`, `zig/src/serve.zig`), so while a
+response is sent the buffer holds less than the receive that completed its
+request, under 8,192 bytes; a buffer near `inCap` waits with at most the
+25-byte interim response. The stated bound adds both maxima and so stays
+above either state. `bench/boundary` measures both as resident set growth
+on the M1 (2026-11-16):
+
+- 1,000 connections each holding an 8,000-byte head while it waits for
+  its body after `100 Continue`: 42.4 KiB per connection;
+- connections whose client writes 8,192 bytes at once (100 pipelined GETs
+  of the fixture's largest response, 60,121 bytes, then an unfinished
+  request) and never reads: 90.6 to 90.9 KiB per added connection in
+  every run, with either parser, the growth from 50 to 100 such connections (from none to 100 it
+  also counts an apparent fixed component of about 500 KiB; more
+  connections made macOS deny network memory for the stalled responses
+  the kernel holds). The socket queues, read with lsof, show
+  before each measurement that the server has read all 8,192 bytes and
+  after it that it has not sent all the responses; from that, each
+  connection was sending a whole response with at least 7,400 bytes
+  buffered, unless its bytes arrived in two receives and Lean had not yet
+  been handed the second at the measurement, which the queues cannot
+  exclude (the scenario's comment). The parts named above add up to about
+  83 KiB in that state (16.6 + 7.8 + 58.7); the other 7.8 KiB, over the
+  2 KiB allowed for allocator and object headers, is not attributed by
+  this measurement. macOS only: elsewhere the scenario is skipped.
+
+Capacities, from the toolchain's `ByteArray` (nightly-2026-11-14): `extract`
+copies exactly, so the buffer kept after a request is consumed, which is the
+one a send waits with, has capacity equal to its length; the initial buffer
+is allocated with capacity `inCap` (`Conn.initial`); `++` doubles the
+capacity when it must grow (`fastAppend` copies with `exact := false`), so a
+buffer that grows past its capacity while reading may hold up to about twice
+its length; a response is allocated with 192 bytes more than its body
+(`Server.Response.write`) and grows the same way only when its head is
+longer. Whether the bound should count capacities is issue es53kx.
 
 ## Fragmented requests (decision D1)
 
