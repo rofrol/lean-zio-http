@@ -13,3 +13,7 @@ Options:
 (c) Also ask man-pages to correct accept(2)'s note; outward, not this repository's concern unless the owner wants it.
 
 Related gap in another repository: ekklesiai.org's decision record 0001 (docs/decisions/0001-lean-http-server-on-zio.md), Consequences, still calls this unresolved without the kernel evidence; the session that changes ekklesiai.org updates it once the owner decides.
+
+Recommendation (consult round 20261116-183449-f682, sol, under the user's delegation of 2026-11-16): do not close it as settled; the kernel evidence narrows reachability but settles neither zio's contract nor security modules' hooks. Keep today's exit, keep the finding, and ask upstream only with your go.
+Question: What follows from the classification?
+Options: keep exiting and keep the item open as a bounded finding | ask zio upstream (b) | close it (a)
