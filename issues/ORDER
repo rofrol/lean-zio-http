@@ -11,6 +11,7 @@ xihdtw Linux pending-connection accept errors end the server process
 byurlg Measure the server's worst-case memory per connection, with full input and output at once
 lpgru3 Controlled-interleaving tests for the zio contracts the graceful shutdown relies on
 i2rh6f Behavior of the PostgreSQL pool while the database is down
+6gmafg Deterministic tests for the PostgreSQL pool's callback orderings and query chains
 
 ## Needs a decision
 
