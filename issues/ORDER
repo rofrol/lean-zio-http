@@ -1,6 +1,5 @@
 ## Next, in order
 
-xihdtw Linux pending-connection accept errors end the server process
 k6oulx Configurable header fields on the server's own error responses
 
 ## Proposed
@@ -10,6 +9,7 @@ vvxfl6 The stop notification can wake a loop that has already ended (zio Async.n
 kaslrv Run the worst-case memory scenario on Linux
 dl4bte Confirm from the server the connection state the worst-case memory scenario measures
 xlto7s Attribute the per-connection memory the README's allowance does not cover
+3pund6 Decide what follows from the classification of Linux pending-connection accept errnos (xihdtw)
 
 ## Needs a decision
 
