@@ -1,6 +1,5 @@
 ## Next, in order
 
-vma67w Keep the load generator's connection burst within the listen queue
 6gmafg Deterministic tests for the PostgreSQL pool's callback orderings and query chains
 lpgru3 Controlled-interleaving tests for the zio contracts the graceful shutdown relies on
 byurlg Measure the server's worst-case memory per connection, with full input and output at once
