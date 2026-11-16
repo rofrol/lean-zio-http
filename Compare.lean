@@ -1,8 +1,9 @@
 import Corpus
-import H1Adapter
+import Server.HandParser
+import Server.H1Adapter
 
-/-! `lsrv-compare`: the verdicts of the hand-written parser (`Http.parse`) and of
-`Std.Http.Protocol.H1` (`H1Adapter.parse`) on the same bytes (item 7bccgi).
+/-! `lsrv-compare`: the verdicts of the hand-written parser (`Server.HandParser.parse`)
+and of `Std.Http.Protocol.H1` (`Server.H1Adapter.parse`) on the same bytes (item 7bccgi).
 
 1. Properties over generated valid requests, for each parser: every proper
    prefix needs more bytes; the whole request is accepted with the generated
@@ -25,40 +26,45 @@ open Std.Http Std.Http.Protocol
 
 inductive V where
   | needMore
+  /-- H1 only: the head asked for `100-continue` and the body is missing. -/
+  | awaitingBody
   | bad (status : Nat)
   | ok (method target : String) (cl : Nat) (close : Bool) (consumed : Nat)
 deriving BEq, Repr
 
 def V.short : V → String
   | .needMore => "need-more"
+  | .awaitingBody => "awaiting-body"
   | .bad s => s!"bad {s}"
   | .ok m t cl c n => s!"ok {m} {t} cl={cl} close={c} consumed={n}"
 
 /-- The kind of a verdict and its status, without the request's fields. -/
 def V.kind : V → String
   | .needMore => "need-more"
+  | .awaitingBody => "awaiting-body"
   | .bad s => s!"{s}"
   | .ok .. => "ok"
 
 def text (b : ByteArray) : String := String.fromUTF8Lossy b
 
 def hand (b : ByteArray) : V :=
-  match parse b with
+  match Server.HandParser.parse b with
   | .needMore => .needMore
   | .bad s => .bad s
   | .ok h => .ok (text (b.extract 0 h.methodEnd)) (text (b.extract h.targetStart h.targetEnd))
       h.contentLength h.close (h.bodyStart + h.contentLength)
 
 def h1Host : ByteArray → Option String := fun b =>
-  match H1Adapter.parse b with
-  | .ok h _ _ => (h.headers.get? Header.Name.host).map (·.value)
+  match Server.H1Adapter.parse b with
+  | .ok h _ _ _ => (h.headers.get? Header.Name.host).map (·.value)
   | _ => none
 
 def h1 (b : ByteArray) : V :=
-  match H1Adapter.parse b with
+  match Server.H1Adapter.parse b with
   | .needMore => .needMore
+  | .awaitingBody => .awaitingBody
   | .bad s => .bad s
-  | .ok h n close =>
+  | .ok h _ n close =>
     let cl := match H1.Message.Head.getSize (dir := .receiving) h true with
       | some (.fixed k) => k
       | _ => 0
@@ -213,17 +219,20 @@ against `maxStartLineLength` (H1.lean:1750). -/
 def requestLineOf (n : Nat) : String :=
   "GET /" ++ Corpus.big (n - 16) ++ " HTTP/1.1\r\nHost: a\r\n\r\n"
 
-/-- Boundary cases with the verdict kind recorded for each parser. -/
+/-- Boundary cases with the verdict kind recorded for each parser. H1 alone
+bounds the request line and the field lines separately; `H1Adapter.parse`
+adds the bound on the whole head (`maxHeadBytes`), so both parsers refuse a
+head over 8,192 bytes, H1 with its own 414 where its line limit comes first. -/
 def boundaries : List (String × String × String × String) := [
   ("head of 8192 bytes", headOf 8192, "ok", "ok"),
-  ("head of 8193 bytes", headOf 8193, "431", "ok"),
-  ("field lines of 8192 bytes (H1's count)", fieldBytesOf 8192, "431", "ok"),
+  ("head of 8193 bytes", headOf 8193, "431", "431"),
+  ("field lines of 8192 bytes (H1's count)", fieldBytesOf 8192, "431", "431"),
   ("field lines of 8193 bytes (H1's count)", fieldBytesOf 8193, "431", "431"),
   ("100 fields", Corpus.manyHeaders 100, "ok", "ok"),
   ("101 fields", Corpus.manyHeaders 101, "431", "431"),
   ("body of 8192 bytes", bodyOf 8192, "ok", "ok"),
   ("body of 8193 bytes", bodyOf 8193, "413", "413"),
-  ("request line of 8192 bytes", requestLineOf 8192, "431", "ok"),
+  ("request line of 8192 bytes", requestLineOf 8192, "431", "431"),
   ("request line of 8193 bytes", requestLineOf 8193, "431", "414")
 ]
 
@@ -253,7 +262,7 @@ def interesting : Array (UInt8 × String) := #[
 
 /-- The part of request `b` that byte `i` belongs to. -/
 def regionAt (b : ByteArray) (i : Nat) : String := Id.run do
-  let some he := findHeadEnd b (b.size + 1) | return "?"
+  let some he := Server.HandParser.findHeadEnd b (b.size + 1) | return "?"
   if i ≥ he + 4 then return "body"
   if i ≥ he + 2 then return "empty line"
   let mut ls := i

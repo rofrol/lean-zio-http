@@ -1,68 +1,194 @@
-# Spike: Lean HTTP/1.1 on zio.ev
+# Lean HTTP/1.1 server on zio.ev
 
-A disposable experiment for item `dqsipn` (see `issues/dqsipn.md` for the
-numbers and the decisions around it). It asks whether a Lean application can
-serve HTTP as fast as Go's `net/http` and dusty, when its event loop comes
-from [zio](https://github.com/lalinsky/zio) instead of Lean's `Std.Async`.
-It is not production code; what production needs beyond it is listed in the
-item.
+The HTTP server of ekklesiai.org: a Lean 4 library on per-core `zio.ev`
+event loops (decision record `docs/decisions/0001-lean-http-server-on-zio.md`).
+It started as the spike of item `dqsipn` and keeps the directory name until
+it moves into its own repository (item gm6krq). The sections from
+"`Std.Http.Protocol.H1` compared with the hand-written parser" on are the
+spike's measurements, kept as they were written.
 
-- `zig/`: a static library; `bench.sh` builds it in ReleaseSafe (bounds and
-  overflow checks) unless `ZIG_OPTIMIZE` says otherwise. One `zio.ev` loop per thread, all
-  accepting on one listening socket on 127.0.0.1:8083; it prints `ready` once
-  every loop has registered its acceptor. The loop keeps no protocol or
-  buffering state: each connection holds a Lean `Conn.State`, reports the
-  outcome of every operation to it through `src/glue.c`, and performs the
-  action it answers. Worker threads call `lean_initialize_thread`, which
-  libleanrt exports but `lean.h` does not declare. It keeps at most one
-  operation in flight per connection and ends the process when a completion
-  finds none outstanding. Test settings, given on the command line after the
-  loop count: `--chunk N` caps every receive and send at N bytes, `--fail-every
-  N` reports every N-th completed receive and every N-th completed send to
-  Lean as failed, and `--trace`
-  prints `open <id>` and `free <id> <operations>` per connection and keeps
-  freed connections allocated, so a late completion hits that check. Reusing
-  a connection's completion from its own callback relies on zio's contract
+## Modules
+
+Lake libraries (`lean/lakefile.toml`) and what each may import. `lsrv-arch`
+(`lean/Arch.lean`) reads the imports of every `.lean` file of the package and
+fails on an import its module's rule does not allow, and on a file no rule
+names; `bench.sh` runs it.
+
+| module | role | may import |
+|---|---|---|
+| `Server.Wire` | the limits and `Server.Reply`, the adapter's answer to the bytes buffered on a connection | nothing |
+| `Server.Handler` | the interface the application implements: `Request → Response` | nothing |
+| `Server.Conn` | a connection's lifecycle: one state type and a pure `step` over the loop's events, with theorems | `Server.Wire` |
+| `Server.Transport` | the loop's Lean side: `ekk_serve`, the command line, the `server_exports` command that exports the loop's entry points | `Server.Wire`, `Server.Conn` |
+| `Server.Response` | writes and checks responses, for both adapters | contracts |
+| `Server.H1Adapter` | the production HTTP/1.1 adapter, `Std.Http.Protocol.H1` (D1) | contracts, `Server.Response`, `Std.Http.Protocol.H1` |
+| `Server.HandParser` | the hand-written parser: test comparator and rollback until item pihgvg, then deleted (D1) | contracts, `Server.Response` |
+| `Server.Pg.*` | the place of the PostgreSQL adapter (step 6 of D3); no module yet | contracts, `Server.Pg.*`, `Std` except `Std.Http` |
+| `App.*` | applications: `App.Hello` (the benchmark route), `App.Fixture` (the boundary tests' route) | `Server.Handler`, `App.*` |
+| `Main`, `Fixture` | composition roots `lsrv`, `lsrv-fixture`: H1 and one application | `Server.Transport`, `Server.H1Adapter`, `App.*` |
+| `MainHand`, `FixtureHand` | `lsrv-hand`, `lsrv-fixture-hand`: the same with the hand-written parser | `Server.Transport`, `Server.HandParser`, `App.*` |
+| `Test`, `Bench`, `Compare`, `Corpus`, `Arch` | tests and measurements | anything |
+
+"Contracts" are `Server.Wire` and `Server.Handler`. The transport knows
+neither HTTP nor the application; the application sees neither the
+transport nor `Std.Http`. The handler is pure and synchronous, which suits
+the applications so far; the PostgreSQL step changes this interface (a
+handler that waits for the database), with no compatibility layer for this
+one.
+
+- `zig/` (the transport's loop): a static library, built ReleaseSafe by
+  `bench.sh` unless `ZIG_OPTIMIZE` says otherwise. One `zio.ev` loop per
+  thread, all accepting on one listening socket on 127.0.0.1:8083; it prints
+  `ready` once every loop has registered its acceptor. The loop keeps no
+  protocol or buffering state: each connection holds a Lean `Conn.State`,
+  reports the outcome of every operation to it through `src/glue.c`, and
+  performs the action it answers. Worker threads call
+  `lean_initialize_thread`, which libleanrt exports but `lean.h` does not
+  declare. It keeps at most one operation in flight per connection and ends
+  the process when a completion finds none outstanding. Reusing a
+  connection's completion from its own callback relies on zio's contract
   (pinned 9bef33d, `src/ev/loop.zig` `finishCompletion`): the completion is
   marked dead before its callback runs, and for a completion without a group
   owner the callback is the last thing the loop does with it.
-- `lean/Conn.lean`: the connection's lifecycle as one state type (reading,
-  writing, closed) and a pure `step` over the loop's events, generic over the
-  request handler, with theorems: the buffer never exceeds the largest
-  accepted request, a closed connection stays closed and asks for nothing,
-  the close action always leaves it closed, every receive has room and every
-  send has at least one byte. What the theorems assume about the loop is in
-  the module's docstring.
-- `lean/Http.lean`: the protocol work. It frames requests (head up to 8 KiB,
-  Content-Length body up to 8 KiB, pipelining), validates the request line and
-  every header field, applies Content-Length, Host, Connection and
-  Transfer-Encoding rules (chunked bodies get 501), routes GET and HEAD `/`
-  (methods compared case-sensitively), and builds Content-Type, Date,
-  Content-Length and Connection headers; `handle` answers need-more or a
-  response with the bytes it consumes. `lean/Serve.lean` starts the loops and
-  reads the command line; `lean/Main.lean` (`lsrv`) exports the loop's entry
-  points for `handle`, and `lean/Fixture.lean` (`lsrv-fixture`) for a test
-  handler whose `/` body is 70,001 bytes, several times the loop's send buffer;
-  `lean/Test.lean` tests `handle` and `Conn.step` without sockets (statuses,
-  every proper prefix of complete requests, limits at their exact boundaries,
-  dates, and one connection through split receives and a partial send).
+- Command line: `lsrv [THREADS] [--max-conns N]`, then the test settings:
+  `--chunk N` caps every receive and send at N bytes, `--fail-every N`
+  reports every N-th completed receive and every N-th completed send to Lean
+  as failed, `--trace` prints `open <id>` and `free <id> <operations>
+  <injected receive failures> <injected send failures>` per connection and
+  keeps freed connections allocated, so a late completion hits that check,
+  and `--crash-after-recv N` and `--crash-after-send N` kill the process with
+  SIGKILL right after the N-th successful receive or send, before Lean hears
+  of it.
 - `dusty-hello/`: the same route on dusty, the HTTP library on zio.
 - `bench/`: Go's `net/http` with the same route (`goserver`), end-to-end
-  checks over real sockets (`check`), tests of the Zig/Lean boundary
-  (`boundary`: it starts `lsrv-fixture` with the test settings and checks
-  exact large responses through 7-byte operations, split and pipelined
-  requests, injected failures, and 2,000 connections closed or reset at
-  different points, each accepted connection freed exactly once), and a
-  closed-loop keep-alive load
-  generator (`load`) that counts only responses with status 200 and the
-  expected body and fails on anything else.
-- The toolchain's own parser, for item `7bccgi` (section below):
-  `lean/H1Adapter.lean` puts `Std.Http.Protocol.H1` behind `Http.handle`'s
-  shape; `lean/MainH1.lean` (`lsrv-h1`) and `lean/FixtureH1.lean`
-  (`lsrv-fixture-h1`) are `lsrv` and `lsrv-fixture` with it, the fixture's body
-  now in `lean/FixtureBody.lean`; `lean/Compare.lean` (`lsrv-compare`)
-  compares the two parsers' verdicts, `lean/Bench.lean` (`lsrv-bench`) their
-  cost, both over the requests in `lean/Corpus.lean`.
+  checks over real sockets (`check`), the boundary tests (`boundary`, below),
+  and a closed-loop keep-alive load generator (`load`) that counts only
+  responses with status 200 and the expected body and fails on anything else.
+
+## Production contract
+
+- **Effects precede their record, and all state is volatile.** A receive or
+  a send has happened in the kernel before its event reaches `Conn.step`; a
+  close is chosen before it is performed. Nothing survives the process. A
+  crash between an effect and its record can leave a peer with any prefix of
+  a response, possibly empty, and its request unanswered; a restarted server
+  knows nothing of it. HTTP clients see a closed connection, which they
+  already handle (consult round 20261116-042512-dc1f). `bench/boundary`
+  kills the server right after a receive (the client sees no byte) and right
+  after the third 7-byte send (the client sees at most those 21 bytes, a
+  prefix of the response), then checks that a fresh server serves normally.
+- **Requests.** HTTP/1.0 and 1.1 through `Std.Http.Protocol.H1`: a head of at
+  most 8,192 bytes in all (H1 bounds the request line and the header block
+  separately; the adapter answers a longer head, complete or not, with 431),
+  at most 100 fields, a Content-Length body of at most 8,192 bytes,
+  pipelining. So every request the adapter waits for fits in the connection's
+  buffer (`inCap`); `lsrv-test` feeds a 10,000-byte head and the largest body
+  through `Conn.step` and expects 431, not a silent close. H1 validates the
+  request line, the method (unregistered: 501), the version (505), the
+  request-target's form and URI syntax, exactly one Host with valid syntax in
+  HTTP/1.1, and the framing; a chunked body gets 501. CONNECT gets 501 and
+  never reaches the application (no tunnels). A rejected request gets its
+  status and the connection closes.
+- **`Expect: 100-continue`.** When a head asks for it in HTTP/1.1 and its body
+  is not complete, the connection sends `HTTP/1.1 100 Continue` once and
+  waits for the body (`Server.Reply.continue`, `Conn.serve_continued`); a
+  body sent with the head gets the final response directly, and HTTP/1.0 gets
+  no interim response. Other expectations are ignored.
+- **Bounded output.** A response is written whole into one buffer of at most
+  `maxResponseBytes` (65,536) bytes and sent in pieces of at most 8,192 bytes
+  (the loop's send buffer). A larger response, a status outside 200-599, a
+  body with 204, 205 or 304, a field the adapter owns (Content-Length,
+  Transfer-Encoding, Connection, Date, Keep-Alive, Upgrade, Trailer) or a
+  field name or value that is not valid becomes `500` with
+  `Connection: close` (`Server.Response.check`). Streaming larger bodies is
+  not offered; it would change the handler interface.
+- **Admission.** At most `--max-conns` connections (default 4,096) are open
+  process-wide; the rest wait in the kernel's listen queue. A loop arms its
+  accept only with a free slot, and an accepted connection keeps the slot
+  until its close; a loop that finds none pauses its acceptor and re-arms it
+  when one of its connections closes (the liveness argument is next to
+  `slots_used` in `zig/src/serve.zig`). At startup the soft `RLIMIT_NOFILE`
+  is raised to fit `--max-conns` plus a reserve, or the server refuses to
+  start.
+- **Accept errors.** Errors of the one pending connection (`ECONNABORTED`,
+  protocol and firewall errors, `ENETDOWN`) and a spurious `EAGAIN` re-arm
+  the accept. Exhaustion (`EMFILE`, `ENFILE`, `ENOBUFS`/`ENOMEM`) and errors
+  of the listening socket itself end the process with status 1 and a
+  `fatal:` line: the descriptor limit was checked at startup, so exhaustion
+  comes from outside the server and nothing in it waits for that to end; a
+  supervisor restarts it. Unresolved: Linux documents further errors of a
+  pending connection (`ENETUNREACH`, `EHOSTUNREACH`, `EHOSTDOWN`, `ENONET`,
+  `ENOPROTOOPT`, `EOPNOTSUPP`, accept(2): "treat them like EAGAIN"), but the
+  pinned zio maps them to `Unexpected` or `OperationNotSupported`, which also
+  stand for errors of a broken listening socket (`src/os/net.zig`,
+  `errnoToAcceptError`), so they end the process too. Re-arming on them
+  would spin on a broken socket; distinguishing them needs zio's error set.
+  Left to the owner.
+- **Shutdown.** SIGTERM or SIGINT starts a graceful shutdown: each loop stops
+  accepting (its armed accept is canceled; a connection accepted meanwhile is
+  closed), cancels every receive in flight and declines every later one
+  (`Conn.Event.refused`, which closes the connection), lets every send run to
+  completion, so a response already started arrives whole and requests
+  already buffered are answered, and its `loop.run` returns once nothing of
+  it is in flight: every completion queued before the stop has been
+  dispatched. When all loops have returned the process prints `stopped` and
+  exits with status 0. A peer that does not read its response holds the
+  shutdown until it does; ending that wait is the supervisor's deadline
+  (SIGKILL), not the server's.
+- **Not yet:** idle, read and write deadlines per connection (a peer can hold
+  a connection slot as long as it likes), chunked request bodies,
+  percent-decoding and query parsing, Go's larger limits.
+
+## Memory
+
+Retained per connection, bounded whatever the peer does: the loop's
+connection (two 8,192-byte buffers and its fields, a little over 16 KiB), the Lean
+buffer of unconsumed bytes (at most `inCap` = 16,388 bytes,
+`Conn.step_inv`), and a response being sent (at most 65,536 bytes,
+`Conn.step_inv`): about 98 KiB at most, so `--max-conns` × 98 KiB in all
+(about 392 MiB at the default 4,096). `Conn.step_inv` bounds the lengths
+of the Lean byte arrays, not their capacities: an array grown by appending
+may hold more capacity than its length, so the bound on allocated memory is
+the stated one only up to that slack (at most about twice the lengths).
+Transient allocations during one
+parse are not in this bound; each loop runs one parse at a time, so they are
+bounded per loop, not per connection. Measured by `bench/boundary` (1,000
+connections, each holding an 8,000-byte head while it waits for its body
+after `100 Continue`): 42.4 KiB per connection of resident set growth on the
+M1 (2026-11-16), under the stated bound. That measurement holds heads and
+the interim response only; it does not fill each connection's input buffer
+and output at once, so it does not establish the worst case.
+
+## Fragmented requests (decision D1)
+
+Every receive makes the adapter parse the whole buffer again, so a request
+split into many receives costs time quadratic in its size, for both parsers.
+`lsrv-bench` feeds requests to `Conn.step` in receives of k bytes (M1,
+2026-11-16; CPU time per request):
+
+| request | bytes | k | receives | hand-written ms | H1 ms |
+|---|---:|---:|---:|---:|---:|
+| browser GET, 16 headers | 789 | 1 | 789 | 1.2 | 13.4 |
+| browser GET, 16 headers | 789 | 1,460 | 1 | 0.0 | 0.1 |
+| largest head | 8,196 | 1 | 8,196 | 145 | 234 |
+| largest head | 8,196 | 7 | 1,171 | 34 | 62 |
+| largest head | 8,196 | 64 | 129 | 3.8 | 7.1 |
+| largest request | 16,388 | 1 | 16,388 | 1,405 | 4,233 |
+| largest request | 16,388 | 7 | 2,342 | 192 | 598 |
+| largest request | 16,388 | 64 | 257 | 12 | 62 |
+| largest request | 16,388 | 1,460 | 12 | 1.0 | 3.5 |
+
+The memory bounds above hold for any split, since the buffer never exceeds
+`inCap`; by D1's condition they do not block H1's adoption. The CPU does not
+have such a bound: a peer that sends the largest request one byte per
+segment costs a loop about 4.2 s of CPU in all with H1 (1.4 s with the
+hand-written parser). It is spread over the receives, each of which parses
+at most 16,388 bytes, so the loop serves its other connections in between;
+but a few such peers take most of a loop's CPU. Not worked around here
+(D1: no local workaround of the parser); keeping the parser's state across
+receives changes the adapter's interface and is a separate decision.
+
+## Running
 
 Run everything (macOS or Linux; needs the Lean toolchain from
 `lean/lean-toolchain`, Zig 0.17 and Go):
@@ -71,30 +197,42 @@ Run everything (macOS or Linux; needs the Lean toolchain from
 spike/zio-http/bench.sh
 ```
 
-It builds all parts, runs the Lean tests, the parser comparison and
-benchmark, the boundary tests and the end-to-end checks (the last two against
-both Lean parsers), then
-measures each server at 1, 64 and 256 connections for 10 s, printing
-requests per second, latency percentiles and server CPU time per request.
-Any failure stops it with a nonzero status, and every server it started is
-stopped on exit. A server that stops answering keeps it from ending; that is
-a failure to trace, never a result.
+It builds all parts, runs the Lean tests (`lsrv-test`: both adapters on the
+same requests, limits at their exact boundaries, Host and target
+validation, `100-continue`, the response checks, and connections through
+`Conn.step`), the module boundary check (`lsrv-arch`), the parser comparison
+and benchmark (`lsrv-compare`, `lsrv-bench`), the boundary tests and the
+end-to-end checks (the last two against both parsers), then measures each
+server at 1, 64 and 256 connections for 10 s, printing requests per second,
+latency percentiles and server CPU time per request; the Lean servers must
+then stop gracefully on SIGTERM. Any failure stops it with a nonzero status,
+and every server it started is stopped on exit. A server that stops
+answering keeps it from ending; that is a failure to trace, never a result.
+
+`bench/boundary` starts the fixture server (`lsrv-fixture`, and
+`lsrv-fixture-hand` with `-no-continue`) with the test settings and checks:
+exact 60,001-byte responses through 7-byte operations, split and pipelined
+requests, injected failures, 2,000 connections closed or reset at different
+points, `100-continue` and a response over the bound, the graceful shutdown
+with a response in flight and an idle and a partial connection, admission at
+`--max-conns 2`, the two crash points, and the memory per connection; every
+accepted connection must be freed exactly once and the server must stop
+with status 0.
 
 Reading the numbers: the load generator runs on the same machine, so at 64
 and more connections it is the limit; compare the 1-connection rows and the
-CPU per request. The servers differ in features and limits (below), and
+CPU per request. The servers differ in features and limits (above), and
 closed-loop latency hides queueing under overload. Acceptance runs belong on
-Linux with HttpArena's tooling (see the item).
-
-What the Lean side does not do yet, unlike Go: chunked request bodies, a map
-of all headers for the application, percent-decoding and query parsing,
-`Expect: 100-continue`, Host syntax checks, and Go's larger limits.
+Linux with HttpArena's tooling (item pihgvg).
 
 ## `Std.Http.Protocol.H1` compared with the hand-written parser (item 7bccgi)
 
 Toolchain leanprover/lean4 nightly-2026-11-14 (`lean/lean-toolchain`); paths
 below are under its `src/lean/Std/Http/`. Numbers from one `bench.sh` run on
-the M1 (2026-11-16).
+the M1 (2026-11-16). Written before the module split: `Http.lean` is now
+`Server/HandParser.lean`, `H1Adapter.lean` is `Server/H1Adapter.lean`,
+`lsrv-h1` is now `lsrv` and the old `lsrv` is `lsrv-hand`; the adapter has
+since started answering `Expect: 100-continue` (above).
 
 ### Does H1 run without Std.Async and fit `Conn.step`?
 
@@ -211,7 +349,7 @@ the last, where it is slower to reject a malformed request line. Neither
 parser accepted anything the other framed differently: no request was
 consumed with a different length or body by the two.
 
-### Proposal for D1 (not decided here)
+### Proposal for D1 (decided: D1 in the decision record)
 
 Options:
 
@@ -253,7 +391,7 @@ Evidence (2026-11-16, diagnostic scripts outside the repository, not tests):
 - Limit: `sysctl kern.ipc.somaxconn` is 128; dusty asks for that backlog
   (`src/server.zig:576-589` and `Listener.kernel_backlog` in
   `src/config.zig`, dusty 96e117f), Go's `net.Listen` asks for it too, and the
-  Lean loop asks for 4,096 (`zig/src/serve.zig:302`). A Go program that
+  Lean loop asks for 4,096 (`zig/src/serve.zig:472`). A Go program that
   listens with backlog 128, or with 4,096 through `listen(2)`, never accepts,
   and dials N connections at once that each send a byte and read: for N = 128
   all 128 wait in the queue; for N = 129, 160, 192, 256 and 512, exactly 128

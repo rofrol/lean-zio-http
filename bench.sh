@@ -1,11 +1,12 @@
 #!/bin/sh
-# Builds the three servers, the checks and the load generator; runs the Lean
-# unit tests, the Zig/Lean boundary tests (bench/boundary, which start the
-# fixture server themselves) and the end-to-end checks against the Lean
-# server, each twice: with the hand-written parser (lsrv) and with the
-# toolchain's Std.Http.Protocol.H1 behind an adapter (lsrv-h1); compares the
-# two parsers' verdicts (lsrv-compare) and their cost per request
-# (lsrv-bench); then measures
+# Builds the servers, the checks and the load generator; runs the Lean unit
+# tests (lsrv-test), the module boundary check (lsrv-arch), the Zig/Lean
+# boundary tests (bench/boundary, which start the fixture servers themselves)
+# and the end-to-end checks against the Lean server, each twice: with the
+# toolchain's Std.Http.Protocol.H1 behind Server.H1Adapter (lsrv, decision
+# D1) and with the hand-written comparator (lsrv-hand); compares the two
+# parsers' verdicts (lsrv-compare), their cost per request and on fragmented
+# requests (lsrv-bench); then measures
 # each server: requests per second, latency, and server CPU time per request
 # at 1, 64 and 256 keep-alive connections, 10 s per run, all on this machine.
 # Any failing test, check or load run stops the script with a nonzero status.
@@ -69,7 +70,14 @@ start() {
   exec 3<&-
 }
 
-stop() { kill -TERM "$pid"; wait "$pid" 2>/dev/null || true; }
+# stop [graceful]: SIGTERM; with `graceful`, the server must exit with status
+# 0 (the Lean servers' shutdown, README "Production contract").
+stop() {
+  kill -TERM "$pid"
+  status=0
+  wait "$pid" 2>/dev/null || status=$?
+  if [ "${1:-}" = graceful ] && [ "$status" != 0 ]; then echo "$name exited with $status after SIGTERM"; exit 1; fi
+}
 
 measure() {
   name=$1; port=$2
@@ -83,21 +91,22 @@ measure() {
 }
 
 lean/.lake/build/bin/lsrv-test
+(cd lean && .lake/build/bin/lsrv-arch)
 lean/.lake/build/bin/lsrv-compare >"$tmp/compare.txt" || { cat "$tmp/compare.txt"; exit 1; }
 sed -n '1,/^## Malformed/p' "$tmp/compare.txt"
 grep -E '^[0-9]+ requests: [0-9]+ verdicts' "$tmp/compare.txt"
 lean/.lake/build/bin/lsrv-bench
 bench/boundary/boundary
-bench/boundary/boundary -fixture lean/.lake/build/bin/lsrv-fixture-h1
-start lean-zio ready lean/.lake/build/bin/lsrv 8
-bench/check/check -addr 127.0.0.1:8083
-measure lean-zio 8083
-stop
-
-start lean-h1 ready lean/.lake/build/bin/lsrv-h1 8
+bench/boundary/boundary -no-continue -fixture lean/.lake/build/bin/lsrv-fixture-hand
+start lean-h1 ready lean/.lake/build/bin/lsrv 8
 bench/check/check -addr 127.0.0.1:8083
 measure lean-h1 8083
-stop
+stop graceful
+
+start lean-hand ready lean/.lake/build/bin/lsrv-hand 8
+bench/check/check -addr 127.0.0.1:8083
+measure lean-hand 8083
+stop graceful
 
 start go ready bench/goserver/server
 measure go 8082

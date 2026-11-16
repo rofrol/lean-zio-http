@@ -1,13 +1,48 @@
 name = "lsrv"
-defaultTargets = ["lsrv", "lsrv-fixture", "lsrv-test", "lsrv-h1", "lsrv-fixture-h1", "lsrv-bench", "lsrv-compare"]
+defaultTargets = ["lsrv", "lsrv-hand", "lsrv-fixture", "lsrv-fixture-hand", "lsrv-test", "lsrv-bench", "lsrv-compare", "lsrv-arch"]
+testDriver = "lsrv-test"
 
+# The server's modules, one library per responsibility. Arch.lean (lsrv-arch)
+# checks every module's imports against the allowed directions; Lake alone
+# lets any module of a package import any other.
+
+# The contracts: Wire (connection <-> protocol adapter) and Handler
+# (adapter <-> application). They import nothing.
 [[lean_lib]]
-name = "Http"
-roots = ["Http", "Conn", "Serve", "H1Adapter", "FixtureBody", "Corpus"]
+name = "ServerContracts"
+roots = ["Server.Wire", "Server.Handler"]
+
+# The transport's Lean side: the connection model and the FFI to the zio.ev
+# loop (zig/). Imports only Wire.
+[[lean_lib]]
+name = "ServerTransport"
+roots = ["Server.Conn", "Server.Transport"]
+
+# The HTTP/1.1 adapter (Std.Http.Protocol.H1, decision D1) and the response
+# writer; the hand-written parser as comparator and rollback. Import Wire and
+# Handler, never the transport.
+[[lean_lib]]
+name = "ServerHttp"
+roots = ["Server.Response", "Server.H1Adapter", "Server.HandParser"]
+
+# The applications: import only Server.Handler (and each other).
+[[lean_lib]]
+name = "App"
+roots = ["App.Hello", "App.Fixture"]
+
+# Tests and measurements.
+[[lean_lib]]
+name = "TestSupport"
+roots = ["Corpus"]
 
 [[lean_exe]]
 name = "lsrv"
 root = "Main"
+moreLinkArgs = ["../zig/zig-out/lib/libzsrv.a"]
+
+[[lean_exe]]
+name = "lsrv-hand"
+root = "MainHand"
 moreLinkArgs = ["../zig/zig-out/lib/libzsrv.a"]
 
 [[lean_exe]]
@@ -16,18 +51,13 @@ root = "Fixture"
 moreLinkArgs = ["../zig/zig-out/lib/libzsrv.a"]
 
 [[lean_exe]]
+name = "lsrv-fixture-hand"
+root = "FixtureHand"
+moreLinkArgs = ["../zig/zig-out/lib/libzsrv.a"]
+
+[[lean_exe]]
 name = "lsrv-test"
 root = "Test"
-
-[[lean_exe]]
-name = "lsrv-h1"
-root = "MainH1"
-moreLinkArgs = ["../zig/zig-out/lib/libzsrv.a"]
-
-[[lean_exe]]
-name = "lsrv-fixture-h1"
-root = "FixtureH1"
-moreLinkArgs = ["../zig/zig-out/lib/libzsrv.a"]
 
 [[lean_exe]]
 name = "lsrv-bench"
@@ -36,3 +66,8 @@ root = "Bench"
 [[lean_exe]]
 name = "lsrv-compare"
 root = "Compare"
+
+[[lean_exe]]
+name = "lsrv-arch"
+root = "Arch"
+supportInterpreter = true

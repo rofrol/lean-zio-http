@@ -1,8 +1,12 @@
-// Tests of the Zig/Lean boundary (zig/src/serve.zig, glue.c, lean/Conn.lean)
-// over real sockets. Each scenario starts a server executable with the loop's
-// test settings (--chunk, --fail-every, --trace), drives connections against
-// it, and then checks, from the server's trace lines, that every connection
-// it accepted was freed exactly once. The loop itself ends the process when an
+// Tests of the Zig/Lean boundary (zig/src/serve.zig, glue.c,
+// lean/Server/Conn.lean) over real sockets. Each scenario starts a server
+// executable with the loop's test settings (--chunk, --fail-every, --trace,
+// --max-conns, --crash-after-recv, --crash-after-send), drives connections
+// against it, and then checks, from the server's trace lines, that every
+// connection it accepted was freed exactly once and that SIGTERM ended it
+// gracefully (exit status 0 after "stopped"). The crash scenarios check what
+// a peer sees when the process dies between an effect and its record. The
+// loop itself ends the process when an
 // operation is submitted while another is in flight, when a completion
 // arrives without one outstanding (a duplicate or stale completion, also
 // after the free, since traced connections stay allocated), or when a receive
@@ -39,7 +43,7 @@ import (
 // accounting still checks. Recorded in issues/dqsipn.md.
 const zioShutWarning = "warning(zio): unexpected error: .INVAL (22) - please file a bug report: https://github.com/lalinsky/zio/issues/new"
 
-const bodySize = 70001 // lean/Fixture.lean's fixtureBody
+const bodySize = 60001 // lean/App/Fixture.lean's body
 
 var body = func() []byte {
 	b := make([]byte, bodySize)
@@ -60,6 +64,31 @@ type server struct {
 	cmd    *exec.Cmd
 	lines  chan string // stderr lines; closed when the process's stderr ends
 	output []string    // every stderr line read so far, for failure reports
+}
+
+// end reads the rest of the server's output and waits for the process to
+// end on its own (after a crash point).
+func (s *server) end() *os.ProcessState {
+	for line := range s.lines {
+		s.output = append(s.output, line)
+	}
+	s.cmd.Wait()
+	return s.cmd.ProcessState
+}
+
+// until reads trace lines into t until done(t) holds.
+func (s *server) until(t *trace, done func(*trace) bool) error {
+	for !done(t) {
+		line, ok := <-s.lines
+		if !ok {
+			return fmt.Errorf("server ended: %s", tail(s.output))
+		}
+		s.output = append(s.output, line)
+		if err := t.take(line); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // start runs path with args and returns once it has printed "ready".
@@ -114,6 +143,9 @@ type trace struct {
 	open, freed      map[uint64]bool
 	ops, shutWarns   uint64
 	injRecv, injSend uint64
+	stopped          int
+	// Sends in flight when a loop's stop arrived (its "stop R S" lines).
+	sendsAtStop uint64
 }
 
 func newTrace(allowShutWarning bool) *trace {
@@ -139,6 +171,10 @@ func (t *trace) take(line string) error {
 		t.ops += num(2)
 		t.injRecv += num(3)
 		t.injSend += num(4)
+	case len(f) == 3 && f[0] == "stop":
+		t.sendsAtStop += num(2)
+	case line == "stopped":
+		t.stopped++
 	case t.allowShutWarning && line == zioShutWarning:
 		t.shutWarns++
 	default:
@@ -150,8 +186,9 @@ func (t *trace) take(line string) error {
 // account reads trace lines until the server has opened `connects`
 // connections and freed every one it opened. The client has closed all its
 // connections by then, so the server reaches that state unless it lost one.
-// It then stops the server and checks the output that came after, and that
-// the process ended by the SIGTERM rather than by a panic.
+// It then stops the server with SIGTERM and checks the output that came
+// after, and that the process shut down gracefully: "stopped" once, exit
+// status 0.
 func (s *server) account(t *trace, connects int64) (string, error) {
 	for int64(len(t.open)) < connects || len(t.freed) < len(t.open) {
 		line, ok := <-s.lines
@@ -170,8 +207,8 @@ func (s *server) account(t *trace, connects int64) (string, error) {
 			return "", fmt.Errorf("after the last free: %w; output: %s", err, tail(s.output))
 		}
 	}
-	if ws, ok := st.Sys().(syscall.WaitStatus); !ok || !ws.Signaled() || ws.Signal() != syscall.SIGTERM {
-		return "", fmt.Errorf("server ended with %v, not by SIGTERM: %s", st, tail(s.output))
+	if !st.Success() || t.stopped != 1 {
+		return "", fmt.Errorf("server ended with %v after %d \"stopped\" lines, not by a graceful shutdown: %s", st, t.stopped, tail(s.output))
 	}
 	if int64(len(t.open)) != connects || len(t.freed) != len(t.open) {
 		return "", fmt.Errorf("server opened %d and freed %d connections, client made %d", len(t.open), len(t.freed), connects)
@@ -294,6 +331,307 @@ func parallel(n, width int, f func(i int) error) error {
 	return first
 }
 
+const continueBytes = "HTTP/1.1 100 Continue\r\n\r\n"
+
+func dial(addr string) (*net.TCPConn, error) {
+	c, err := net.Dial("tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+	tc := c.(*net.TCPConn)
+	tc.SetNoDelay(true)
+	return tc, nil
+}
+
+// expectEOF reads from r and requires the server's close with no byte before it.
+func expectEOF(r io.Reader, what string) error {
+	n, err := r.Read(make([]byte, 1))
+	if n != 0 || (err != io.EOF && !errors.Is(err, syscall.ECONNRESET)) {
+		return fmt.Errorf("%s: read %d bytes, %v; want the server's close", what, n, err)
+	}
+	return nil
+}
+
+// expectations sends a POST with `Expect: 100-continue`, waits for the
+// interim response before sending the body, and checks the echoed body; then
+// asks for /too-big, whose body exceeds the bounded output, and expects 500
+// and the server's close.
+func expectations(addr string) (int64, string, error) {
+	c, err := dial(addr)
+	if err != nil {
+		return 0, "", err
+	}
+	defer c.Close()
+	r := bufio.NewReader(c)
+	io.WriteString(c, "POST /echo HTTP/1.1\r\nHost: a\r\nExpect: 100-continue\r\nContent-Length: 5\r\n\r\n")
+	interim := make([]byte, len(continueBytes))
+	if _, err := io.ReadFull(r, interim); err != nil || string(interim) != continueBytes {
+		return 1, "", fmt.Errorf("interim response %q, %v", interim, err)
+	}
+	io.WriteString(c, "hello")
+	resp, err := http.ReadResponse(r, &http.Request{Method: "POST"})
+	if err != nil {
+		return 1, "", err
+	}
+	got, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 || string(got) != "hello" {
+		return 1, "", fmt.Errorf("echo: status %d body %q", resp.StatusCode, got)
+	}
+	c2, err := dial(addr)
+	if err != nil {
+		return 1, "", err
+	}
+	defer c2.Close()
+	r2 := bufio.NewReader(c2)
+	io.WriteString(c2, "GET /too-big HTTP/1.1\r\nHost: a\r\n\r\n")
+	resp, err = http.ReadResponse(r2, &http.Request{Method: "GET"})
+	if err != nil {
+		return 2, "", err
+	}
+	io.ReadAll(resp.Body)
+	if resp.StatusCode != 500 {
+		return 2, "", fmt.Errorf("/too-big: status %d, want 500", resp.StatusCode)
+	}
+	return 2, "", expectEOF(r2, "after the 500")
+}
+
+// shutdown sends SIGTERM to a one-loop server while it holds three
+// connections: one in the middle of a 60,001-byte response sent 7 bytes per
+// operation, one idle, one with half a request. The response must arrive
+// whole, then every connection must see the server's close with nothing
+// else, and the process must stop gracefully.
+func shutdown(path, addr string) (string, error) {
+	s, err := start(path, "1", "--chunk", "7", "--trace")
+	if err != nil {
+		return "", err
+	}
+	defer s.stop()
+	t := newTrace(false)
+	a, err := dial(addr)
+	if err != nil {
+		return "", err
+	}
+	defer a.Close()
+	ra := bufio.NewReader(a)
+	io.WriteString(a, get)
+	if _, err := ra.Peek(1); err != nil {
+		return "", fmt.Errorf("response did not start: %v", err)
+	}
+	idle, err := dial(addr)
+	if err != nil {
+		return "", err
+	}
+	defer idle.Close()
+	partial, err := dial(addr)
+	if err != nil {
+		return "", err
+	}
+	defer partial.Close()
+	io.WriteString(partial, get[:len(get)/2])
+	if err := s.until(t, func(t *trace) bool { return len(t.open) == 3 }); err != nil {
+		return "", err
+	}
+	s.cmd.Process.Signal(syscall.SIGTERM)
+	if err := readExact(ra, false); err != nil {
+		return "", fmt.Errorf("the response in flight: %w", err)
+	}
+	for _, e := range []struct {
+		r    io.Reader
+		what string
+	}{{ra, "after the response"}, {idle, "idle connection"}, {partial, "half a request"}} {
+		if err := expectEOF(e.r, e.what); err != nil {
+			return "", err
+		}
+	}
+	summary, err := s.account(t, 3)
+	if err == nil && t.sendsAtStop == 0 {
+		// Without a send in flight at the stop, the scenario shows nothing
+		// about sends surviving the shutdown.
+		return "", fmt.Errorf("the response was sent completely before the stop arrived")
+	}
+	return summary, err
+}
+
+// admission runs a one-loop server with --max-conns 2: two connections are
+// served, a third one waits in the listen queue, and the server accepts it
+// only after one of the two closed (its "open" follows a "free" in the
+// trace; without the limit it would be accepted while both are open, before
+// the client closes the first). A control run with --max-conns 3 must show
+// that early accept, so the trace order is shown to detect a missing limit.
+func admission(path, addr string) (string, error) {
+	summary, early, err := admit(path, addr, "2")
+	if err != nil {
+		return "", err
+	}
+	if early {
+		return "", fmt.Errorf("the third connection was accepted while two were open")
+	}
+	if _, early, err = admit(path, addr, "3"); err != nil {
+		return "", fmt.Errorf("control run with --max-conns 3: %w", err)
+	}
+	if !early {
+		return "", fmt.Errorf("control run with --max-conns 3: the third connection was not accepted before a slot freed, so the scenario cannot detect a missing limit")
+	}
+	return summary + "; a control run without the limit accepted early", nil
+}
+
+// admit runs the admission scenario with `maxConns`; early reports whether
+// the third connection was opened before any connection was freed.
+func admit(path, addr, maxConns string) (string, bool, error) {
+	s, err := start(path, "1", "--max-conns", maxConns, "--trace")
+	if err != nil {
+		return "", false, err
+	}
+	defer s.stop()
+	t := newTrace(false)
+	var cs [3]*net.TCPConn
+	var rs [3]*bufio.Reader
+	for i := range cs {
+		if cs[i], err = dial(addr); err != nil {
+			return "", false, err
+		}
+		defer cs[i].Close()
+		rs[i] = bufio.NewReader(cs[i])
+		io.WriteString(cs[i], get)
+		if i < 2 {
+			if err := readExact(rs[i], false); err != nil {
+				return "", false, fmt.Errorf("connection %d: %w", i+1, err)
+			}
+		}
+	}
+	// A round trip on the second connection after the third one connected.
+	io.WriteString(cs[1], get)
+	if err := readExact(rs[1], false); err != nil {
+		return "", false, fmt.Errorf("connection 2 again: %w", err)
+	}
+	cs[0].Close()
+	if err := readExact(rs[2], false); err != nil {
+		return "", false, fmt.Errorf("connection 3 after a slot freed: %w", err)
+	}
+	var early bool
+	err = s.until(t, func(t *trace) bool {
+		if len(t.open) == 3 && len(t.freed) == 0 {
+			early = true
+		}
+		return len(t.open) == 3
+	})
+	if err != nil {
+		return "", false, err
+	}
+	cs[1].Close()
+	cs[2].Close()
+	summary, err := s.account(t, 3)
+	return summary, early, err
+}
+
+// crashPoint runs a one-loop server that kills itself with SIGKILL right
+// after its `n`-th successful receive or send (crashArg), before Lean
+// records it, and checks what the client saw: at most `most` bytes, a prefix
+// of the response. A fresh server must then serve normally: nothing of the
+// crashed process survives (README, "Production contract").
+func crashPoint(path, addr, crashArg string, n, most int, args ...string) (string, error) {
+	s, err := start(path, append([]string{"1", crashArg, strconv.Itoa(n)}, args...)...)
+	if err != nil {
+		return "", err
+	}
+	c, err := dial(addr)
+	if err != nil {
+		s.stop()
+		return "", err
+	}
+	io.WriteString(c, get)
+	got, _ := io.ReadAll(c) // the kill closes the socket: EOF, or a reset
+	c.Close()
+	st := s.end()
+	kind := strings.TrimPrefix(crashArg, "--crash-after-")
+	if ws, ok := st.Sys().(syscall.WaitStatus); !ok || !ws.Signaled() || ws.Signal() != syscall.SIGKILL {
+		return "", fmt.Errorf("server ended with %v, not by its SIGKILL: %s", st, tail(s.output))
+	}
+	if len(s.output) != 2 || !strings.HasPrefix(s.output[1], "crash "+kind+" ") {
+		return "", fmt.Errorf("output %q, want ready and one crash %s line", s.output, kind)
+	}
+	const prefix = "HTTP/1.1 200 OK\r\nContent-Type: "
+	if len(got) > most || !strings.HasPrefix(prefix, string(got)) {
+		return "", fmt.Errorf("client saw %q; want a prefix of the response of at most %d bytes", got, most)
+	}
+	s2, err := start(path, "1", "--trace")
+	if err != nil {
+		return "", fmt.Errorf("restart: %w", err)
+	}
+	defer s2.stop()
+	if err := exchange(addr); err != nil {
+		return "", fmt.Errorf("after the restart: %w", err)
+	}
+	summary, err := s2.account(newTrace(false), 1)
+	return fmt.Sprintf("client saw %d response bytes, %q; restarted server: %s", len(got), s.output[1], summary), err
+}
+
+// rssKiB is the resident set size of process pid, from ps(1).
+func rssKiB(pid int) (int, error) {
+	out, err := exec.Command("ps", "-o", "rss=", "-p", strconv.Itoa(pid)).Output()
+	if err != nil {
+		return 0, err
+	}
+	return strconv.Atoi(strings.TrimSpace(string(out)))
+}
+
+// memory measures the retained memory of connections holding a request
+// head: 1000 connections each send an 8,000-byte head with
+// `Expect: 100-continue` and a body still to come; the interim response is
+// the event that shows the server buffered the head and waits. The growth
+// of the resident set per connection must stay within the bound the README
+// states per connection (perConnBound).
+func memory(path, addr string) (string, error) {
+	const n = 1000
+	// README, "Memory": the loop's connection (two 8 KiB buffers and its
+	// fields), the Lean buffer of at most inCap bytes, and a response of at
+	// most 64 KiB, with 2 KiB for allocator and object headers.
+	const perConnBound = (16640 + 16388 + 65536 + 2048) / 1024
+	s, err := start(path, "1", "--max-conns", "1100")
+	if err != nil {
+		return "", err
+	}
+	defer s.stop()
+	base, err := rssKiB(s.cmd.Process.Pid)
+	if err != nil {
+		return "", err
+	}
+	fill := strings.Repeat("a", 8000)
+	conns := make([]*net.TCPConn, n)
+	defer func() {
+		for _, c := range conns {
+			if c != nil {
+				c.Close()
+			}
+		}
+	}()
+	err = parallel(n, 32, func(i int) error {
+		c, err := dial(addr)
+		if err != nil {
+			return err
+		}
+		conns[i] = c
+		io.WriteString(c, "POST /echo HTTP/1.1\r\nHost: a\r\nExpect: 100-continue\r\nContent-Length: 8192\r\nX: "+fill+"\r\n\r\n")
+		interim := make([]byte, len(continueBytes))
+		if _, err := io.ReadFull(c, interim); err != nil || string(interim) != continueBytes {
+			return fmt.Errorf("interim response %q, %v", interim, err)
+		}
+		return nil
+	})
+	if err != nil {
+		return "", err
+	}
+	held, err := rssKiB(s.cmd.Process.Pid)
+	if err != nil {
+		return "", err
+	}
+	per := float64(held-base) / n
+	if per > perConnBound {
+		return "", fmt.Errorf("%.1f KiB per connection, over the stated bound of %d KiB", per, perConnBound)
+	}
+	return fmt.Sprintf("resident set %d KiB idle, %d KiB with %d heads held: %.1f KiB per connection (bound %d KiB)", base, held, n, per, perConnBound), nil
+}
+
 type scenario struct {
 	name string
 	args []string
@@ -305,6 +643,12 @@ type scenario struct {
 	injects bool
 	// run drives the server and returns how many connections it made.
 	run func(addr string) (int64, string, error)
+	// custom, when set, replaces args and run: it starts its own servers and
+	// returns a summary.
+	custom func(path, addr string) (string, error)
+	// continues: the scenario needs the server to answer
+	// `Expect: 100-continue`, which the hand-written comparator does not.
+	continues bool
 }
 
 func exchanges(n int) func(addr string) (int64, string, error) {
@@ -395,27 +739,50 @@ func churn(addr string) (int64, string, error) {
 func main() {
 	fixture := flag.String("fixture", "lean/.lake/build/bin/lsrv-fixture", "fixture server executable")
 	addr := flag.String("addr", "127.0.0.1:8083", "address the server listens on")
+	noContinue := flag.Bool("no-continue", false, "the fixture does not answer Expect: 100-continue (lsrv-fixture-hand); skip the scenarios that need it")
 	flag.Parse()
 	scenarios := []scenario{
-		{"large responses, operations of at most 7 bytes", []string{"2", "--chunk", "7", "--trace"}, false, false, exchanges(8)},
-		{"large responses, full-size operations", []string{"2", "--trace"}, false, false, exchanges(16)},
-		{"every 29th receive and every 29th send fail", []string{"2", "--fail-every", "29", "--trace"}, false, true, failures},
-		{"connection churn with resets", []string{"4", "--trace"}, true, false, churn},
+		{"large responses, operations of at most 7 bytes", []string{"2", "--chunk", "7", "--trace"}, false, false, exchanges(8), nil, false},
+		{"large responses, full-size operations", []string{"2", "--trace"}, false, false, exchanges(16), nil, false},
+		{"every 29th receive and every 29th send fail", []string{"2", "--fail-every", "29", "--trace"}, false, true, failures, nil, false},
+		{"connection churn with resets", []string{"4", "--trace"}, true, false, churn, nil, false},
+		{"Expect: 100-continue and a response over the bound, operations of at most 7 bytes", []string{"2", "--chunk", "7", "--trace"}, false, false, expectations, nil, true},
+		{"graceful shutdown with a response in flight, an idle and a partial connection", nil, false, false, nil, shutdown, false},
+		{"admission: at most 2 connections", nil, false, false, nil, admission, false},
+		{"crash after the first receive", nil, false, false, nil, func(p, a string) (string, error) {
+			return crashPoint(p, a, "--crash-after-recv", 1, 0)
+		}, false},
+		{"crash after the third 7-byte send", nil, false, false, nil, func(p, a string) (string, error) {
+			return crashPoint(p, a, "--crash-after-send", 3, 21, "--chunk", "7")
+		}, false},
+		{"memory of 1000 connections holding a head", nil, false, false, nil, memory, true},
 	}
-	failed := 0
+	failed, ran := 0, 0
 	for _, sc := range scenarios {
+		if sc.continues && *noContinue {
+			fmt.Printf("skipped %s: the fixture does not answer Expect: 100-continue\n", sc.name)
+			continue
+		}
+		ran++
 		if err := runScenario(*fixture, *addr, sc); err != nil {
 			fmt.Printf("FAIL %s: %v\n", sc.name, err)
 			failed++
 		}
 	}
-	fmt.Printf("%d of %d boundary scenarios failed\n", failed, len(scenarios))
+	fmt.Printf("%d of %d boundary scenarios failed\n", failed, ran)
 	if failed > 0 {
 		os.Exit(1)
 	}
 }
 
 func runScenario(path, addr string, sc scenario) error {
+	if sc.custom != nil {
+		summary, err := sc.custom(path, addr)
+		if err == nil {
+			fmt.Printf("ok %s: %s\n", sc.name, summary)
+		}
+		return err
+	}
 	s, err := start(path, sc.args...)
 	if err != nil {
 		return err

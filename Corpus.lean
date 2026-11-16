@@ -1,9 +1,11 @@
-import Http
+import Server.Wire
 
 /-! Byte sequences both parsers are measured and compared on (item 7bccgi):
 the spike's test requests (Test.lean, bench/check) and a typical browser GET. -/
 
 namespace Corpus
+
+open Server
 
 def big (n : Nat) : String := String.ofList (List.replicate n 'a')
 
@@ -12,7 +14,7 @@ def maxHeadRequest : String :=
   let fixed := "GET / HTTP/1.1\r\nHost: a\r\nX: "
   fixed ++ big (maxHeadBytes - fixed.length) ++ "\r\n\r\n"
 
-/-- The largest request `Http.parse` accepts: an 8192-byte head and an 8192-byte body. -/
+/-- The largest request the parsers accept: an 8192-byte head and an 8192-byte body. -/
 def maxRequest : String :=
   let fixed := "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 8192\r\nX: "
   fixed ++ big (maxHeadBytes - fixed.length) ++ "\r\n\r\n" ++ big maxBodyBytes
