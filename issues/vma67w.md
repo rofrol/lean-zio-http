@@ -32,3 +32,5 @@ in time and dusty, even with 8 accept loops, does not.
 
 Check: the 30-iteration loop from the README section passes at 256 and 512
 connections for dusty and Go, and `bench.sh` exits 0.
+
+Decided 2026-11-16 by this session with sol (consult round 20261116-145342-a8e2), under the user's delegation of that day to decide with sol what comes next: approved with option 1: each connection's warm-up request and its response gate the start of the measurement, at most 128 connections awaiting their first response at a time, no delays or retries. The README states that the numbers exclude connection setup. Check as above: the 30-iteration loop passes at 256 and 512 for dusty and Go, and ./bench.sh exits 0.
