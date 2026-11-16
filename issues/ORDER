@@ -2,7 +2,6 @@
 
 ## Proposed
 
-jl63fo Point issues i35sos and tc5rsx at zig/src/pg.c instead of zig/src/glue.c
 vvxfl6 The stop notification can wake a loop that has already ended (zio Async.notify racing Loop.deinit)
 kaslrv Run the worst-case memory scenario on Linux
 dl4bte Confirm from the server the connection state the worst-case memory scenario measures
