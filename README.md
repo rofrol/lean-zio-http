@@ -203,13 +203,23 @@ only `Server.Query` values.
   closing loop has acknowledged that the close finished), each loop
   acknowledges a snapshot of its own admission state, so the test sees both acceptors
   pause when the server is full, a connection wait in the listen queue,
-  and the loop whose connection closed re-arm and take it. Unresolved: the
-  pinned zio's `Async.notify` can reach a loop's poller after that loop has
-  ended. The signal thread notifies a loop's stop handle; if that loop wakes
-  for another event, finishes its shutdown and closes its poller before the
-  notify's own wake, the wake fails and the process panics instead of
-  exiting with status 0. A reproducer that runs notify's steps one by one
-  shows it; it is left to the owner.
+  and the loop whose connection closed re-arm and take it. (4) A stop
+  notify in progress holds the loop's teardown until it returns. The pinned
+  zio's `Async.notify` can let the loop take the stop and end before
+  notify's own wake reaches the loop's poller; if the loop's `deinit` closed
+  the poller first, that wake would fail and the process would panic
+  instead of exiting with status 0. zio documents notify only as
+  thread-safe, so serve.zig keeps a supported-subset contract that is not
+  an upstream guarantee (`StopGate` in `serve.zig`, approved by the owner
+  until upstream answers https://github.com/lalinsky/zio/issues/927; it is
+  rechecked at each zio update): a loop is deinitialized only after every
+  `notify()` on its handles has returned, and no notify starts after its
+  loop's teardown. The signal thread notifies under a per-loop gate and
+  skips a retired loop; the loop's thread retires and deinits its loop
+  under the same gate. The test runs notify's steps one by one inside the
+  gate, lets another event end the loop before the last step, and checks
+  that the teardown waits; without the gate it fails. (5) A loop that ended
+  without a notify is retired by its teardown, and a later notify skips it.
 - **Not yet:** idle, read and write deadlines per connection (a peer can hold
   a connection slot as long as it likes), deadlines for queries, chunked
   request bodies, percent-decoding and query parsing, Go's larger limits.

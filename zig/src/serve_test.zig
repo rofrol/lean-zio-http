@@ -30,7 +30,7 @@ const max_steps = 1000;
 
 // ---- the fake glue.c ----
 
-const Kind = enum(u8) { open, recv, refused, fail, free, ready, snapshot, done };
+const Kind = enum(u8) { open, recv, refused, fail, free, ready, snapshot, done, returned, busy, notifying };
 
 const Event = extern struct {
     kind: Kind,
@@ -300,7 +300,7 @@ const Single = struct {
     }
 
     fn deinit(self: *Single) void {
-        self.lp.loop.deinit();
+        if (!self.lp.gate.retired) serve.endLoop(&self.lp);
         self.listener.close();
         closeEvents();
     }
@@ -364,7 +364,7 @@ test "the shutdown cancels each receive in flight without calling back into the 
     // Each connection now has a receive parked; stopCb cancels all three
     // (and the accept) while it walks the list. A callback from inside a
     // cancel would hit `enter` in the fake.
-    s.lp.stop.notify();
+    try std.testing.expect(serve.notifyStop(&s.lp));
     try s.stepUntil(.free, 3);
     try s.finish();
     try std.testing.expectEqual(@as(usize, 3), stop_nphases);
@@ -414,7 +414,7 @@ test "a receive whose result is queued when the shutdown cancels it is dispatche
     // which `stop_phases` shows.
     try send(cl, "ab");
     awaitReadable(s.lp.head.?.fd);
-    s.lp.stop.notify();
+    try std.testing.expect(serve.notifyStop(&s.lp));
     try s.stepUntil(.free, 1);
     try s.finish();
     try std.testing.expectEqual(@as(usize, 1), stop_nphases);
@@ -440,6 +440,22 @@ test "a receive whose result is queued when the shutdown cancels it is dispatche
             try std.testing.expectEqual(w.byte, e.byte);
         }
     }
+}
+
+test "a loop that ended without a stop notification is retired at its teardown, and a later notify skips it" {
+    var s: Single = undefined;
+    try s.init(64);
+    defer s.deinit();
+    // The stop handle is canceled instead of notified: stopCb runs the same
+    // shutdown, and the loop ends with no notify ever made.
+    s.lp.loop.cancel(&s.lp.stop.c);
+    try s.finish();
+    serve.endLoop(&s.lp);
+    try std.testing.expect(s.lp.gate.retired);
+    // Admission after the teardown: refused, and the handle is not touched
+    // (a notify would have set `pending`).
+    try std.testing.expect(!serve.notifyStop(&s.lp));
+    try std.testing.expectEqual(@as(u32, 0), s.lp.stop.pending.load(.acquire));
 }
 
 // ---- admission across loops, each on its own thread ----
@@ -491,7 +507,7 @@ fn loopThread(i: u8) void {
     emit(.{ .kind = .ready, .loop = i });
     lp.loop.run() catch @panic("a loop failed");
     if (lp.head != null) @panic("a loop ended with connections open");
-    lp.loop.deinit();
+    serve.endLoop(lp);
     emit(.{ .kind = .done, .loop = i });
 }
 
@@ -654,8 +670,118 @@ test "admission across two loops: a full server pauses both acceptors, and the l
 
     // The shutdown. No connection is open and no client acts, so nothing but
     // the stop notification can wake a loop.
-    for (&m.lps) |*lp| lp.stop.notify();
+    for (&m.lps) |*lp| try std.testing.expect(serve.notifyStop(lp));
     for (0..nloops) |_| _ = try expectEvent(.done);
     for (m.threads) |t| t.join();
+    try std.testing.expectEqual(@as(u32, 0), serve.slots_used.load(.monotonic));
+}
+
+// ---- the stop notification against the loop's teardown (StopGate) ----
+
+const LoopState = @FieldType(ev.Loop, "state");
+
+/// Most yields while the test waits for its loop thread to go to sleep in
+/// its poll: it has nothing else to do then, so running out means it never did.
+const max_spins = 1 << 24;
+
+fn emitBusy(_: *serve.LoopCtx) void {
+    emit(.{ .kind = .busy });
+}
+
+/// Set by the test once the loop's teardown has found the gate held.
+var release_notify: zio.os.ResetEvent = .init();
+
+/// The pinned zio's `Async.notify` (src/ev/completion.zig:668, with
+/// `Loop.wakeAsync`, src/ev/loop.zig:662) one step at a time, run by
+/// `notifyStop` inside the gate: after `requestWake` it reports `notifying`
+/// and waits for the test's release before the last step, `backend.wake`.
+fn pausedNotify(stop: *ev.Async) void {
+    if (stop.pending.swap(1, .acq_rel) != 0) @panic("the stop was already notified");
+    const loop = stop.c.getLoop() orelse @panic("the stop handle has no loop");
+    // The loop sleeps in its poll and nothing else is due (the test made
+    // sure of both), so this notify is the one to wake it.
+    if (!loop.state.requestWake(LoopState.wake_async)) @panic("the loop was not asleep");
+    emit(.{ .kind = .notifying });
+    release_notify.wait();
+    loop.backend.wake(&loop.state);
+}
+
+fn signalThread(lp: *serve.LoopCtx) void {
+    if (!serve.notifyStop(lp)) @panic("the loop was retired before its stop");
+}
+
+/// A loop thread as in `runLoop`: start, run until the shutdown, tear down.
+fn gatedLoopThread(lp: *serve.LoopCtx) void {
+    if (!serve.startLoop(lp)) @panic("the loop failed to start");
+    emit(.{ .kind = .ready });
+    lp.loop.run() catch @panic("the loop failed");
+    if (lp.head != null) @panic("a loop ended with connections open");
+    emit(.{ .kind = .returned });
+    serve.endLoop(lp);
+    emit(.{ .kind = .done });
+}
+
+test "a stop notify in progress holds the loop's teardown until it returns, even after the loop has ended" {
+    // The reproducer of the race (item vvxfl6), through `notifyStop`. Its
+    // notify pauses just before `backend.wake`; another event then wakes
+    // the loop, which takes the stop, ends, and reaches its teardown while
+    // the notify is still in progress. Without the gate the teardown would
+    // close the poller and the delayed wake would panic with EBADF.
+    errdefer @panic("the stop-notify gate test failed");
+    try std.testing.expectEqual(@as(u32, 0), serve.slots_used.load(.monotonic));
+    try openEvents();
+    defer closeEvents();
+    room = 64;
+    serve.max_conns = 8;
+    release_notify.reset();
+    serve.gate_busy_hook = emitBusy;
+    defer serve.gate_busy_hook = null;
+    serve.notify_hook = pausedNotify;
+    defer serve.notify_hook = null;
+    var listener = try Listener.open();
+    defer listener.close();
+    var lp: serve.LoopCtx = .{ .lfd = listener.fd };
+    const t = try std.Thread.spawn(.{}, gatedLoopThread, .{&lp});
+    _ = try expectEvent(.ready);
+    const cl = try listener.connect();
+    defer _ = c.close(cl);
+    _ = try expectEvent(.open);
+
+    // The loop now has a receive parked and the acceptor armed, and nothing
+    // else is due: it goes to sleep in its poll and stays there until the
+    // test acts.
+    var spins: usize = 0;
+    while (lp.loop.state.wake_requested.load(.acquire) != LoopState.sleeping) : (spins += 1) {
+        if (spins == max_spins) @panic("the loop never went to sleep in its poll");
+        std.Thread.yield() catch {};
+    }
+    const sig = try std.Thread.spawn(.{}, signalThread, .{&lp});
+    _ = try expectEvent(.notifying);
+
+    // Another event wakes the loop: it receives the byte, takes the stop,
+    // ends its shutdown, and its teardown finds the gate held.
+    try send(cl, "x");
+    var returned = false;
+    while (true) {
+        const e = readEvent();
+        switch (e.kind) {
+            .recv, .refused, .free => {},
+            .returned => returned = true,
+            .busy => break,
+            else => {
+                printEvent(e);
+                return error.UnexpectedEvent;
+            },
+        }
+    }
+    try std.testing.expect(returned);
+    // The notify's last step finds the poller still open; then the
+    // teardown proceeds.
+    release_notify.set();
+    sig.join();
+    _ = try expectEvent(.done);
+    t.join();
+    try std.testing.expect(lp.gate.retired);
+    try std.testing.expect(!serve.notifyStop(&lp));
     try std.testing.expectEqual(@as(u32, 0), serve.slots_used.load(.monotonic));
 }

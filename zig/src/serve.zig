@@ -327,9 +327,71 @@ const Conn = struct {
     }
 };
 
+/// The gate between a loop's shutdown handle and its teardown, kept outside
+/// the loop's and the handle's own storage (in `LoopCtx`, which outlives both
+/// threads that take it).
+///
+/// Supported-subset contract (AGENTS.md Rule 6, approved by the user on
+/// 2026-11-16; NOT an upstream guarantee): a loop is deinitialized only after
+/// every `notify()` on its handles has returned, and no `notify` starts after
+/// its loop's teardown. Grounded in the pinned zio 9bef33d: `Async.notify`
+/// (src/ev/completion.zig:668) swaps `pending`, reads the handle's loop and
+/// calls `Loop.wakeAsync` (src/ev/loop.zig:662), whose `requestWake` can
+/// already let the loop take the async bit and finish before
+/// `backend.wake` runs; `Loop.deinit` (src/ev/loop.zig:591) closes the
+/// poller that `backend.wake` then uses (kqueue: a panic on EBADF). zio
+/// documents notify only as "thread-safe" and says nothing of a concurrent
+/// deinit; the question is upstream as
+/// https://github.com/lalinsky/zio/issues/927. Recheck this at each zio
+/// update; remove the gate if upstream declares notify safe against a
+/// concurrent deinit, replace it by a fork fix if upstream calls it a bug.
+///
+/// `notifyStop` holds `mutex` through the whole `notify()` and skips a
+/// retired loop; `endLoop` takes it after the loop's `run` has returned,
+/// marks the loop retired and deinits it. Neither runs from a loop callback,
+/// and the mutex is held across nothing that waits on another thread.
+/// Completing the handle frees nothing: `stop` lives in `LoopCtx`.
+const StopGate = struct {
+    mutex: os.Mutex = .init(),
+    retired: bool = false,
+};
+
+/// Test setting (serve_test.zig): called on the loop's thread when `endLoop`
+/// finds the gate held by a notify, just before it waits for that notify to
+/// return. Null in normal runs.
+pub var gate_busy_hook: ?*const fn (lp: *LoopCtx) void = null;
+/// Test setting (serve_test.zig): run by `notifyStop`, inside the gate, in
+/// place of `stop.notify()`, so a test can pause a notify in progress. Null
+/// in normal runs.
+pub var notify_hook: ?*const fn (stop: *ev.Async) void = null;
+
+/// Notifies `lp`'s shutdown handle unless its loop has been torn down;
+/// returns whether it notified. Thread-safe.
+pub fn notifyStop(lp: *LoopCtx) bool {
+    lp.gate.mutex.lock();
+    defer lp.gate.mutex.unlock();
+    if (lp.gate.retired) return false;
+    if (notify_hook) |h| h(&lp.stop) else lp.stop.notify();
+    return true;
+}
+
+/// Tears down `lp`'s loop on its own thread, after `run` has returned (or
+/// after `startLoop`, if it never ran): waits for a `notifyStop` in progress
+/// to return, then retires the loop, so no later one touches it, and deinits it.
+pub fn endLoop(lp: *LoopCtx) void {
+    if (!lp.gate.mutex.tryLock()) {
+        if (gate_busy_hook) |h| h(lp);
+        lp.gate.mutex.lock();
+    }
+    defer lp.gate.mutex.unlock();
+    lp.gate.retired = true;
+    lp.loop.deinit();
+}
+
 /// One loop and what it owns: its acceptor, its open connections and its
 /// shutdown handle. Touched only by the loop's own thread, except `stop`,
-/// which the signal thread notifies.
+/// which the signal thread notifies, and `gate`, which orders that notify
+/// before the loop's teardown (`StopGate`).
 pub const LoopCtx = struct {
     loop: ev.Loop = undefined,
     lfd: ev.Backend.NetHandle,
@@ -340,6 +402,7 @@ pub const LoopCtx = struct {
     paused: bool = false,
     stopping: bool = false,
     stop: ev.Async = undefined,
+    gate: StopGate = .{},
     head: ?*Conn = null,
     /// The loop's PostgreSQL connections (pg.zig).
     pool: pg.Pool = undefined,
@@ -491,7 +554,7 @@ fn runLoop(i: usize, lean_thread: bool, report: std.c.fd_t, done: std.c.fd_t) vo
         sendReport(report, 1);
         return;
     }
-    defer lp.loop.deinit();
+    defer endLoop(lp);
     sendReport(report, 0);
     lp.loop.run() catch |err| fatal("loop failed: {}", .{err});
     if (lp.head != null) @panic("a loop ended with connections open");
@@ -514,7 +577,11 @@ fn awaitReadyThenStop(ready: std.c.fd_t, threads: u32, stop_fd: c_int) void {
         if (r < 0 and std.c._errno().* == @intFromEnum(std.c.E.INTR)) continue;
         fatal("the shutdown pipe failed", .{});
     }
-    for (loops) |*lp| lp.stop.notify();
+    // A loop ends only after its stop (a failure ends the process instead),
+    // so none is retired yet; the gate makes it safe either way. This thread
+    // is detached and never joined, and `loops` is never freed, so nothing
+    // waits for it to end and its gates stay valid after `ekk_serve` returns.
+    for (loops) |*lp| _ = notifyStop(lp);
 }
 
 /// Serves on 127.0.0.1:port with `threads` loops (the calling thread runs the
