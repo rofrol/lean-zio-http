@@ -347,9 +347,38 @@ on the M1 (2026-11-16):
   buffered, unless its bytes arrived in two receives and Lean had not yet
   been handed the second at the measurement, which the queues cannot
   exclude (the scenario's comment). The parts named above add up to about
-  83 KiB in that state (16.6 + 7.8 + 58.7); the other 7.8 KiB, over the
-  2 KiB allowed for allocator and object headers, is not attributed by
-  this measurement. macOS only: elsewhere the scenario is skipped.
+  83 KiB in that state (16.6 + 7.8 + 58.7); the other 7.8 KiB is over the
+  2 KiB allowed for allocator and object headers. Matched snapshots of the
+  server's allocators at the scenario's two measurements
+  (`bench/boundary -memsnap DIR`: `vmmap -summary` and `heap -s`; nine
+  runs, five with H1 and four with the hand-written parser, 90.6 to
+  91.5 KiB per added connection with the snapshots taken) split the growth per added connection by region
+  category, within these ranges in every run:
+  - the malloc zone, which holds the loop's connections
+    (`std.heap.c_allocator`), 21.1 KiB resident: consistent with one
+    20,480-byte block for each 16,712-byte `Conn` (`@sizeOf`, Zig 0.17.1;
+    `heap -s` shows 50 more 20 KiB blocks per 50 connections, and no
+    other block size grew but 512 bytes), 13 more 512-byte blocks per 50
+    connections whose owner the snapshots do not show (0.1 KiB), and
+    1.0 KiB resident beyond the bytes allocated;
+  - the region vmmap names IOAccelerator, VM tag 100, which is the tag
+    the toolchain's mimalloc gives its mappings by default
+    (`mi_option_os_tag`), so most likely Lean's objects: 69.4 to
+    70.4 KiB, against about 66.5 KiB estimated for the buffer and the
+    response (7.8 + 58.7);
+  - no other region category more than 0.8 KiB.
+
+  So about 4.5 KiB of the 7.8 is the malloc zone beyond the 16.6 KiB
+  counted above for the loop's connection, mostly the block's size class,
+  and 2.9 to 3.9 KiB is a residual in the tagged region against those
+  estimates, not attributed further: a region total cannot tell which
+  objects are live, nor separate size-class rounding, still-resident
+  pages of freed blocks (such as the initial `inCap` buffer) and Lean's
+  small per-connection objects. The snapshots are taken one after the
+  other, just before the resident set sample, not at one instant, and the
+  inspection may perturb the process; the resident set per connection
+  with and without them overlaps (90.6 to 91.5 against 90.6 to 90.9).
+  macOS only: elsewhere the scenario is skipped.
 
 Capacities, from the toolchain's `ByteArray` (nightly-2026-11-14): `extract`
 copies exactly, so the buffer kept after a request is consumed, which is the

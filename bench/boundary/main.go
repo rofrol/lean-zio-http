@@ -26,6 +26,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -705,6 +706,40 @@ func awaitBytes(c *net.TCPConn) error {
 	return err
 }
 
+// memSnapDir, when set (-memsnap), is where memoryFull writes the server's
+// allocator statistics at each of its two measurements, for attributing the
+// growth between them (README, "Memory"): vmmap -summary (resident size per
+// region type, and the malloc zones' allocated bytes) and heap -s (the
+// malloc blocks by size). Lean's objects come from the toolchain's mimalloc,
+// whose mappings carry VM tag 100 (mimalloc.h, mi_option_os_tag), which
+// vmmap names IOAccelerator; heap sees only the malloc zones, which hold the
+// loop's connections (std.heap.c_allocator, zig/src/serve.zig).
+var memSnapDir string
+
+// memSnapshot writes those statistics of process pid, taken with conns
+// connections open, to memSnapDir; it does nothing when memSnapDir is empty.
+func memSnapshot(pid, conns int) error {
+	if memSnapDir == "" {
+		return nil
+	}
+	p := strconv.Itoa(pid)
+	for _, a := range [][]string{{"vmmap", "-summary", p}, {"heap", "-s", p}} {
+		out, err := exec.Command(a[0], a[1:]...).Output()
+		if err != nil {
+			var stderr []byte
+			if ee, ok := err.(*exec.ExitError); ok {
+				stderr = ee.Stderr
+			}
+			return fmt.Errorf("%s with %d connections: %w; %s", a[0], conns, err, bytes.TrimSpace(stderr))
+		}
+		name := filepath.Join(memSnapDir, fmt.Sprintf("%s-%d.txt", a[0], conns))
+		if err := os.WriteFile(name, out, 0o644); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // memoryFull measures the retained memory of connections each holding a
 // whole response being sent and a buffered tail of pipelined bytes, the most
 // Lean holds per connection at once when it sends (README, "Memory"). A
@@ -829,6 +864,9 @@ func memoryFull(path, addr string) (string, error) {
 					return 0, fmt.Errorf("connection %d: %d bytes unread by the server; it has not read all %d bytes", i, sq[0], write)
 				}
 			}
+		}
+		if err := memSnapshot(s.cmd.Process.Pid, hi); err != nil {
+			return 0, err
 		}
 		return rssKiB(s.cmd.Process.Pid)
 	}
@@ -989,6 +1027,7 @@ func main() {
 	fixture := flag.String("fixture", ".lake/build/bin/lsrv-fixture", "fixture server executable")
 	addr := flag.String("addr", "127.0.0.1:8083", "address the server listens on")
 	noContinue := flag.Bool("no-continue", false, "the fixture does not answer Expect: 100-continue (lsrv-fixture-hand); skip the scenarios that need it")
+	flag.StringVar(&memSnapDir, "memsnap", "", "directory for the server's allocator statistics (vmmap, heap) at the measurements of the scenario with 100 connections sending responses; macOS only")
 	flag.Parse()
 	scenarios := []scenario{
 		{"large responses, operations of at most 7 bytes", []string{"2", "--chunk", "7", "--trace"}, false, false, exchanges(8), nil, false},
