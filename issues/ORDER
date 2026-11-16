@@ -1,6 +1,5 @@
 ## Next, in order
 
-4n7czb Link libzsrv.a against the glibc of Lean's toolchain on Linux
 vvxfl6 The stop notification can wake a loop that has already ended (zio Async.notify racing Loop.deinit)
 u4moqo Move the toolchain to the first nightly with lean4 PR 16417 (Std.Http RFC fixes)
 
