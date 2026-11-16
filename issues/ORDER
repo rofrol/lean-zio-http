@@ -1,6 +1,5 @@
 ## Next, in order
 
-lpgru3 Controlled-interleaving tests for the zio contracts the graceful shutdown relies on
 byurlg Measure the server's worst-case memory per connection, with full input and output at once
 xihdtw Linux pending-connection accept errors end the server process
 k6oulx Configurable header fields on the server's own error responses
@@ -8,6 +7,7 @@ k6oulx Configurable header fields on the server's own error responses
 ## Proposed
 
 jl63fo Point issues i35sos and tc5rsx at zig/src/pg.c instead of zig/src/glue.c
+vvxfl6 The stop notification can wake a loop that has already ended (zio Async.notify racing Loop.deinit)
 
 ## Needs a decision
 

@@ -1,8 +1,0 @@
-Controlled-interleaving tests for the zio contracts the graceful shutdown relies on
-
-Moved on 2026-11-16 from ekklesiai.org's queue, where it was item 2vvkxw (moved by its item m4jfmv). Item ids and decisions (D1, D2) named below are ekklesiai.org's; paths are this repository's.
-Seen in queue item 55ewev (review round 20261116-065425-266b, sol): the shutdown in zig/src/serve.zig (`stopCb`, `runLoop`) relies on zio contracts that only a one-loop end-to-end scenario exercises: `loop.cancel` on a receive does not free or call back synchronously into the connection being traversed; a canceled completion whose result was already queued is still dispatched (with its result or `error.Canceled`); a one-shot `ev.Async` notified from another thread is safe when its loop finishes right after; admission (`slots_used`, pause and resume) across several loops. No counterexample was found; the tests that would show these are a hook in the loop that holds a completion between its result and its dispatch (a test-only latch), and multi-loop admission with an acknowledged admission snapshot from each loop.
-
-Owner's call whether these are worth a test hook in the transport before the repository move (item gm6krq), or should wait for the Linux runs (item pihgvg).
-
-Decided 2026-11-16 by this session with sol (consult round 20261116-145342-a8e2), under the user's delegation of that day to decide with sol what comes next: approved for the tests only: a test-only latch in the loop and multi-loop admission tests with acknowledged snapshots. No change to transport behavior and no local patch of zio; a counterexample found becomes a new item.
