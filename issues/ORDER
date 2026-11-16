@@ -7,6 +7,7 @@
 vma67w Keep the load generator's connection burst within the listen queue
 daaqgn Keep the H1 parser's state across receives instead of reparsing the whole buffer
 ytzycm Per-connection idle, read and write deadlines for the Lean HTTP server
+xihdtw Linux pending-connection accept errors end the server process
 
 ## Needs a decision
 
