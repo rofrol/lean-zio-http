@@ -9,8 +9,6 @@ xihdtw Linux pending-connection accept errors end the server process
 
 ## Proposed
 
-i2rh6f Behavior of the PostgreSQL pool while the database is down
-
 ## Needs a decision
 
 53rwgc Linux acceptance runs for the Lean HTTP server
@@ -20,3 +18,4 @@ daaqgn Keep the H1 parser's state across receives instead of reparsing the whole
 yvladm Decide whether per-loop PostgreSQL pools should share connections across loops
 tc5rsx Bound the memory of a PostgreSQL result before it is fully received
 i35sos Invalidate the per-connection statement cache after a schema change
+i2rh6f Behavior of the PostgreSQL pool while the database is down
