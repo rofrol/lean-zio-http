@@ -1,4 +1,5 @@
 The stop notification can wake a loop that has already ended (zio Async.notify racing Loop.deinit)
+Done by: the coordinating session
 
 Found in item lpgru3, which added the transport's controlled-interleaving tests. This is a counterexample to the third contract that item named: "a one-shot `ev.Async` notified from another thread is safe when its loop finishes right after".
 
@@ -25,3 +26,5 @@ What it needs from the owner. Per AGENTS.md Rule 6, zio's documentation says onl
 Recommendation (consult round 20261116-183449-f682, sol, under the user's delegation of 2026-11-16): authorize asking upstream (a) first, keeping the reproducer; choose neither a fork fix nor a change of the shutdown until upstream settles the contract. The race itself is demonstrated; only its classification is open.
 Question: May I ask zio upstream whether Async.notify must be safe when its loop ends and deinits concurrently?
 Options: ask upstream (a) | conform in serve.zig now (b) | accept and keep documented (c)
+
+Decided by the user 2026-11-16: yes, ask zio upstream (option a). The coordinating session opens an issue on https://github.com/lalinsky/zio asking whether Async.notify must be safe when its loop ends and deinits concurrently, with the reproducer; the answer settles bug (fork with this reproducer as the regression test, then a PR, each publish again needing the user's go) versus contract (conform in serve.zig, which needs the user's approval). The item is finished once the issue is open; the follow-up waits on the answer as a new item.
