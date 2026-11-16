@@ -35,8 +35,9 @@ and that the queue items about the server move here:
   (`require lsrv from git ... @ "<commit>"`); a change it needs is published
   here first, then its pin moves.
 - Build: `lakefile.lean`; `extern_lib zsrv` builds `zig/` with `zig build`,
-  traced on its files, the Lean and libpq include directories and
-  `ZIG_OPTIMIZE`. Executables that run the transport add `-lpq`.
+  traced on its files, the Lean and libpq include directories,
+  `ZIG_OPTIMIZE` and the Zig target (on Linux, the glibc of Lean's
+  toolchain: `zsrvTarget`). Executables that run the transport add `-lpq`.
 - Trust: the server parses untrusted network input (`Server.H1Adapter`,
   `Server.HandParser`) and talks to PostgreSQL through libpq with the
   consumer's connection string. It holds no secrets of its own.

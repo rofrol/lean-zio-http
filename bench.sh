@@ -1,7 +1,8 @@
 #!/bin/sh
 # Builds the servers, the checks and the load generator; runs the Lean unit
 # tests (lsrv-test), the PostgreSQL pool's and the transport's tests (zig
-# build test, which need no database), the module boundary check (lsrv-arch), the Zig/Lean
+# build test, which need no database), a check that zig/ built for Linux at
+# the Lean toolchain's glibc calls nothing that glibc lacks, the module boundary check (lsrv-arch), the Zig/Lean
 # boundary tests (bench/boundary, which start the fixture servers themselves)
 # and the end-to-end checks against the Lean server, each twice: with the
 # toolchain's Std.Http.Protocol.H1 behind Server.H1Adapter (lsrv, decision
@@ -104,6 +105,51 @@ measure() {
 lean_prefix=$(lean --print-prefix)
 (cd zig && zig build test -Dlean-include="$lean_prefix/include" -Dpq-include="$(pg_config --includedir)" \
   -Dlean-lib="$lean_prefix/lib/lean" -Dpq-lib="$(pg_config --libdir)")
+# libzsrv.a for Linux (issue 4n7czb): Lean links a Linux program against the
+# glibc its toolchain ships (lib/glibc/), so lakefile.lean's zsrvTarget builds
+# zig/ for that glibc, and the archive must reference no libc symbol it lacks.
+# This machine's toolchain may ship no glibc, so the version is stated: 2.26,
+# the highest GLIBC_2.* version lib/glibc/libc.so of Lean's x86_64 Linux
+# release nightly-2026-11-14 defines (checked 2026-11-16); recheck it at each
+# update of lean-toolchain.
+lean_glibc=2.26
+# The newest glibc Zig knows: its stubs define every libc symbol Zig's std may call.
+newest_glibc=$(zig targets | sed -n '/^ *\.glibc = \.{/,/}/p' | sed -n 's/^ *"\([0-9.]*\)",$/\1/p' | tail -n 1)
+[ -n "$newest_glibc" ] || { echo "zig targets lists no glibc version"; exit 1; }
+printf 'int main(void) { return 0; }\n' >"$tmp/main.c"
+# glibc_lacks GLIBC: builds zig/ for x86_64 Linux with glibc GLIBC and writes
+# to $tmp/linux-GLIBC/lacks the symbols libzsrv.a references that glibc
+# $lean_glibc lacks: those a link against $lean_glibc's stubs leaves undefined
+# and one against $newest_glibc's does not (the Lean and libpq symbols stay
+# undefined in both). Each link must fail with undefined symbols only, and
+# some (zig cc lifts ld.lld's default limit of 20 errors: it lists all of them).
+glibc_lacks() {
+  out="$tmp/linux-$1"
+  (cd zig && zig build -Dtarget="x86_64-linux-gnu.$1" -Doptimize="${ZIG_OPTIMIZE:-ReleaseSafe}" \
+    -Dlean-include="$lean_prefix/include" -Dpq-include="$(pg_config --includedir)" --prefix "$out")
+  for v in "$lean_glibc" "$newest_glibc"; do
+    if zig cc -target "x86_64-linux-gnu.$v" "$tmp/main.c" -Wl,--whole-archive "$out/lib/libzsrv.a" \
+        -Wl,--no-whole-archive -o "$out/a.out" >"$out/link-$v.txt" 2>&1 ||
+       grep -v -e '^$' -e '^>>> ' -e '^ld\.lld: error: undefined symbol: ' "$out/link-$v.txt" | grep -q .; then
+      echo "linking libzsrv.a (glibc $1) against glibc $v did not fail with undefined symbols only:"
+      cat "$out/link-$v.txt"; exit 1
+    fi
+    sed -n 's/^ld\.lld: error: undefined symbol: //p' "$out/link-$v.txt" | sort -u >"$out/undefined-$v"
+    [ -s "$out/undefined-$v" ] || { echo "linking libzsrv.a (glibc $1) against glibc $v reported no undefined symbol"; exit 1; }
+  done
+  comm -23 "$out/undefined-$lean_glibc" "$out/undefined-$newest_glibc" >"$out/lacks"
+}
+glibc_lacks "$lean_glibc"
+if [ -s "$tmp/linux-$lean_glibc/lacks" ]; then
+  echo "libzsrv.a for glibc $lean_glibc references symbols glibc $lean_glibc lacks:"; cat "$tmp/linux-$lean_glibc/lacks"; exit 1
+fi
+# The check must also fail where it should: built for Debian 13's glibc 2.41,
+# where the link failed, the archive references copy_file_range and statx.
+glibc_lacks 2.41
+if ! grep -qx copy_file_range "$tmp/linux-2.41/lacks" || ! grep -qx statx "$tmp/linux-2.41/lacks"; then
+  echo "libzsrv.a for glibc 2.41 should reference copy_file_range and statx, which glibc $lean_glibc lacks; it references:"
+  cat "$tmp/linux-2.41/lacks"; exit 1
+fi
 .lake/build/bin/lsrv-arch
 # The check must also fail where it should: on a fixture package with an
 # application importing the transport and an application no rule names,

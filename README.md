@@ -22,7 +22,10 @@ require lsrv from git "https://github.com/rofrol/lean-zio-http" @ "<commit>"
 The package builds its Zig side itself: `extern_lib zsrv` in `lakefile.lean`
 runs `zig build` in `zig/` (Zig 0.17; `ZIG_OPTIMIZE` picks the optimization,
 ReleaseSafe by default) and Lake links `libzsrv.a` into every executable of
-the requiring package. An executable that runs the transport also links
+the requiring package. On Linux it builds for the glibc the Lean toolchain
+links programs against (`lib/glibc/libc.so` of the toolchain, 2.26 for the
+pinned one), not the host's, so the archive calls no libc function that glibc
+lacks. An executable that runs the transport also links
 libpq: give it `moreLinkArgs := #["-lpq"]` and put `pg_config --libdir` on
 `LIBRARY_PATH`. Its composition root imports `Server.Transport`, one adapter
 (`Server.H1Adapter`) and the application, and declares
@@ -432,7 +435,9 @@ also provides libpq; Homebrew `postgresql@18`):
 It builds all parts, runs the Lean tests (`lsrv-test`: both adapters on the
 same requests, limits at their exact boundaries, Host and target
 validation, `100-continue`, the response checks, and connections through
-`Conn.step`), the module boundary check (`lsrv-arch`), the parser comparison
+`Conn.step`), the module boundary check (`lsrv-arch`), a check that `zig/`
+built for x86_64 Linux at the Lean toolchain's glibc references no libc
+symbol that glibc lacks (and that the same build for glibc 2.41 does), the parser comparison
 and benchmark (`lsrv-compare`, `lsrv-bench`), the boundary tests and the
 end-to-end checks (the last two against both parsers), then measures each
 server at 1, 64 and 256 connections for 10 s, printing requests per second,
