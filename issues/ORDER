@@ -9,6 +9,7 @@ daaqgn Keep the H1 parser's state across receives instead of reparsing the whole
 ytzycm Per-connection idle, read and write deadlines for the Lean HTTP server
 xihdtw Linux pending-connection accept errors end the server process
 byurlg Measure the server's worst-case memory per connection, with full input and output at once
+lpgru3 Controlled-interleaving tests for the zio contracts the graceful shutdown relies on
 
 ## Needs a decision
 
