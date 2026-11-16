@@ -1,6 +1,5 @@
 ## Next, in order
 
-wwuck5 The module boundary check accepts any App.* module without a rule
 vma67w Keep the load generator's connection burst within the listen queue
 6gmafg Deterministic tests for the PostgreSQL pool's callback orderings and query chains
 lpgru3 Controlled-interleaving tests for the zio contracts the graceful shutdown relies on
