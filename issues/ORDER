@@ -2,6 +2,7 @@
 
 wwuck5 The module boundary check accepts any App.* module without a rule
 vma67w Keep the load generator's connection burst within the listen queue
+6gmafg Deterministic tests for the PostgreSQL pool's callback orderings and query chains
 
 ## Proposed
 
@@ -11,7 +12,6 @@ xihdtw Linux pending-connection accept errors end the server process
 byurlg Measure the server's worst-case memory per connection, with full input and output at once
 lpgru3 Controlled-interleaving tests for the zio contracts the graceful shutdown relies on
 i2rh6f Behavior of the PostgreSQL pool while the database is down
-6gmafg Deterministic tests for the PostgreSQL pool's callback orderings and query chains
 yvladm Decide whether per-loop PostgreSQL pools should share connections across loops
 3jnkx5 Deadlines for PostgreSQL queries, connection attempts and shutdown in the Lean server
 tc5rsx Bound the memory of a PostgreSQL result before it is fully received
