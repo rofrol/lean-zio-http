@@ -9,7 +9,6 @@ xihdtw Linux pending-connection accept errors end the server process
 
 ## Proposed
 
-daaqgn Keep the H1 parser's state across receives instead of reparsing the whole buffer
 i2rh6f Behavior of the PostgreSQL pool while the database is down
 yvladm Decide whether per-loop PostgreSQL pools should share connections across loops
 tc5rsx Bound the memory of a PostgreSQL result before it is fully received
@@ -20,3 +19,4 @@ i35sos Invalidate the per-connection statement cache after a schema change
 53rwgc Linux acceptance runs for the Lean HTTP server
 ytzycm Per-connection idle, read and write deadlines for the Lean HTTP server
 3jnkx5 Deadlines for PostgreSQL queries, connection attempts and shutdown in the Lean server
+daaqgn Keep the H1 parser's state across receives instead of reparsing the whole buffer
