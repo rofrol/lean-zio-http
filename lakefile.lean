@@ -18,9 +18,11 @@ package lsrv where
 
 /-- `libzsrv.a`, rebuilt when a file under `zig/` (sources, `build.zig`,
 `build.zig.zon`), `ZIG_OPTIMIZE`, the Zig compiler's version, the Lean
-toolchain's version or libpq's version (`pg_config --version`), or the paths
-of the Lean and libpq include directories change. Header contents are traced
-through those versions, not file by file. `ZIG_OPTIMIZE` picks the build of the loop and zio:
+toolchain's version, libpq's version (`pg_config --version`), the paths of the
+Lean and libpq include directories, or the contents of the headers the glue
+reads from them (every file of the Lean include directory's `lean/`,
+`libpq-fe.h` and the `postgres_ext.h` it includes) change. Other system headers and the Zig compiler's own files are
+traced only through those versions. `ZIG_OPTIMIZE` picks the build of the loop and zio:
 ReleaseSafe (bounds and overflow checks) unless set; it measured no slower
 than ReleaseFast. -/
 extern_lib zsrv (pkg) := do
@@ -31,11 +33,21 @@ extern_lib zsrv (pkg) := do
     let under (d : String) := p.toString.startsWith ((zigDir / d).toString ++ "/")
     !(under "zig-out" || under ".zig-cache" || under "zig-pkg")
   let leanInclude ← getLeanIncludeDir
-  let pqInclude := (← captureProc { cmd := "pg_config", args := #["--includedir"] }).trimAscii.toString
+  let pqInclude : FilePath := (← captureProc { cmd := "pg_config", args := #["--includedir"] }).trimAscii.toString
   let optimize := (← IO.getEnv "ZIG_OPTIMIZE").getD "ReleaseSafe"
   let zigVersion := (← captureProc { cmd := "zig", args := #["version"] }).trimAscii.toString
   let pqVersion := (← captureProc { cmd := "pg_config", args := #["--version"] }).trimAscii.toString
-  let config := s!"{leanInclude} {pqInclude} {optimize} zig {zigVersion} lean {Lean.versionString} {pqVersion}"
+  -- Every Lean header (lean.h includes config.h, version.h and mimalloc.h),
+  -- and the two libpq headers the glue reads.
+  let leanHeaders ← ((← (leanInclude / "lean").readDir).map (·.path)).filterM fun p => return !(← p.isDir)
+  let leanHeaders := leanHeaders.qsort (·.toString < ·.toString)
+  let headers := leanHeaders ++ #[pqInclude / "libpq-fe.h", pqInclude / "postgres_ext.h"]
+  let mut headerHashes := #[]
+  for h in headers do
+    headerHashes := headerHashes.push s!"{h} {hash (← IO.FS.readBinFile h)}"
+  -- Fields joined by NUL, which no path, environment value or version holds.
+  let config := "\x00".intercalate ([leanInclude.toString, pqInclude.toString, optimize, zigVersion,
+    Lean.versionString, pqVersion] ++ headerHashes.toList)
   let lib := pkg.staticLibDir / nameToStaticLib "zsrv"
   buildFileAfterDep lib srcs (extraDepTrace := pure (BuildTrace.ofHash (Hash.ofString config))) fun _ => do
     proc { cmd := "zig", cwd := zigDir,
