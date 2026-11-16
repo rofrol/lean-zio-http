@@ -1,0 +1,17 @@
+.{
+    .name = .dhello,
+    .version = "0.0.0",
+    .fingerprint = 0xd295bd7450a3f45f,
+    .minimum_zig_version = "0.17.0",
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+    .dependencies = .{
+        .dusty = .{
+            .url = "git+https://github.com/lalinsky/dusty#96e117fed9f29d6b96bd320c6c482a4b64560529",
+            .hash = "dusty-0.6.0-Qdw7Rm0DJwCnKnGFl-JqMhvxkAR5rbFyW7RnL97vE-9V",
+        },
+        .zio = .{
+            .url = "git+https://github.com/lalinsky/zio#9bef33d67424737f864d9131e5b6c0e2526a6704",
+            .hash = "zio-0.20.1-xHbVVM88LwBqscEtY3Q_kCycBkXSqI7kyHdHmR60_3Ov",
+        },
+    },
+}

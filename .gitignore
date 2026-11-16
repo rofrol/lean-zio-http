@@ -1,0 +1,10 @@
+zig/zig-out/
+zig/.zig-cache/
+zig/zig-pkg/
+dusty-hello/zig-out/
+dusty-hello/.zig-cache/
+dusty-hello/zig-pkg/
+lean/.lake/
+bench/load/load
+bench/check/check
+bench/goserver/server

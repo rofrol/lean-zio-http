@@ -1,0 +1,20 @@
+const std = @import("std");
+
+pub fn build(b: *std.Build) void {
+    const target = b.standardTargetOptions(.{});
+    const optimize = b.standardOptimizeOption(.{ .preferred_optimize_mode = .ReleaseFast });
+    const lean_include = b.option([]const u8, "lean-include", "Lean include directory") orelse @panic("-Dlean-include required");
+    const zio = b.dependency("zio", .{ .target = target, .optimize = optimize });
+    const mod = b.createModule(.{
+        .root_source_file = b.path("src/serve.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    mod.addImport("zio", zio.module("zio"));
+    mod.addIncludePath(.{ .cwd_relative = lean_include });
+    mod.addCSourceFile(.{ .file = b.path("src/glue.c"), .flags = &.{ "-O2" } });
+    const lib = b.addLibrary(.{ .name = "zsrv", .root_module = mod, .linkage = .static });
+    lib.bundle_compiler_rt = true;
+    b.installArtifact(lib);
+}

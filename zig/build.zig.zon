@@ -1,0 +1,13 @@
+.{
+    .name = .zsrv,
+    .version = "0.0.0",
+    .minimum_zig_version = "0.17.0",
+    .fingerprint = 0xd71e869024ae1e78,
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+    .dependencies = .{
+        .zio = .{
+            .url = "git+https://github.com/lalinsky/zio#9bef33d67424737f864d9131e5b6c0e2526a6704",
+            .hash = "zio-0.20.1-xHbVVM88LwBqscEtY3Q_kCycBkXSqI7kyHdHmR60_3Ov",
+        },
+    },
+}
