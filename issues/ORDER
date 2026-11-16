@@ -4,13 +4,13 @@ wwuck5 The module boundary check accepts any App.* module without a rule
 vma67w Keep the load generator's connection burst within the listen queue
 6gmafg Deterministic tests for the PostgreSQL pool's callback orderings and query chains
 lpgru3 Controlled-interleaving tests for the zio contracts the graceful shutdown relies on
+byurlg Measure the server's worst-case memory per connection, with full input and output at once
 
 ## Proposed
 
 daaqgn Keep the H1 parser's state across receives instead of reparsing the whole buffer
 ytzycm Per-connection idle, read and write deadlines for the Lean HTTP server
 xihdtw Linux pending-connection accept errors end the server process
-byurlg Measure the server's worst-case memory per connection, with full input and output at once
 i2rh6f Behavior of the PostgreSQL pool while the database is down
 yvladm Decide whether per-loop PostgreSQL pools should share connections across loops
 3jnkx5 Deadlines for PostgreSQL queries, connection attempts and shutdown in the Lean server
