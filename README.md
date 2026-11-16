@@ -1,16 +1,32 @@
 # Lean HTTP/1.1 server on zio.ev
 
-The HTTP server of ekklesiai.org: a Lean 4 library on per-core `zio.ev`
-event loops (decision record `docs/decisions/0001-lean-http-server-on-zio.md`).
-It started as the spike of item `dqsipn` and keeps the directory name until
-it moves into its own repository (item gm6krq). The sections from
+A Lean 4 HTTP/1.1 server library on per-core `zio.ev` event loops, with
+PostgreSQL access from the loops. It was written for ekklesiai.org and
+started there as a spike; item ids below (`dqsipn`, `7bccgi`, ...) name that
+project's queue items, where the history was kept. The sections from
 "`Std.Http.Protocol.H1` compared with the hand-written parser" on are the
 spike's measurements, kept as they were written.
 
+## Using it from another Lake package
+
+```lean
+require lsrv from git "https://github.com/rofrol/lean-zio-http" @ "<commit>"
+```
+
+The package builds its Zig side itself: `extern_lib zsrv` in `lakefile.lean`
+runs `zig build` in `zig/` (Zig 0.17; `ZIG_OPTIMIZE` picks the optimization,
+ReleaseSafe by default) and Lake links `libzsrv.a` into every executable of
+the requiring package. An executable that runs the transport also links
+libpq: give it `moreLinkArgs := #["-lpq"]` and put `pg_config --libdir` on
+`LIBRARY_PATH`. Its composition root imports `Server.Transport`, one adapter
+(`Server.H1Adapter`) and the application, and declares
+`server_exports (Server.H1Adapter.handle app)`; see `Main.lean`. Pin the same
+Lean toolchain as `lean-toolchain` here.
+
 ## Modules
 
-Lake libraries (`lean/lakefile.toml`) and what each may import. `lsrv-arch`
-(`lean/Arch.lean`) reads the imports of every `.lean` file of the package and
+Lake libraries (`lakefile.lean`) and what each may import. `lsrv-arch`
+(`Arch.lean`) reads the imports of every `.lean` file of the package and
 fails on an import its module's rule does not allow, and on a file no rule
 names; `bench.sh` runs it.
 
@@ -288,11 +304,11 @@ receives changes the adapter's interface and is a separate decision.
 ## Running
 
 Run everything (macOS or Linux; needs the Lean toolchain from
-`lean/lean-toolchain`, Zig 0.17, Go and PostgreSQL with `pg_config`, which
+`lean-toolchain`, Zig 0.17, Go and PostgreSQL with `pg_config`, which
 also provides libpq; Homebrew `postgresql@18`):
 
 ```sh
-spike/zio-http/bench.sh
+./bench.sh
 ```
 
 It builds all parts, runs the Lean tests (`lsrv-test`: both adapters on the
@@ -346,7 +362,7 @@ Linux with HttpArena's tooling (item pihgvg).
 
 ## `Std.Http.Protocol.H1` compared with the hand-written parser (item 7bccgi)
 
-Toolchain leanprover/lean4 nightly-2026-11-14 (`lean/lean-toolchain`); paths
+Toolchain leanprover/lean4 nightly-2026-11-14 (`lean-toolchain`); paths
 below are under its `src/lean/Std/Http/`. Numbers from one `bench.sh` run on
 the M1 (2026-11-16). Written before the module split: `Http.lean` is now
 `Server/HandParser.lean`, `H1Adapter.lean` is `Server/H1Adapter.lean`,

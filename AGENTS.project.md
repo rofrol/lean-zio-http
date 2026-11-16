@@ -1,0 +1,34 @@
+# Rules of this repository
+
+Read with `AGENTS.md` (the shared policy, copied verbatim from agent-kit);
+these rules are specific to lean-zio-http.
+
+## Architecture map
+
+- What it is: a Lean 4 HTTP/1.1 server library on per-core zio.ev event loops
+  (Zig, `zig/`), with non-blocking PostgreSQL access from the loops (libpq).
+  The modules, their contracts and what each may import are in `README.md`,
+  "Modules"; `Arch.lean` (`lsrv-arch`) enforces those import rules.
+- Architectural core: the contracts `Server.Query`, `Server.Wire` and
+  `Server.Handler`. Changing them changes every consumer.
+- Consumers: ekklesiai.org pins this repository by commit
+  (`require lsrv from git ... @ "<commit>"`); a change it needs is published
+  here first, then its pin moves.
+- Build: `lakefile.lean`; `extern_lib zsrv` builds `zig/` with `zig build`,
+  traced on its files, the Lean and libpq include directories and
+  `ZIG_OPTIMIZE`. Executables that run the transport add `-lpq`.
+- Trust: the server parses untrusted network input (`Server.H1Adapter`,
+  `Server.HandParser`) and talks to PostgreSQL through libpq with the
+  consumer's connection string. It holds no secrets of its own.
+- Persistent data: none; the example applications use a `world` table that
+  `bench.sh` creates in a private, disposable cluster.
+
+## Verification
+
+`./bench.sh` (README, "Running"): builds everything, runs `lsrv-test`,
+`lsrv-arch`, `lsrv-compare`, `lsrv-bench`, the Zig/Lean boundary tests, the
+end-to-end checks against both parsers, the database checks on a private
+PostgreSQL cluster, and the load measurements. Any failure stops it with a
+nonzero status. It takes several minutes: run it as a visible job.
+Measurements are comparative and machine-dependent; a pass/fail verdict comes
+only from the tests and checks.
