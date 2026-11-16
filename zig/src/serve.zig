@@ -391,13 +391,14 @@ pub const LoopCtx = struct {
                 // RLIMIT_NOFILE at startup, so this is pressure from outside the
                 // server; nothing of ours waits for it to end (README).
                 error.ProcessFdQuotaExceeded, error.SystemFdQuotaExceeded, error.SystemResources => fatal("accept: {}", .{err}),
-                // The listening socket itself is broken. Also, unresolved: Linux's
-                // other pending-connection errnos (accept(2): ENETUNREACH,
-                // EHOSTUNREACH, EHOSTDOWN, ENONET, ENOPROTOOPT, EOPNOTSUPP) reach
-                // here, because the pinned zio maps them to Unexpected or
-                // OperationNotSupported together with errors of a broken socket
-                // (src/os/net.zig, errnoToAcceptError); the owner decides (README,
-                // "Production contract").
+                // An error of the listening socket itself, or one zio does not
+                // name (Unexpected): fatal. Linux's other pending-connection
+                // errnos in accept(2) (ENETUNREACH, EHOSTUNREACH, EHOSTDOWN,
+                // ENONET, ENOPROTOOPT, EOPNOTSUPP) would reach here too, as the
+                // pinned zio maps them to Unexpected or OperationNotSupported
+                // (src/os/net.zig, errnoToAcceptError); the Linux sources read
+                // do not return them from TCP's accept (README, "Production
+                // contract", "Accept errors").
                 else => fatal("accept: {}", .{err}),
             }
             return self.armAccept();

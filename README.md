@@ -155,14 +155,24 @@ only `Server.Query` values.
   of the listening socket itself end the process with status 1 and a
   `fatal:` line: the descriptor limit was checked at startup, so exhaustion
   comes from outside the server and nothing in it waits for that to end; a
-  supervisor restarts it. Unresolved: Linux documents further errors of a
+  supervisor restarts it. Linux's accept(2) lists further errors of a
   pending connection (`ENETUNREACH`, `EHOSTUNREACH`, `EHOSTDOWN`, `ENONET`,
-  `ENOPROTOOPT`, `EOPNOTSUPP`, accept(2): "treat them like EAGAIN"), but the
-  pinned zio maps them to `Unexpected` or `OperationNotSupported`, which also
-  stand for errors of a broken listening socket (`src/os/net.zig`,
-  `errnoToAcceptError`), so they end the process too. Re-arming on them
-  would spin on a broken socket; distinguishing them needs zio's error set.
-  Left to the owner.
+  `ENOPROTOOPT`, `EOPNOTSUPP`: "treat them like EAGAIN by retrying"). The
+  pinned zio maps them to `Unexpected` (through `unexpectedError`, which logs
+  "please file a bug report") or `OperationNotSupported`, which also stand
+  for errors of a broken listening socket (`src/os/net.zig`,
+  `errnoToAcceptError`), so they end the process. In the Linux sources read
+  (v5.4, v6.1 and mainline aebb727, on 2026-11-16), TCP's accept, for IPv4
+  and IPv6 and also through io_uring, passes no pending connection's network
+  error to the caller: `inet_accept` returns only the error of
+  `inet_csk_accept`, which fails only with `EINVAL` (not listening),
+  `EAGAIN` or the error of its wait for a connection. That is a reading of
+  those revisions, not a guarantee for every kernel or security module. zio
+  documents no meaning for these errnos and no passage names them as a
+  limitation; whether its mapping is a bug stays unresolved, and the owner
+  decides whether anything follows (item xihdtw's outcome). Re-arming on
+  `Unexpected` unconditionally would repeat a persistent error of the
+  listening socket.
 - **Shutdown.** SIGTERM or SIGINT starts a graceful shutdown: each loop stops
   accepting (its armed accept is canceled; a connection accepted meanwhile is
   closed), cancels every receive in flight and declines every later one
