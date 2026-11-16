@@ -3,6 +3,24 @@
 Read with `AGENTS.md` (the shared policy, copied verbatim from agent-kit);
 these rules are specific to lean-zio-http.
 
+## The queue runs through rr2
+
+The user said on 2026-11-16 (ekklesiai.org's item m4jfmv) that this
+repository has its own queue in `issues/`, run by rr2 as ekklesiai.org's is,
+and that the queue items about the server move here:
+
+- Run an item of "Next, in order" with `rr2 --issue ID < task.md`, or the
+  queue item after item with `rr2 queue` (rr2's README, "Usage" and "The queue
+  item after item"); rr2 runs the agent in its own worktree and integrates
+  the result. A session does not do a queue item by hand in the main checkout.
+- An rr2 run makes every change to this repository's files. The coordinating
+  session does only what acts outside the repository (publishing, pushing,
+  opening an upstream issue) and changes `issues/` through `rr2 issue`. An
+  item that only acts outside the repository or only changes `issues/`
+  carries the line `Done by: the coordinating session` after its title; that
+  session does it and finishes it with `rr2 issue finish ID`.
+- Change `issues/` only with `rr2 issue add|move|edit|finish`, never by hand.
+
 ## Architecture map
 
 - What it is: a Lean 4 HTTP/1.1 server library on per-core zio.ev event loops

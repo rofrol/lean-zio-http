@@ -2,8 +2,14 @@
 
 A Lean 4 HTTP/1.1 server library on per-core `zio.ev` event loops, with
 PostgreSQL access from the loops. It was written for ekklesiai.org and
-started there as a spike; item ids below (`dqsipn`, `7bccgi`, ...) name that
-project's queue items, where the history was kept. The sections from
+started there as a spike; ids of finished items below (`dqsipn`, `7bccgi`,
+`2l6rcv`, ...) name that project's queue items, where the history was kept.
+Open work on the server is queued in this repository, in `issues/` (order in
+`issues/ORDER`), and named below by its ids here (`53rwgc`, ...). Decision
+D1 (the HTTP/1.1 parser) is recorded in ekklesiai.org, in its decision
+record 0001 (`docs/decisions/0001-lean-http-server-on-zio.md`, section "D1:
+the HTTP/1.1 parser"), which names this queue's item 53rwgc as pihgvg. The
+sections from
 "`Std.Http.Protocol.H1` compared with the hand-written parser" on are the
 spike's measurements, kept as they were written.
 
@@ -39,7 +45,7 @@ names; `bench.sh` runs it.
 | `Server.Transport` | the loop's Lean side: `ekk_serve`, the command line, the `server_exports` command that exports the loop's entry points | `Server.Wire`, `Server.Conn` |
 | `Server.Response` | writes and checks responses, for both adapters | contracts |
 | `Server.H1Adapter` | the production HTTP/1.1 adapter, `Std.Http.Protocol.H1` (D1) | contracts, `Server.Response`, `Std.Http.Protocol.H1` |
-| `Server.HandParser` | the hand-written parser: test comparator and rollback until item pihgvg, then deleted (D1) | contracts, `Server.Response` |
+| `Server.HandParser` | the hand-written parser: test comparator and rollback until item 53rwgc, then deleted (D1) | contracts, `Server.Response` |
 | `App.*` | applications: `App.Hello` (the benchmark route), `App.Fixture` (the boundary tests' route), `App.Db` (the PostgreSQL tests' and benchmark's routes) | `Server.Handler`, `Server.Query`, `App.*` |
 | `Main`, `Fixture`, `MainDb` | composition roots `lsrv`, `lsrv-fixture`, `lsrv-db`: H1 and one application | `Server.Transport`, `Server.H1Adapter`, `App.*` |
 | `MainHand`, `FixtureHand` | `lsrv-hand`, `lsrv-fixture-hand`: the same with the hand-written parser | `Server.Transport`, `Server.HandParser`, `App.*` |
@@ -358,7 +364,7 @@ Reading the numbers: the load generator runs on the same machine, so at 64
 and more connections it is the limit; compare the 1-connection rows and the
 CPU per request. The servers differ in features and limits (above), and
 closed-loop latency hides queueing under overload. Acceptance runs belong on
-Linux with HttpArena's tooling (item pihgvg).
+Linux with HttpArena's tooling (item 53rwgc).
 
 ## `Std.Http.Protocol.H1` compared with the hand-written parser (item 7bccgi)
 
