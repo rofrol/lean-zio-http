@@ -11,3 +11,5 @@ Options: vps.frolow.dev at a quiet hour | the 2010 MacBook | a rented machine
 Checked 2026-11-16: the handoff note forbids load tests on vps.frolow.dev without the user's consent; D2 asks for the VPS's CPU allocation.
 
 Sol (consult round 20261116-145342-a8e2) on the MacBook: useful for Linux diagnostics, not for D2 acceptance, since two cores cannot give the server two CPUs and the load generator separate cores. Recommendation: a rented machine.
+
+Also run the PostgreSQL pool tests (`zig build test` in zig/, run by bench.sh) on epoll: they have run only on macOS (kqueue) so far (item jl63fo, 2026-11-16).
