@@ -22,11 +22,13 @@ pub fn build(b: *std.Build) void {
     lib.bundle_compiler_rt = true;
     b.installArtifact(lib);
 
-    // `zig build test`: the PostgreSQL pool's deterministic tests (README,
-    // "PostgreSQL"). pg_test.zig runs pg.zig on a real loop with a scripted
-    // fake in place of pg.c; pg_glue_test.c runs pg.c and the real libpq
-    // against a fake PostgreSQL server, so it links libpq and the Lean runtime.
-    const test_step = b.step("test", "Run the PostgreSQL pool's tests");
+    // `zig build test`: the deterministic tests of the PostgreSQL pool (README,
+    // "PostgreSQL") and of the transport's shutdown and admission (README,
+    // "Production contract"). pg_test.zig runs pg.zig on a real loop with a
+    // scripted fake in place of pg.c; pg_glue_test.c runs pg.c and the real
+    // libpq against a fake PostgreSQL server, so it links libpq and the Lean
+    // runtime.
+    const test_step = b.step("test", "Run the PostgreSQL pool's and the transport's tests");
     const pool_mod = b.createModule(.{
         .root_source_file = b.path("src/pg_test.zig"),
         .target = target,
@@ -36,6 +38,17 @@ pub fn build(b: *std.Build) void {
     pool_mod.addImport("zio", zio.module("zio"));
     const pool_tests = b.addTest(.{ .root_module = pool_mod });
     test_step.dependOn(&b.addRunArtifact(pool_tests).step);
+    // serve_test.zig runs serve.zig's shutdown and admission on real loops,
+    // with a fake of glue.c (README, "Production contract").
+    const serve_mod = b.createModule(.{
+        .root_source_file = b.path("src/serve_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    serve_mod.addImport("zio", zio.module("zio"));
+    const serve_tests = b.addTest(.{ .root_module = serve_mod });
+    test_step.dependOn(&b.addRunArtifact(serve_tests).step);
 
     const lean_lib = b.option([]const u8, "lean-lib", "Lean library directory, with libleanshared (tests)");
     const pq_lib = b.option([]const u8, "pq-lib", "libpq library directory (tests)");

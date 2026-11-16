@@ -15,14 +15,14 @@ const net = os.net;
 const pg = @import("pg.zig");
 
 /// Conn.Action as decoded by glue.c.
-const Action = extern struct {
+pub const Action = extern struct {
     kind: u8, // 0 recv, 1 send, 2 close, 3 none, 4 query
     room: usize, // recv: most bytes to receive
     len: usize, // send: bytes glue.c copied into out
     query: ?*anyopaque, // query: the Server.Query, owned
 };
 
-const State = ?*anyopaque; // a Lean Conn.State, owned by the connection
+pub const State = ?*anyopaque; // a Lean Conn.State, owned by the connection
 
 extern fn ekk_open(state: *State, out: [*]u8, cap: usize, act: *Action) void;
 extern fn ekk_recv(state: *State, data: [*]const u8, n: usize, out: [*]u8, cap: usize, act: *Action) void;
@@ -112,8 +112,8 @@ fn fatal(comptime fmt: []const u8, args: anytype) noreturn {
 /// see its close (a slot held by an armed accept becomes a connection or is
 /// released on that loop), so whenever a slot is free some acceptor is armed
 /// or is about to re-arm.
-var slots_used = std.atomic.Value(u32).init(0);
-var max_conns: u32 = 0;
+pub var slots_used = std.atomic.Value(u32).init(0);
+pub var max_conns: u32 = 0;
 
 fn reserveSlot() bool {
     var used = slots_used.load(.monotonic);
@@ -330,7 +330,7 @@ const Conn = struct {
 /// One loop and what it owns: its acceptor, its open connections and its
 /// shutdown handle. Touched only by the loop's own thread, except `stop`,
 /// which the signal thread notifies.
-const LoopCtx = struct {
+pub const LoopCtx = struct {
     loop: ev.Loop = undefined,
     lfd: ev.Backend.NetHandle,
     accept: ev.NetAccept = undefined,
@@ -424,7 +424,7 @@ const LoopCtx = struct {
     /// result it had). Sends run to completion; Lean still answers requests
     /// already buffered, and every receive it asks for afterwards is declined.
     /// `loop.run` returns once nothing of this loop is in flight.
-    fn stopCb(_: *ev.Loop, c: *ev.Completion) void {
+    pub fn stopCb(_: *ev.Loop, c: *ev.Completion) void {
         const self: *LoopCtx = @ptrCast(@alignCast(c.userdata.?));
         self.stopping = true;
         if (self.armed) self.loop.cancel(&self.accept.c);
@@ -460,21 +460,15 @@ fn sendReport(report: std.c.fd_t, code: u8) void {
     if (std.c.write(report, &[1]u8{code}, 1) != 1) fatal("could not report a loop's state", .{});
 }
 
-/// Sets up loop `i` with its acceptor and shutdown handle, reports the outcome
-/// as one byte on `report` (0 ready, 1 failed), runs the loop until its
-/// shutdown is complete, then reports 2 on `done`.
-fn runLoop(i: usize, lean_thread: bool, report: std.c.fd_t, done: std.c.fd_t) void {
-    if (lean_thread) ekk_thread_init();
-    defer if (lean_thread) ekk_thread_fini();
-    const lp = &loops[i];
-    lp.loop.init(.{ .allocator = alloc }) catch {
-        sendReport(report, 1);
-        return;
-    };
-    defer lp.loop.deinit();
+/// Sets up `lp`'s loop on the calling thread, which then owns it: its
+/// PostgreSQL pool, its shutdown handle and its armed acceptor. Returns false,
+/// with nothing left to deinit, when the loop could not be set up. The tests
+/// (serve_test.zig) drive a loop set up this way themselves.
+pub fn startLoop(lp: *LoopCtx) bool {
+    lp.loop.init(.{ .allocator = alloc }) catch return false;
     const slots = alloc.alloc(pg.Slot, pg_conns) catch {
-        sendReport(report, 1);
-        return;
+        lp.loop.deinit();
+        return false;
     };
     lp.pool.init(&lp.loop, pg_conninfo, slots, testing.trace);
     lp.stop = ev.Async.init();
@@ -482,6 +476,21 @@ fn runLoop(i: usize, lean_thread: bool, report: std.c.fd_t, done: std.c.fd_t) vo
     lp.stop.c.userdata = lp;
     lp.loop.add(&lp.stop.c);
     lp.armAccept();
+    return true;
+}
+
+/// Sets up loop `i` with its acceptor and shutdown handle, reports the outcome
+/// as one byte on `report` (0 ready, 1 failed), runs the loop until its
+/// shutdown is complete, then reports 2 on `done`.
+fn runLoop(i: usize, lean_thread: bool, report: std.c.fd_t, done: std.c.fd_t) void {
+    if (lean_thread) ekk_thread_init();
+    defer if (lean_thread) ekk_thread_fini();
+    const lp = &loops[i];
+    if (!startLoop(lp)) {
+        sendReport(report, 1);
+        return;
+    }
+    defer lp.loop.deinit();
     sendReport(report, 0);
     lp.loop.run() catch |err| fatal("loop failed: {}", .{err});
     if (lp.head != null) @panic("a loop ended with connections open");

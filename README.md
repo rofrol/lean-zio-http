@@ -176,6 +176,25 @@ only `Server.Query` values.
   (SIGKILL), not the server's.
   A query in flight or waiting for a pool slot also holds the shutdown
   until it is answered (section "PostgreSQL").
+- **Transport tests.** `zig build test` in `zig/` (`bench.sh` runs it) also
+  runs `src/serve_test.zig`. It drives `serve.zig`'s loops on real sockets,
+  with a fake of `glue.c` that reports every call as an event, and checks
+  the zio behavior the shutdown and admission rely on. (1) The shutdown's
+  cancels never call back into a connection while the shutdown is walking
+  the list of connections: each canceled receive comes back once, as a
+  refusal. (2) A receive whose result is already queued when the cancel
+  comes is dispatched once, with that result. (3) Admission works across
+  two loops: after each step the test has seen (for a close, once the
+  closing loop has acknowledged that the close finished), each loop
+  acknowledges a snapshot of its own admission state, so the test sees both acceptors
+  pause when the server is full, a connection wait in the listen queue,
+  and the loop whose connection closed re-arm and take it. Unresolved: the
+  pinned zio's `Async.notify` can reach a loop's poller after that loop has
+  ended. The signal thread notifies a loop's stop handle; if that loop wakes
+  for another event, finishes its shutdown and closes its poller before the
+  notify's own wake, the wake fails and the process panics instead of
+  exiting with status 0. A reproducer that runs notify's steps one by one
+  shows it; it is left to the owner.
 - **Not yet:** idle, read and write deadlines per connection (a peer can hold
   a connection slot as long as it likes), deadlines for queries, chunked
   request bodies, percent-decoding and query parsing, Go's larger limits.

@@ -46,8 +46,9 @@ and that the queue items about the server move here:
 ## Verification
 
 `./bench.sh` (README, "Running"): builds everything, runs `lsrv-test`,
-`lsrv-arch`, `lsrv-compare`, `lsrv-bench`, the PostgreSQL pool's tests
-(`zig build test` in `zig/`, README "PostgreSQL"), the Zig/Lean boundary tests, the
+`lsrv-arch`, `lsrv-compare`, `lsrv-bench`, the PostgreSQL pool's and the
+transport's tests (`zig build test` in `zig/`, README "PostgreSQL" and
+"Production contract"), the Zig/Lean boundary tests, the
 end-to-end checks against both parsers, the database checks on a private
 PostgreSQL cluster, and the load measurements. Any failure stops it with a
 nonzero status. It takes several minutes: run it as a visible job.

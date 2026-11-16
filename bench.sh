@@ -1,7 +1,7 @@
 #!/bin/sh
 # Builds the servers, the checks and the load generator; runs the Lean unit
-# tests (lsrv-test), the PostgreSQL pool's tests (zig build test, which need
-# no database), the module boundary check (lsrv-arch), the Zig/Lean
+# tests (lsrv-test), the PostgreSQL pool's and the transport's tests (zig
+# build test, which need no database), the module boundary check (lsrv-arch), the Zig/Lean
 # boundary tests (bench/boundary, which start the fixture servers themselves)
 # and the end-to-end checks against the Lean server, each twice: with the
 # toolchain's Std.Http.Protocol.H1 behind Server.H1Adapter (lsrv, decision
