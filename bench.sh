@@ -23,15 +23,9 @@ PATH="$(pg_config --bindir):$PATH"
 # lake links the servers with -lpq from pg_config's libdir.
 LIBRARY_PATH="$(pg_config --libdir)${LIBRARY_PATH:+:$LIBRARY_PATH}"
 export PATH LIBRARY_PATH
-# The include directory of the toolchain lean/lean-toolchain pins.
-LEAN_INCLUDE="$(cd lean && lean --print-prefix)/include"
-# ZIG_OPTIMIZE picks the build of the loop and zio: ReleaseSafe (bounds and
-# overflow checks) unless set; it measured no slower than ReleaseFast.
-(cd zig && zig build -Doptimize="${ZIG_OPTIMIZE:-ReleaseSafe}" -Dlean-include="$LEAN_INCLUDE" -Dpq-include="$(pg_config --includedir)")
-# Lake does not track libzsrv.a (passed through moreLinkArgs), so drop the
-# executables to make them link against the library just built.
-rm -f lean/.lake/build/bin/lsrv*
-(cd lean && lake build)
+# lake builds the Zig library (extern_lib zsrv in lakefile.lean, ZIG_OPTIMIZE
+# picks its optimization) and links it into the servers.
+lake build
 (cd dusty-hello && zig build -Doptimize=ReleaseFast)
 (cd bench/load && go build -o load .)
 (cd bench/check && go build -o check .)
@@ -105,20 +99,20 @@ measure() {
   done
 }
 
-lean/.lake/build/bin/lsrv-test
-(cd lean && .lake/build/bin/lsrv-arch)
-lean/.lake/build/bin/lsrv-compare >"$tmp/compare.txt" || { cat "$tmp/compare.txt"; exit 1; }
+.lake/build/bin/lsrv-test
+.lake/build/bin/lsrv-arch
+.lake/build/bin/lsrv-compare >"$tmp/compare.txt" || { cat "$tmp/compare.txt"; exit 1; }
 sed -n '1,/^## Malformed/p' "$tmp/compare.txt"
 grep -E '^[0-9]+ requests: [0-9]+ verdicts' "$tmp/compare.txt"
-lean/.lake/build/bin/lsrv-bench
+.lake/build/bin/lsrv-bench
 bench/boundary/boundary
-bench/boundary/boundary -no-continue -fixture lean/.lake/build/bin/lsrv-fixture-hand
-start lean-h1 ready lean/.lake/build/bin/lsrv 8
+bench/boundary/boundary -no-continue -fixture .lake/build/bin/lsrv-fixture-hand
+start lean-h1 ready .lake/build/bin/lsrv 8
 bench/check/check -addr 127.0.0.1:8083
 measure lean-h1 8083
 stop graceful
 
-start lean-hand ready lean/.lake/build/bin/lsrv-hand 8
+start lean-hand ready .lake/build/bin/lsrv-hand 8
 bench/check/check -addr 127.0.0.1:8083
 measure lean-hand 8083
 stop graceful
@@ -156,7 +150,7 @@ measure_db() {
   done
 }
 # 8 loops with 4 connections each against one pool of 32.
-start lean-db ready lean/.lake/build/bin/lsrv-db 8 --pg "$pg" --pg-conns 4
+start lean-db ready .lake/build/bin/lsrv-db 8 --pg "$pg" --pg-conns 4
 measure_db lean-db 8083
 stop graceful
 lean_1=$rps_1; lean_64=$rps_64
