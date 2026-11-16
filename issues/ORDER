@@ -4,6 +4,8 @@
 
 ## Proposed
 
+vma67w Keep the load generator's connection burst within the listen queue
+
 ## Needs a decision
 
 53rwgc Linux acceptance runs for the Lean HTTP server
