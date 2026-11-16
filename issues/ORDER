@@ -1,5 +1,7 @@
 ## Next, in order
 
+wwuck5 The module boundary check accepts any App.* module without a rule
+
 ## Proposed
 
 vma67w Keep the load generator's connection burst within the listen queue
@@ -14,7 +16,6 @@ yvladm Decide whether per-loop PostgreSQL pools should share connections across 
 3jnkx5 Deadlines for PostgreSQL queries, connection attempts and shutdown in the Lean server
 tc5rsx Bound the memory of a PostgreSQL result before it is fully received
 i35sos Invalidate the per-connection statement cache after a schema change
-wwuck5 The module boundary check accepts any App.* module without a rule
 
 ## Needs a decision
 
