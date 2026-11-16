@@ -1,6 +1,7 @@
 ## Next, in order
 
 4n7czb Link libzsrv.a against the glibc of Lean's toolchain on Linux
+vvxfl6 The stop notification can wake a loop that has already ended (zio Async.notify racing Loop.deinit)
 
 ## Proposed
 
@@ -17,7 +18,6 @@ i2rh6f Behavior of the PostgreSQL pool while the database is down
 rtkla3 Whether a handler's synchronous PostgreSQL error chain needs a scheduling boundary
 es53kx Bound the capacity of connection buffers or qualify the memory claim
 cxhvkb Where an item's time goes: bench.sh's load measurements, not the cold build
-vvxfl6 The stop notification can wake a loop that has already ended (zio Async.notify racing Loop.deinit)
 kaslrv Run the worst-case memory scenario on Linux
 dl4bte Confirm from the server the connection state the worst-case memory scenario measures
 3pund6 Decide what follows from the classification of Linux pending-connection accept errnos (xihdtw)
