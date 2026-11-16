@@ -236,11 +236,15 @@ inductive Reply where
 
 def emptyResponse : ByteArray := ByteArray.emptyWithCapacity 192
 
-/-- `now` is the wall clock in Unix seconds, for the Date header. -/
-def handle (now : Nat) (buf : ByteArray) : Reply :=
+/-- Frames and validates the request at the start of `buf` and answers it with
+`router` (status, body, head-only). `now` is the wall clock in Unix seconds,
+for the Date header. -/
+@[inline] def handleWith (router : ByteArray → Head → Nat × ByteArray × Bool) (now : Nat) (buf : ByteArray) : Reply :=
   match parse buf with
   | .needMore => .needMore
   | .bad status => .respond buf.size (respond emptyResponse now status ByteArray.empty true false) true
   | .ok h =>
-    let (status, body, isHead) := route buf h
+    let (status, body, isHead) := router buf h
     .respond (h.bodyStart + h.contentLength) (respond emptyResponse now status body h.close isHead) h.close
+
+def handle (now : Nat) (buf : ByteArray) : Reply := handleWith route now buf

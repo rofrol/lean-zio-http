@@ -1,13 +1,15 @@
-import Conn
+import Serve
 
-/-! Spike entry point: starts the zio.ev loops (zig/src/serve.zig), which drive
-each connection through the entry points of `Conn.lean`. -/
+/-! The spike server: `Http.handle` on the zio.ev loops. -/
 
-@[extern "ekk_serve"]
-opaque serve (port : UInt16) (threads : UInt32) : UInt8
+@[export ekk_conn_open] def connOpen (_ : UInt8) : Conn.State × Conn.Action := Serve.connOpen
+@[export ekk_conn_on_recv]
+def onRecv (now : UInt64) (s : Conn.State) (data : ByteArray) : Conn.State × Conn.Action :=
+  Serve.onRecv handle now s data
+@[export ekk_conn_on_sent]
+def onSent (now : UInt64) (s : Conn.State) (n : USize) : Conn.State × Conn.Action :=
+  Serve.onSent handle now s n
+@[export ekk_conn_on_fail]
+def onFail (s : Conn.State) : Conn.State × Conn.Action := Serve.onFail handle s
 
-def main (args : List String) : IO UInt32 := do
-  let threads := (args.head? >>= String.toNat?).getD 8
-  IO.println s!"serving on 127.0.0.1:8083 with {threads} loops"
-  (← IO.getStdout).flush
-  return (serve 8083 threads.toUInt32).toUInt32
+def main (args : List String) : IO UInt32 := Serve.main args

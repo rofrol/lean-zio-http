@@ -1,13 +1,18 @@
 name = "lsrv"
-defaultTargets = ["lsrv", "lsrv-test"]
+defaultTargets = ["lsrv", "lsrv-fixture", "lsrv-test"]
 
 [[lean_lib]]
 name = "Http"
-roots = ["Http", "Conn"]
+roots = ["Http", "Conn", "Serve"]
 
 [[lean_exe]]
 name = "lsrv"
 root = "Main"
+moreLinkArgs = ["../zig/zig-out/lib/libzsrv.a"]
+
+[[lean_exe]]
+name = "lsrv-fixture"
+root = "Fixture"
 moreLinkArgs = ["../zig/zig-out/lib/libzsrv.a"]
 
 [[lean_exe]]

@@ -229,22 +229,4 @@ theorem step_send (handler : ByteArray → Reply) (s : State) (e : Event) (data 
           · simp
   · simp [closeNow]
 
-/-! ## The loop's entry points (zig/src/serve.zig through glue.c) -/
-
-/-- A new connection: the initial state and its first action, a receive. -/
-@[export ekk_conn_open]
-def connOpen (_ : UInt8) : State × Action := (initial, .recv inCap)
-
-@[export ekk_conn_on_recv]
-def onRecv (now : UInt64) (s : State) (data : ByteArray) : State × Action :=
-  step (handle now.toNat) s (.received data)
-
-@[export ekk_conn_on_sent]
-def onSent (now : UInt64) (s : State) (n : USize) : State × Action :=
-  step (handle now.toNat) s (.sent n.toNat)
-
-@[export ekk_conn_on_fail]
-def onFail (s : State) : State × Action :=
-  step (handle 0) s .failed
-
 end Conn

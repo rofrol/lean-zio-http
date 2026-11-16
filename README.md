@@ -14,7 +14,18 @@ item.
   buffering state: each connection holds a Lean `Conn.State`, reports the
   outcome of every operation to it through `src/glue.c`, and performs the
   action it answers. Worker threads call `lean_initialize_thread`, which
-  libleanrt exports but `lean.h` does not declare.
+  libleanrt exports but `lean.h` does not declare. It keeps at most one
+  operation in flight per connection and ends the process when a completion
+  finds none outstanding. Test settings, given on the command line after the
+  loop count: `--chunk N` caps every receive and send at N bytes, `--fail-every
+  N` reports every N-th completed receive and every N-th completed send to
+  Lean as failed, and `--trace`
+  prints `open <id>` and `free <id> <operations>` per connection and keeps
+  freed connections allocated, so a late completion hits that check. Reusing
+  a connection's completion from its own callback relies on zio's contract
+  (pinned 9bef33d, `src/ev/loop.zig` `finishCompletion`): the completion is
+  marked dead before its callback runs, and for a completion without a group
+  owner the callback is the last thing the loop does with it.
 - `lean/Conn.lean`: the connection's lifecycle as one state type (reading,
   writing, closed) and a pure `step` over the loop's events, generic over the
   request handler, with theorems: the buffer never exceeds the largest
@@ -28,13 +39,21 @@ item.
   Transfer-Encoding rules (chunked bodies get 501), routes GET and HEAD `/`
   (methods compared case-sensitively), and builds Content-Type, Date,
   Content-Length and Connection headers; `handle` answers need-more or a
-  response with the bytes it consumes. `lean/Main.lean` starts the loops;
+  response with the bytes it consumes. `lean/Serve.lean` starts the loops and
+  reads the command line; `lean/Main.lean` (`lsrv`) exports the loop's entry
+  points for `handle`, and `lean/Fixture.lean` (`lsrv-fixture`) for a test
+  handler whose `/` body is 70,001 bytes, several times the loop's send buffer;
   `lean/Test.lean` tests `handle` and `Conn.step` without sockets (statuses,
   every proper prefix of complete requests, limits at their exact boundaries,
   dates, and one connection through split receives and a partial send).
 - `dusty-hello/`: the same route on dusty, the HTTP library on zio.
 - `bench/`: Go's `net/http` with the same route (`goserver`), end-to-end
-  checks over real sockets (`check`), and a closed-loop keep-alive load
+  checks over real sockets (`check`), tests of the Zig/Lean boundary
+  (`boundary`: it starts `lsrv-fixture` with the test settings and checks
+  exact large responses through 7-byte operations, split and pipelined
+  requests, injected failures, and 2,000 connections closed or reset at
+  different points, each accepted connection freed exactly once), and a
+  closed-loop keep-alive load
   generator (`load`) that counts only responses with status 200 and the
   expected body and fails on anything else.
 
@@ -45,7 +64,8 @@ Run everything (macOS or Linux; needs the Lean toolchain from
 spike/zio-http/bench.sh
 ```
 
-It builds all parts, runs the Lean tests and the end-to-end checks, then
+It builds all parts, runs the Lean tests, the boundary tests and the
+end-to-end checks, then
 measures each server at 1, 64 and 256 connections for 10 s, printing
 requests per second, latency percentiles and server CPU time per request.
 Any failure stops it with a nonzero status, and every server it started is

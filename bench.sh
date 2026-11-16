@@ -1,6 +1,8 @@
 #!/bin/sh
 # Builds the three servers, the checks and the load generator; runs the Lean
-# unit tests and the end-to-end checks against the Lean server; then measures
+# unit tests, the Zig/Lean boundary tests (bench/boundary, which start the
+# fixture server themselves) and the end-to-end checks against the Lean
+# server; then measures
 # each server: requests per second, latency, and server CPU time per request
 # at 1, 64 and 256 keep-alive connections, 10 s per run, all on this machine.
 # Any failing test, check or load run stops the script with a nonzero status.
@@ -12,12 +14,13 @@ LEAN_INCLUDE="$(cd lean && lean --print-prefix)/include"
 # overflow checks) unless set; it measured no slower than ReleaseFast.
 (cd zig && zig build -Doptimize="${ZIG_OPTIMIZE:-ReleaseSafe}" -Dlean-include="$LEAN_INCLUDE")
 # Lake does not track libzsrv.a (passed through moreLinkArgs), so drop the
-# executable to make it link against the library just built.
-rm -f lean/.lake/build/bin/lsrv
+# executables to make them link against the library just built.
+rm -f lean/.lake/build/bin/lsrv lean/.lake/build/bin/lsrv-fixture
 (cd lean && lake build)
 (cd dusty-hello && zig build -Doptimize=ReleaseFast)
 (cd bench/load && go build -o load .)
 (cd bench/check && go build -o check .)
+(cd bench/boundary && go build -o boundary .)
 (cd bench/goserver && go build -o server .)
 
 tmp=$(mktemp -d)
@@ -77,6 +80,7 @@ measure() {
 }
 
 lean/.lake/build/bin/lsrv-test
+bench/boundary/boundary
 start lean-zio ready lean/.lake/build/bin/lsrv 8
 bench/check/check -addr 127.0.0.1:8083
 measure lean-zio 8083

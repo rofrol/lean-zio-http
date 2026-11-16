@@ -7,4 +7,5 @@ dusty-hello/zig-pkg/
 lean/.lake/
 bench/load/load
 bench/check/check
+bench/boundary/boundary
 bench/goserver/server
