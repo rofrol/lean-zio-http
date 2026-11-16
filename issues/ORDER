@@ -14,6 +14,7 @@ i2rh6f Behavior of the PostgreSQL pool while the database is down
 6gmafg Deterministic tests for the PostgreSQL pool's callback orderings and query chains
 yvladm Decide whether per-loop PostgreSQL pools should share connections across loops
 3jnkx5 Deadlines for PostgreSQL queries, connection attempts and shutdown in the Lean server
+tc5rsx Bound the memory of a PostgreSQL result before it is fully received
 
 ## Needs a decision
 
