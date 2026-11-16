@@ -19,3 +19,4 @@ yvladm Decide whether per-loop PostgreSQL pools should share connections across 
 tc5rsx Bound the memory of a PostgreSQL result before it is fully received
 i35sos Invalidate the per-connection statement cache after a schema change
 i2rh6f Behavior of the PostgreSQL pool while the database is down
+rtkla3 Whether a handler's synchronous PostgreSQL error chain needs a scheduling boundary
