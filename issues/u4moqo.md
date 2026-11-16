@@ -5,3 +5,5 @@ Checked 2026-11-16 (`gh release list -R leanprover/lean4-nightly`): the newest n
 Do, once approved and once a nightly contains 13921a64bf71: move lean-toolchain, run ./bench.sh (the H1 comparison against the hand-written parser and the corpus show behavior changes), record in README any changed parser behavior, then tell ekklesiai.org the commit.
 Question: Should lean-zio-http move to the first nightly that contains PR 16417?
 Options: yes, once that nightly exists, with ./bench.sh and the parser comparison as the check | wait for a release candidate | stay on nightly-2026-11-14
+
+Decided by the user 2026-11-16: yes, move to the first nightly that contains PR 16417 (13921a64bf71), with ./bench.sh and the parser comparison as the check. Before the run starts, the coordinating session checks that such a nightly exists (`gh release list -R leanprover/lean4-nightly`, and that 13921a64bf71 is an ancestor of the nightly's commit); at 20:42Z on 2026-11-16 the newest was nightly-2026-11-16, built before the merge. The run tells ekklesiai.org (ekklesiai-org-8f) nothing itself; the coordinating session sends the commit.
