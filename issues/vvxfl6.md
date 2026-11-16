@@ -21,3 +21,7 @@ What it needs from the owner. Per AGENTS.md Rule 6, zio's documentation says onl
 (a) Ask upstream (https://github.com/lalinsky/zio) whether `notify` is meant to be safe when its loop ends concurrently. If it is, this is a bug: fix it in a fork with this reproducer as the regression test and offer the fix upstream. Publishing either is an outward action that needs the owner's go.
 (b) If upstream answers that the caller must keep the loop alive until every `notify` has returned, conform to that in serve.zig. For example, a loop deinits only after the signal thread reports that it has notified every loop. That changes the transport's shutdown behavior, so it needs the owner's approval.
 (c) Accept the risk and keep it documented. README, "Transport tests", names it as unresolved.
+
+Recommendation (consult round 20261116-183449-f682, sol, under the user's delegation of 2026-11-16): authorize asking upstream (a) first, keeping the reproducer; choose neither a fork fix nor a change of the shutdown until upstream settles the contract. The race itself is demonstrated; only its classification is open.
+Question: May I ask zio upstream whether Async.notify must be safe when its loop ends and deinits concurrently?
+Options: ask upstream (a) | conform in serve.zig now (b) | accept and keep documented (c)
