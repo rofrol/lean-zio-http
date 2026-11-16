@@ -1,0 +1,6 @@
+The queue runs through rr2; point the README at this queue's items
+
+Requested by the user 2026-11-16 in ekklesiai.org's item m4jfmv: this repository gets its own queue, run by rr2 as ekklesiai.org's is, and the queue items about the server move here.
+- Add to `AGENTS.project.md` a section "The queue runs through rr2", as in ekklesiai.org's `AGENTS.project.md`: items are done with `rr2 --issue ID < task.md` or `rr2 queue`, an rr2 run makes every change to the repository's files, the coordinating session changes `issues/` only through `rr2 issue add|move|edit|finish` and does only what acts outside the repository; an item that only does that carries `Done by: the coordinating session`.
+- `README.md` names ekklesiai.org's item ids for work now queued here (for example pihgvg, the Linux runs, in the `Server.HandParser` row and elsewhere) and decision D1, whose record is in ekklesiai.org: name the item ids of this queue (`issues/ORDER`) and say where D1 is recorded, or record it here (`DECISIONS.md` or `docs/decisions/`). Leave historical mentions of finished items (7bccgi, 2l6rcv) as history.
+Check: `git grep -n pihgvg` names only this queue's ids for open work; `./bench.sh` is not needed (documentation only).
