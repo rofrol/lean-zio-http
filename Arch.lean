@@ -4,7 +4,7 @@ import Lean.Elab.ParseImportsFast
 checked on the imports every Lean file of this package declares. Each module
 may import only what its rule below allows; a file no rule names fails, so a
 new module must be placed in the map before it builds into a passing check.
-Run from `lean/` (or pass the package directory); exit status 1 on any
+Run from the repository root (or pass the package directory); exit status 1 on any
 violation. -/
 
 open Lean

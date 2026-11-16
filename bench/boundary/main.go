@@ -1,5 +1,5 @@
 // Tests of the Zig/Lean boundary (zig/src/serve.zig, glue.c,
-// lean/Server/Conn.lean) over real sockets. Each scenario starts a server
+// Server/Conn.lean) over real sockets. Each scenario starts a server
 // executable with the loop's test settings (--chunk, --fail-every, --trace,
 // --max-conns, --crash-after-recv, --crash-after-send), drives connections
 // against it, and then checks, from the server's trace lines, that every
@@ -43,7 +43,7 @@ import (
 // accounting still checks. Recorded in issues/dqsipn.md.
 const zioShutWarning = "warning(zio): unexpected error: .INVAL (22) - please file a bug report: https://github.com/lalinsky/zio/issues/new"
 
-const bodySize = 60001 // lean/App/Fixture.lean's body
+const bodySize = 60001 // App/Fixture.lean's body
 
 var body = func() []byte {
 	b := make([]byte, bodySize)
@@ -737,7 +737,7 @@ func churn(addr string) (int64, string, error) {
 }
 
 func main() {
-	fixture := flag.String("fixture", "lean/.lake/build/bin/lsrv-fixture", "fixture server executable")
+	fixture := flag.String("fixture", ".lake/build/bin/lsrv-fixture", "fixture server executable")
 	addr := flag.String("addr", "127.0.0.1:8083", "address the server listens on")
 	noContinue := flag.Bool("no-continue", false, "the fixture does not answer Expect: 100-continue (lsrv-fixture-hand); skip the scenarios that need it")
 	flag.Parse()

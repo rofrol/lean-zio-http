@@ -1,7 +1,7 @@
 // The PostgreSQL pool of one loop: at most `size` libpq connections, owned
 // by the loop's thread and driven by its zio.ev in libpq's non-blocking mode,
 // so a query never blocks the loop. Queries and results are Lean values
-// (lean/Server/Query.lean); glue.c makes the libpq calls and builds the
+// (Server/Query.lean); glue.c makes the libpq calls and builds the
 // results. The pool knows nothing of HTTP: a query comes with a `Waiter`
 // (embedded in the connection that asked) and its result goes to the
 // waiter's `deliver` (README, "PostgreSQL").

@@ -44,7 +44,7 @@ import (
 )
 
 var (
-	server   = flag.String("server", "lean/.lake/build/bin/lsrv-db", "the lsrv-db executable")
+	server   = flag.String("server", ".lake/build/bin/lsrv-db", "the lsrv-db executable")
 	conninfo = flag.String("pg", "", "libpq conninfo of the private cluster")
 	pgdata   = flag.String("pgdata", "", "the private cluster's data directory, for pg_ctl")
 	pgopts   = flag.String("pgopts", "", "the options pg_ctl starts the cluster with (-o)")

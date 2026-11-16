@@ -1,6 +1,6 @@
 // The transport: one zio.ev loop per thread, all accepting on one listening
 // socket. The loop keeps no protocol or buffering state: each connection holds
-// a Lean state (lean/Server/Conn.lean), reports the outcome of every operation
+// a Lean state (Server/Conn.lean), reports the outcome of every operation
 // to it through glue.c, and performs the action it answers (receive, send,
 // close, or a query, which the loop's PostgreSQL pool in pg.zig runs and whose
 // result it reports back). Around that the loop owns admission (at most `max_conns`
