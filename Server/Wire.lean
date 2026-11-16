@@ -1,8 +1,11 @@
+import Server.Query
+
 /-! The contract between a connection (`Server.Conn`, driven by the transport)
 and the protocol adapter that reads its bytes (`Server.H1Adapter` in
 production, `Server.HandParser` as the comparator): the limits both sides
 size their buffers by, and what an adapter answers about the bytes buffered on
-a connection. It imports nothing, so neither side depends on the other. -/
+a connection. It imports only `Server.Query` (the values a waiting answer
+carries), so neither side depends on the other. -/
 
 namespace Server
 
@@ -35,5 +38,9 @@ inductive Reply where
   | continue (interim : ByteArray)
   /-- Send `response` for the first `consumed` bytes; close afterwards when `close`. -/
   | respond (consumed : Nat) (response : ByteArray) (close : Bool)
+  /-- The first `consumed` bytes are a complete request whose answer waits for
+  query `q`: run it, then continue with `k` applied to its result, which ends in
+  a response to send and whether to close afterwards, as with `respond`. -/
+  | await (consumed : Nat) (q : Query) (k : Query.Result → Await (ByteArray × Bool))
 
 end Server

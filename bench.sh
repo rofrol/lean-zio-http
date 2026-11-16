@@ -9,14 +9,25 @@
 # requests (lsrv-bench); then measures
 # each server: requests per second, latency, and server CPU time per request
 # at 1, 64 and 256 keep-alive connections, 10 s per run, all on this machine.
+# Then it creates a private PostgreSQL cluster (its own data directory and
+# Unix socket under a temporary directory, no TCP listener), runs the
+# database tests against lsrv-db (bench/dbcheck, which restarts and stops
+# that cluster) and measures lsrv-db against Go with pgx (bench/pgserver) on
+# GET /db?id=42 at 1 and 64 connections, printing lean's throughput as a
+# share of Go's. It needs PostgreSQL's pg_config, initdb, pg_ctl and psql
+# (Homebrew: postgresql@18); pg_config's bindir goes first on PATH.
 # Any failing test, check or load run stops the script with a nonzero status.
 set -eu
 cd "$(dirname "$0")"
+PATH="$(pg_config --bindir):$PATH"
+# lake links the servers with -lpq from pg_config's libdir.
+LIBRARY_PATH="$(pg_config --libdir)${LIBRARY_PATH:+:$LIBRARY_PATH}"
+export PATH LIBRARY_PATH
 # The include directory of the toolchain lean/lean-toolchain pins.
 LEAN_INCLUDE="$(cd lean && lean --print-prefix)/include"
 # ZIG_OPTIMIZE picks the build of the loop and zio: ReleaseSafe (bounds and
 # overflow checks) unless set; it measured no slower than ReleaseFast.
-(cd zig && zig build -Doptimize="${ZIG_OPTIMIZE:-ReleaseSafe}" -Dlean-include="$LEAN_INCLUDE")
+(cd zig && zig build -Doptimize="${ZIG_OPTIMIZE:-ReleaseSafe}" -Dlean-include="$LEAN_INCLUDE" -Dpq-include="$(pg_config --includedir)")
 # Lake does not track libzsrv.a (passed through moreLinkArgs), so drop the
 # executables to make them link against the library just built.
 rm -f lean/.lake/build/bin/lsrv*
@@ -26,11 +37,15 @@ rm -f lean/.lake/build/bin/lsrv*
 (cd bench/check && go build -o check .)
 (cd bench/boundary && go build -o boundary .)
 (cd bench/goserver && go build -o server .)
+(cd bench/pgserver && go build -o server .)
+(cd bench/dbcheck && go build -o dbcheck .)
 
 tmp=$(mktemp -d)
 pids=""
+pgdata=""
 cleanup() {
   for p in $pids; do kill -TERM "$p" 2>/dev/null || true; done
+  if [ -n "$pgdata" ]; then pg_ctl -D "$pgdata" -m immediate stop >/dev/null 2>&1 || true; fi
   rm -rf "$tmp"
 }
 trap cleanup EXIT INT TERM
@@ -115,3 +130,37 @@ stop
 start dusty "Listening on" dusty-hello/zig-out/bin/dhello
 measure dusty 8084
 stop
+
+# The private cluster: trust authentication on its own Unix socket only.
+pgdata="$tmp/pgdata"
+pgopts="-c listen_addresses= -c unix_socket_directories=$tmp -p 5499 -c max_prepared_transactions=4 -c max_connections=200"
+pg="host=$tmp port=5499 user=postgres dbname=postgres"
+initdb -D "$pgdata" -U postgres --auth=trust -E UTF8 --no-locale >"$tmp/initdb.log" 2>&1 || { cat "$tmp/initdb.log"; exit 1; }
+pg_ctl -D "$pgdata" -w -l "$tmp/pg.log" -o "$pgopts" start >/dev/null
+# The rows of world: randomnumber = (id * 7919) mod 10000 + 1 (42 -> 2599).
+psql "$pg" -q -v ON_ERROR_STOP=1 -c "CREATE TABLE world (id int PRIMARY KEY, randomnumber int NOT NULL);
+  INSERT INTO world SELECT i, (i * 7919) % 10000 + 1 FROM generate_series(1, 10000) i; ANALYZE world;"
+bench/dbcheck/dbcheck -pg "$pg" -pgdata "$pgdata" -pgopts "$pgopts" -pglog "$tmp/pg.log"
+
+# measure_db NAME PORT: GET /db?id=42 at 1 and 64 connections; sets rps_1 and
+# rps_64 to the requests per second.
+measure_db() {
+  name=$1; port=$2
+  for c in 1 64; do
+    before=$(cpu "$pid")
+    result=$(bench/load/load -url "http://127.0.0.1:$port/db?id=42" -c "$c" -d 10s -body '{"id":42,"randomNumber":2599}') || { echo "$name c=$c $result"; exit 1; }
+    after=$(cpu "$pid")
+    n=$(echo "$result" | sed -E 's/.* n=([0-9]+).*/\1/')
+    echo "$name c=$c $result cpu_us_per_req=$(echo "($after - $before) * 1000000 / $n" | bc)"
+    eval "rps_$c=$(echo "$result" | sed -E 's/^req\/s=([0-9]+).*/\1/')"
+  done
+}
+# 8 loops with 4 connections each against one pool of 32.
+start lean-db ready lean/.lake/build/bin/lsrv-db 8 --pg "$pg" --pg-conns 4
+measure_db lean-db 8083
+stop graceful
+lean_1=$rps_1; lean_64=$rps_64
+start go-db ready bench/pgserver/server -pg "$pg" -conns 32
+measure_db go-db 8082
+stop
+echo "lean-db/go-db c=1 $(echo "scale=2; $lean_1 / $rps_1" | bc) c=64 $(echo "scale=2; $lean_64 / $rps_64" | bc) (goal: at least 0.9)"

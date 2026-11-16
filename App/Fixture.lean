@@ -17,13 +17,15 @@ def body : ByteArray := Id.run do
     b := b.push (97 + (i % 26).toUInt8)
   return b
 
-def app (r : Server.Request) : Server.Response :=
+def respond (r : Server.Request) : Server.Response :=
   if r.target == "/too-big" then
     { status := 200, headers := App.Hello.textPlain, body := ByteArray.mk (Array.replicate 70001 97) }
   else if r.target == "/echo" && r.method == "POST" then
     { status := 200, headers := App.Hello.textPlain, body := r.body }
-  else match App.Hello.app r with
+  else match App.Hello.respond r with
     | { status := 200, headers, .. } => { status := 200, headers, body }
     | other => other
+
+def app : Server.Handler := fun r => .done (respond r)
 
 end App.Fixture

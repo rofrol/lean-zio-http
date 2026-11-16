@@ -1,14 +1,17 @@
-/-! The interface the application implements: a pure function from a request
-to a response. It imports nothing, so an application depends neither on the
-parser nor on the transport (the architecture test, `Arch.lean`, enforces
-that application modules import only this one and each other).
+import Server.Query
 
-Scope: synchronous applications. A handler runs on the event loop thread that
-owns the connection, so a slow handler delays every connection of that loop;
-purity bounds neither its time nor its allocations. Step 6 of the server order
-(non-blocking PostgreSQL owned by each loop) needs a handler that can suspend;
-that is a change of this interface, decided then, not a second interface kept
-beside it. -/
+/-! The interface the application implements: a pure function from a request
+to a response, which may first wait for database queries (`Server.Await`,
+`Server.Query`). It imports only those values, so an application depends
+neither on the parser nor on the transport (the architecture test, `Arch.lean`,
+enforces that application modules import only this module, `Server.Query` and
+each other).
+
+A handler runs on the event loop thread that owns the connection, so a slow
+handler delays every connection of that loop; purity bounds neither its time
+nor its allocations. A query does not run on that thread's time: the
+connection waits for its result while the loop serves its other connections
+(README, "PostgreSQL"). -/
 
 namespace Server
 
@@ -37,6 +40,8 @@ structure Response where
   headers : Array (String × String) := #[]
   body : ByteArray := ByteArray.empty
 
-abbrev Handler := Request → Response
+/-- The application: a response, possibly after queries (`Await.done r` when
+it needs none). -/
+abbrev Handler := Request → Await Response
 
 end Server

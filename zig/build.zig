@@ -14,6 +14,9 @@ pub fn build(b: *std.Build) void {
     mod.addImport("zio", zio.module("zio"));
     mod.addIncludePath(.{ .cwd_relative = lean_include });
     mod.addCSourceFile(.{ .file = b.path("src/glue.c"), .flags = &.{ "-O2" } });
+    // libpq's headers (Homebrew's libpq by default); the executables link libpq.
+    const pq_include = b.option([]const u8, "pq-include", "libpq include directory") orelse @panic("-Dpq-include required");
+    mod.addIncludePath(.{ .cwd_relative = pq_include });
     const lib = b.addLibrary(.{ .name = "zsrv", .root_module = mod, .linkage = .static });
     lib.bundle_compiler_rt = true;
     b.installArtifact(lib);

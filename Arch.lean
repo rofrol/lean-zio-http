@@ -13,13 +13,14 @@ open Lean
 def under (pre n : Name) : Bool := pre == n || pre.isPrefixOf n
 
 /-- The library modules every server-side module may build on. -/
-def contracts : List Name := [`Server.Wire, `Server.Handler]
+def contracts : List Name := [`Server.Query, `Server.Wire, `Server.Handler]
 
 /-- What module `m` may import, or `none` when no rule names it. -/
 def rule (m : Name) : Option (Name → Bool) :=
   match m with
-  -- The contracts: no imports beyond the prelude.
-  | `Server.Wire | `Server.Handler => some fun _ => false
+  -- The contracts: queries as values import nothing; Wire and Handler only them.
+  | `Server.Query => some fun _ => false
+  | `Server.Wire | `Server.Handler => some (· == `Server.Query)
   -- The transport knows the wire limits and the connection model, not HTTP or the application.
   | `Server.Conn => some (· == `Server.Wire)
   | `Server.Transport => some (· ∈ [`Server.Wire, `Server.Conn])
@@ -28,15 +29,13 @@ def rule (m : Name) : Option (Name → Bool) :=
   | `Server.H1Adapter => some (· ∈ contracts ++ [`Server.Response, `Std.Http.Protocol.H1])
   | `Server.HandParser => some (· ∈ contracts ++ [`Server.Response])
   -- Composition roots: one transport, one adapter, one application each.
-  | `Main | `Fixture => some fun i => i ∈ [`Server.Transport, `Server.H1Adapter] || under `App i
+  | `Main | `Fixture | `MainDb => some fun i => i ∈ [`Server.Transport, `Server.H1Adapter] || under `App i
   | `MainHand | `FixtureHand => some fun i => i ∈ [`Server.Transport, `Server.HandParser] || under `App i
   -- Tests and measurement tools may import anything.
   | `Test | `Bench | `Compare | `Corpus | `Arch => some fun _ => true
   | _ =>
-    -- The application sees the handler interface only.
-    if under `App m then some fun i => i == `Server.Handler || under `App i
-    -- The PostgreSQL adapter's place (step 6 of order D3): the contracts and Std, not HTTP or the transport.
-    else if under `Server.Pg m then some fun i => i ∈ contracts || under `Server.Pg i || (under `Std i && !under `Std.Http i)
+    -- The application sees the handler interface and the query values only.
+    if under `App m then some fun i => i ∈ [`Server.Handler, `Server.Query] || under `App i
     else none
 
 /-- The `.lean` files under `dir`, skipping Lake's build directory, as module names. -/

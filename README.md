@@ -16,25 +16,28 @@ names; `bench.sh` runs it.
 
 | module | role | may import |
 |---|---|---|
-| `Server.Wire` | the limits and `Server.Reply`, the adapter's answer to the bytes buffered on a connection | nothing |
-| `Server.Handler` | the interface the application implements: `Request → Response` | nothing |
+| `Server.Query` | a database query and its result as values, and `Await`, a computation that may wait for queries | nothing |
+| `Server.Wire` | the limits and `Server.Reply`, the adapter's answer to the bytes buffered on a connection | `Server.Query` |
+| `Server.Handler` | the interface the application implements: `Request → Await Response` | `Server.Query` |
 | `Server.Conn` | a connection's lifecycle: one state type and a pure `step` over the loop's events, with theorems | `Server.Wire` |
 | `Server.Transport` | the loop's Lean side: `ekk_serve`, the command line, the `server_exports` command that exports the loop's entry points | `Server.Wire`, `Server.Conn` |
 | `Server.Response` | writes and checks responses, for both adapters | contracts |
 | `Server.H1Adapter` | the production HTTP/1.1 adapter, `Std.Http.Protocol.H1` (D1) | contracts, `Server.Response`, `Std.Http.Protocol.H1` |
 | `Server.HandParser` | the hand-written parser: test comparator and rollback until item pihgvg, then deleted (D1) | contracts, `Server.Response` |
-| `Server.Pg.*` | the place of the PostgreSQL adapter (step 6 of D3); no module yet | contracts, `Server.Pg.*`, `Std` except `Std.Http` |
-| `App.*` | applications: `App.Hello` (the benchmark route), `App.Fixture` (the boundary tests' route) | `Server.Handler`, `App.*` |
-| `Main`, `Fixture` | composition roots `lsrv`, `lsrv-fixture`: H1 and one application | `Server.Transport`, `Server.H1Adapter`, `App.*` |
+| `App.*` | applications: `App.Hello` (the benchmark route), `App.Fixture` (the boundary tests' route), `App.Db` (the PostgreSQL tests' and benchmark's routes) | `Server.Handler`, `Server.Query`, `App.*` |
+| `Main`, `Fixture`, `MainDb` | composition roots `lsrv`, `lsrv-fixture`, `lsrv-db`: H1 and one application | `Server.Transport`, `Server.H1Adapter`, `App.*` |
 | `MainHand`, `FixtureHand` | `lsrv-hand`, `lsrv-fixture-hand`: the same with the hand-written parser | `Server.Transport`, `Server.HandParser`, `App.*` |
 | `Test`, `Bench`, `Compare`, `Corpus`, `Arch` | tests and measurements | anything |
 
-"Contracts" are `Server.Wire` and `Server.Handler`. The transport knows
-neither HTTP nor the application; the application sees neither the
-transport nor `Std.Http`. The handler is pure and synchronous, which suits
-the applications so far; the PostgreSQL step changes this interface (a
-handler that waits for the database), with no compatibility layer for this
-one.
+"Contracts" are `Server.Query`, `Server.Wire` and `Server.Handler`. The
+transport knows neither HTTP nor the application; the application sees
+neither the transport nor `Std.Http`. The handler is pure: it answers
+`Await.done response`, or `Await.query q k`, which asks the loop to run `q`
+and continues with `k` on its result (`Await` is a monad, so a handler
+writes `match ← Await.run q with ...`). This replaced `Request → Response`
+with no compatibility layer. The PostgreSQL adapter is part of the loop
+(`zig/src/pg.zig` and `zig/src/glue.c`, section "PostgreSQL"); Lean sees
+only `Server.Query` values.
 
 - `zig/` (the transport's loop): a static library, built ReleaseSafe by
   `bench.sh` unless `ZIG_OPTIMIZE` says otherwise. One `zio.ev` loop per
@@ -49,21 +52,31 @@ one.
   connection's completion from its own callback relies on zio's contract
   (pinned 9bef33d, `src/ev/loop.zig` `finishCompletion`): the completion is
   marked dead before its callback runs, and for a completion without a group
-  owner the callback is the last thing the loop does with it.
-- Command line: `lsrv [THREADS] [--max-conns N]`, then the test settings:
+  owner the callback is the last thing the loop does with it. Each loop
+  also owns a PostgreSQL pool (`src/pg.zig`, section "PostgreSQL"). The
+  library needs libpq's headers (`-Dpq-include`) and the servers link
+  `-lpq`.
+- Command line: `lsrv [THREADS] [--max-conns N] [--pg CONNINFO]
+  [--pg-conns N]` (`--pg-conns`, default 4, is per loop; without `--pg` no
+  pool is made and every query fails with `08006`), then the test settings:
   `--chunk N` caps every receive and send at N bytes, `--fail-every N`
   reports every N-th completed receive and every N-th completed send to Lean
   as failed, `--trace` prints `open <id>` and `free <id> <operations>
-  <injected receive failures> <injected send failures>` per connection and
+  <injected receive failures> <injected send failures>` per connection,
+  `query <id>` when a connection hands a query to the pool, `pg closed`
+  when a pool slot has ended its PostgreSQL session, and
+  `stop <receives> <sends>` when a loop's shutdown starts, and
   keeps freed connections allocated, so a late completion hits that check,
   and `--crash-after-recv N` and `--crash-after-send N` kill the process with
   SIGKILL right after the N-th successful receive or send, before Lean hears
   of it.
 - `dusty-hello/`: the same route on dusty, the HTTP library on zio.
-- `bench/`: Go's `net/http` with the same route (`goserver`), end-to-end
-  checks over real sockets (`check`), the boundary tests (`boundary`, below),
-  and a closed-loop keep-alive load generator (`load`) that counts only
-  responses with status 200 and the expected body and fails on anything else.
+- `bench/`: Go's `net/http` with the same route (`goserver`) and with
+  `App.Db`'s `/db` route over a pgx pool (`pgserver`), end-to-end checks over
+  real sockets (`check`), the boundary tests (`boundary`, below), the
+  PostgreSQL tests (`dbcheck`, below), and a closed-loop keep-alive load
+  generator (`load`) that counts only responses with status 200 and the
+  expected body and fails on anything else.
 
 ## Production contract
 
@@ -135,13 +148,97 @@ one.
   exits with status 0. A peer that does not read its response holds the
   shutdown until it does; ending that wait is the supervisor's deadline
   (SIGKILL), not the server's.
+  A query in flight or waiting for a pool slot also holds the shutdown
+  until it is answered (section "PostgreSQL").
 - **Not yet:** idle, read and write deadlines per connection (a peer can hold
-  a connection slot as long as it likes), chunked request bodies,
-  percent-decoding and query parsing, Go's larger limits.
+  a connection slot as long as it likes), deadlines for queries, chunked
+  request bodies, percent-decoding and query parsing, Go's larger limits.
+
+## PostgreSQL
+
+A handler that answers `Await.query q k` puts its connection in
+`Conn.Phase.querying k`; the loop runs `q` on its own pool and feeds the
+result back as `Conn.Event.answered`, and `k`'s answer continues the
+connection (another query or the response). The connection does nothing
+else meanwhile; the loop serves its other connections (`Conn.step_query`,
+`bench/dbcheck`'s slow-query test).
+
+- **Pool.** Each loop has its own pool of at most `--pg-conns` libpq
+  connections in non-blocking mode, registered with its own `zio.ev` loop
+  only (no locks, no sharing between loops; one loop's busy pool does not
+  borrow another's idle connections). Connections open on demand, for the
+  query that needs one; a query that finds every slot busy waits in the
+  loop's FIFO queue, which holds at most one query per HTTP connection.
+  zio's socket registry keeps a registration per descriptor until a
+  `NetClose`, while libpq closes and replaces its own socket, so the pool
+  polls a duplicate of libpq's descriptor that it owns and closes with
+  `NetClose` (`zig/src/pg.zig`, its header).
+- **Statements.** Each connection prepares a statement for each distinct
+  `Query.sql` on its first use (one round trip: Prepare, execute and Sync in
+  libpq's pipeline mode) and executes it by name after that, as pgx does;
+  past 64 statements on a connection further texts run unnamed. So a query
+  must not deallocate statements (`DEALLOCATE`, `DISCARD ALL`), and a
+  statement whose result type changes after a schema change fails until the
+  connection is replaced. Parameters and results are text; one statement per
+  query.
+- **Results and errors.** Every query is answered exactly once: rows (text
+  values, `none` for NULL, invalid UTF-8 replaced), PostgreSQL's error with
+  its SQLSTATE, or a pool error: `08006` when the connection could not be
+  made or was lost (also for a query in flight when the server restarts),
+  `54000` for a query that cannot be sent (a NUL byte, more than 65,535
+  parameters) or a result over `Query.maxResultBytes` (1 MiB of text). A
+  query is never retried: once it may have reached the server, a lost
+  connection fails it, and its outcome is unknown (a write may have been
+  committed); the next query opens a fresh connection. Likewise a process
+  that ends after a query was sent leaves its outcome to PostgreSQL, as
+  for any client that disconnects. With the
+  database down every query fails at once with `08006` after its own
+  connection attempt; there are no timers, backoff or circuit breaker.
+  `App.Db` answers class 08 with 503 and other errors with 500.
+- **Liveness.** An idle connection keeps its receive armed, so a connection
+  the server closed is ended when the loop handles its EOF. This is best
+  effort: a query the loop dispatches before handling the EOF fails with
+  `08006`.
+- **Sessions.** Each query is its own implicit transaction. A query that
+  leaves a transaction open or failed (`BEGIN`) is answered `25000` and its
+  session is closed, which rolls the transaction back, so no query runs in
+  another's transaction. Other session state (`SET`, session-level advisory
+  locks, temporary tables) stays with the session for later queries of any
+  request; queries must not change it (`Server.Query`).
+- **Connection string.** `--pg` is a libpq conninfo; the pool adds
+  `client_encoding=UTF8`. It must name a Unix socket directory or a
+  `hostaddr`: libpq resolves a host name synchronously, which would block
+  the loop.
+- **Not bounded yet:** libpq gathers a whole result before the size check,
+  so a query returning more than 1 MiB costs that memory until it is
+  refused; a query or a connection attempt has no deadline, so a stuck
+  database holds connections, and shutdown, until it answers.
+
+Measured by `bench.sh` (M1, 2026-11-16, 8 loops with 4 connections each
+against Go's `net/http` with one pgx pool of 32, both on the same private
+cluster, `GET /db?id=42`, 10 s per run):
+
+| server | c=1 req/s | CPU µs/req | c=64 req/s | CPU µs/req |
+|---|---:|---:|---:|---:|
+| lean-db | 12,512 | 34 | 78,178 | 44 |
+| go-db | 11,745 | 68 | 71,610 | 51 |
+
+lean-db reaches 1.06 and 1.09 of Go's throughput (goal: 0.9). Two choices
+decided it, measured while building the pool (5 to 10 s runs): readiness
+through a one-byte peeking receive instead of zio's `NetPoll`, whose
+`poll(2)` probe cost more CPU than the receive and the send together on
+macOS (c=64 from 0.86 to 1.07 of Go), and prepared statements (c=1 from
+0.78 to 0.90 of Go with the probe; without them, after the probe change,
+0.91 at c=1 and 0.98 at c=64). At 64 connections lean-db's p99 latency is
+higher than Go's (3.6 against 2.4 ms): HTTP connections spread unevenly over
+the loops, and each loop's queries wait for that loop's slots only.
 
 ## Memory
 
-Retained per connection, bounded whatever the peer does: the loop's
+Retained per connection, bounded whatever the peer does (a waiting query
+adds its `Server.Query` and continuation, bounded by what the handler builds,
+and a result of at most `Query.maxResultBytes` of text while it is turned
+into the continuation's answer): the loop's
 connection (two 8,192-byte buffers and its fields, a little over 16 KiB), the Lean
 buffer of unconsumed bytes (at most `inCap` = 16,388 bytes,
 `Conn.step_inv`), and a response being sent (at most 65,536 bytes,
@@ -191,7 +288,8 @@ receives changes the adapter's interface and is a separate decision.
 ## Running
 
 Run everything (macOS or Linux; needs the Lean toolchain from
-`lean/lean-toolchain`, Zig 0.17 and Go):
+`lean/lean-toolchain`, Zig 0.17, Go and PostgreSQL with `pg_config`, which
+also provides libpq; Homebrew `postgresql@18`):
 
 ```sh
 spike/zio-http/bench.sh
@@ -205,7 +303,10 @@ and benchmark (`lsrv-compare`, `lsrv-bench`), the boundary tests and the
 end-to-end checks (the last two against both parsers), then measures each
 server at 1, 64 and 256 connections for 10 s, printing requests per second,
 latency percentiles and server CPU time per request; the Lean servers must
-then stop gracefully on SIGTERM. Any failure stops it with a nonzero status,
+then stop gracefully on SIGTERM. Then it creates a private PostgreSQL
+cluster under its temporary directory (a Unix socket there, no TCP
+listener; any other PostgreSQL on the machine is not touched), runs
+`bench/dbcheck` and measures `lsrv-db` against `bench/pgserver`. Any failure stops it with a nonzero status,
 and every server it started is stopped on exit. A server that stops
 answering keeps it from ending; that is a failure to trace, never a result.
 
@@ -218,6 +319,24 @@ with a response in flight and an idle and a partial connection, admission at
 `--max-conns 2`, the two crash points, and the memory per connection; every
 accepted connection must be freed exactly once and the server must stop
 with status 0.
+
+`bench/dbcheck` starts `lsrv-db` with one loop for each test and checks,
+without assumptions on elapsed time (a query waits on an advisory lock the
+test holds; `pg_stat_activity` tells the test it is waiting): results, a
+missing row and two chained queries; a slow query does not delay the loop's
+other connections (a request with no query, and a query on the second
+slot); pool exhaustion (one slot: 20 queries queue behind a waiting one,
+which the server's `query` trace lines confirm, PostgreSQL sees one
+connection, all complete once the lock is released); a
+restart (`pg_ctl restart -m fast` with a query in flight, its lock held by a
+prepared transaction so it cannot finish first: 503, then, once the
+`pg closed` trace lines show both old sessions ended, 200 on fresh
+connections on both slots); errors on one slot (a query that cannot be
+prepared, a cached statement failing when executed, `BEGIN` leaving a
+transaction open: each 500 with its SQLSTATE, and the slot answers the next
+query); the database stopped (503, 200 once started); and SIGTERM with a
+query waiting (once the `stop` trace line shows the shutdown started, the
+lock is released: the query is answered, then `stopped` and status 0).
 
 Reading the numbers: the load generator runs on the same machine, so at 64
 and more connections it is the limit; compare the 1-connection rows and the

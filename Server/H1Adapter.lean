@@ -139,7 +139,6 @@ def handle (app : Handler) (now : Nat) (buf : ByteArray) : Reply :=
   | .awaitingBody => .continue Server.Response.continueBytes
   | .bad status => .respond buf.size (Server.Response.error now status) true
   | .ok h body consumed close =>
-    let (bytes, close) := Server.Response.answer now app (toRequest buf h body) close
-    .respond consumed bytes close
+    Server.Response.reply consumed (Server.Response.answer now app (toRequest buf h body) close)
 
 end Server.H1Adapter

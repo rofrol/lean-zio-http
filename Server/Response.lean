@@ -82,6 +82,7 @@ def reason : Nat → String
   | 431 => "Request Header Fields Too Large"
   | 500 => "Internal Server Error"
   | 501 => "Not Implemented"
+  | 503 => "Service Unavailable"
   | 505 => "HTTP Version Not Supported"
   | _ => ""
 
@@ -156,12 +157,20 @@ def error (now : Nat) (status : Nat) : ByteArray :=
   write now { status, headers := #[("Content-Type", "text/plain; charset=utf-8")] } true false
 
 /-- The bytes answering a request the adapter framed, and whether the
-connection closes after them: the application's response (`render`; no body
-for HEAD), except that CONNECT gets 501 without reaching the application. A
-2xx answer to CONNECT turns the connection into a tunnel (RFC 9110 9.3.6),
-which this server does not implement, so no `Response` may stand for one. -/
-def answer (now : Nat) (app : Handler) (req : Request) (close : Bool) : ByteArray × Bool :=
-  if req.method == "CONNECT" then (error now 501, true)
-  else render now (app req) close (req.method == "HEAD")
+connection closes after them, once the application's queries are answered: the
+application's response (`render`; no body for HEAD), except that CONNECT gets
+501 without reaching the application. A 2xx answer to CONNECT turns the
+connection into a tunnel (RFC 9110 9.3.6), which this server does not
+implement, so no `Response` may stand for one. The Date header is the time
+the request was framed. -/
+def answer (now : Nat) (app : Handler) (req : Request) (close : Bool) : Await (ByteArray × Bool) :=
+  if req.method == "CONNECT" then .done (error now 501, true)
+  else (app req).map fun r => render now r close (req.method == "HEAD")
+
+/-- The adapter's reply for a framed request of `consumed` bytes: the response
+at once, or the query it waits for. -/
+def reply (consumed : Nat) : Await (ByteArray × Bool) → Reply
+  | .done (bytes, close) => .respond consumed bytes close
+  | .query q k => .await consumed q k
 
 end Server.Response

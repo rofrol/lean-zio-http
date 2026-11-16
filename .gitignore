@@ -9,3 +9,5 @@ bench/load/load
 bench/check/check
 bench/boundary/boundary
 bench/goserver/server
+bench/dbcheck/dbcheck
+bench/pgserver/server

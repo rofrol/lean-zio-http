@@ -9,9 +9,11 @@ def textPlain : Array (String × String) := #[("Content-Type", "text/plain; char
 def helloBody : ByteArray := "Hello, World!".toUTF8
 def notFoundBody : ByteArray := "404 page not found\n".toUTF8
 
-def app (r : Server.Request) : Server.Response :=
+def respond (r : Server.Request) : Server.Response :=
   if r.target == "/" && (r.method == "GET" || r.method == "HEAD") then
     { status := 200, headers := textPlain, body := helloBody }
   else { status := 404, headers := textPlain, body := notFoundBody }
+
+def app : Server.Handler := fun r => .done (respond r)
 
 end App.Hello

@@ -6,8 +6,8 @@ import Server.Conn
 executable (the composition root: `Main.lean`, `Fixture.lean` and their
 hand-written-parser twins) picks a protocol adapter and an application and
 exports the loop's entry points (`ekk_conn_open`, `ekk_conn_on_recv`,
-`ekk_conn_on_sent`, `ekk_conn_on_fail`, `ekk_conn_on_refused`) through the
-functions below; the command `server_exports` writes them. -/
+`ekk_conn_on_sent`, `ekk_conn_on_fail`, `ekk_conn_on_refused`,
+`ekk_conn_on_answer`) through the functions below; the command `server_exports` writes them. -/
 
 namespace Server.Transport
 
@@ -30,6 +30,9 @@ def onFail (adapter : Adapter) (s : Conn.State) : Conn.State × Conn.Action :=
 def onRefused (adapter : Adapter) (s : Conn.State) : Conn.State × Conn.Action :=
   Conn.step (adapter 0) s .refused
 
+def onAnswer (adapter : Adapter) (now : UInt64) (s : Conn.State) (r : Query.Result) : Conn.State × Conn.Action :=
+  Conn.step (adapter now.toNat) s (.answered r)
+
 set_option hygiene false in
 /-- Writes the loop's entry points for `adapter` in the executable that uses
 it: `server_exports (Server.H1Adapter.handle App.Hello.app)`. Unhygienic, so
@@ -44,7 +47,9 @@ macro "server_exports " adapter:term : command => `(
   @[export ekk_conn_on_fail] def onFail (s : Server.Conn.State) : Server.Conn.State × Server.Conn.Action :=
     Server.Transport.onFail $adapter s
   @[export ekk_conn_on_refused] def onRefused (s : Server.Conn.State) : Server.Conn.State × Server.Conn.Action :=
-    Server.Transport.onRefused $adapter s)
+    Server.Transport.onRefused $adapter s
+  @[export ekk_conn_on_answer] def onAnswer (now : UInt64) (s : Server.Conn.State) (r : Server.Query.Result) :
+      Server.Conn.State × Server.Conn.Action := Server.Transport.onAnswer $adapter now s r)
 
 /-- The loop's settings, passed to `ekk_serve` (zig/src/serve.zig). -/
 structure Options where
@@ -52,6 +57,13 @@ structure Options where
   /-- Most connections open at once, process-wide; more wait in the kernel's
   listen queue. -/
   maxConns : Nat := 4096
+  /-- The PostgreSQL connection string (libpq's conninfo); it must name a
+  Unix socket directory (`host=/path`) or an address (`hostaddr=`), since
+  resolving a host name would block a loop. -/
+  pg : String := ""
+  /-- Most PostgreSQL connections per loop; without `pg` there are none, and
+  every query is answered with an error. -/
+  pgConns : Nat := 4
   /-- Test settings (`Testing` in zig/src/serve.zig); all zero in normal runs. -/
   chunk : Nat := 0
   failEvery : Nat := 0
@@ -60,14 +72,16 @@ structure Options where
   crashAfterSend : Nat := 0
 
 @[extern "ekk_serve"]
-opaque serve (port : UInt16) (threads : UInt32) (maxConns : UInt32) (chunk : USize) (failEvery : UInt32)
-  (trace : UInt8) (crashAfterRecv : UInt32) (crashAfterSend : UInt32) : UInt8
+opaque serve (port : UInt16) (threads : UInt32) (maxConns : UInt32) (pg : @& String) (pgConns : UInt32)
+  (chunk : USize) (failEvery : UInt32) (trace : UInt8) (crashAfterRecv : UInt32) (crashAfterSend : UInt32) : UInt8
 
 def parseArgs : List String → Options → Except String Options
   | [], o => .ok o
   | flag :: n :: rest, o =>
     let num := n.toNat?
     match flag, num with
+    | "--pg", _ => parseArgs rest { o with pg := n }
+    | "--pg-conns", some k => parseArgs rest { o with pgConns := k }
     | "--max-conns", some k => parseArgs rest { o with maxConns := k }
     | "--chunk", some k => parseArgs rest { o with chunk := k }
     | "--fail-every", some k => parseArgs rest { o with failEvery := k }
@@ -82,9 +96,9 @@ def parseArgs : List String → Options → Except String Options
     | some k => .ok { o with threads := k }
     | none => .error s!"unknown argument: {a}"
 
-/-- `[THREADS] [--max-conns N] [--chunk N] [--fail-every N] [--trace]
-[--crash-after-recv N] [--crash-after-send N]`; all but the first two are the
-loop's test settings. Serves on 127.0.0.1:8083 until SIGTERM or SIGINT, then
+/-- `[THREADS] [--max-conns N] [--pg CONNINFO] [--pg-conns N] [--chunk N]
+[--fail-every N] [--trace] [--crash-after-recv N] [--crash-after-send N]`;
+the last five are the loop's test settings. Serves on 127.0.0.1:8083 until SIGTERM or SIGINT, then
 shuts down gracefully and returns 0 (README, "Production contract"). -/
 def main (args : List String) : IO UInt32 := do
   match parseArgs args {} with
@@ -95,9 +109,13 @@ def main (args : List String) : IO UInt32 := do
     if o.threads == 0 || o.maxConns == 0 || o.maxConns ≥ 2 ^ 31 then
       IO.eprintln "THREADS and --max-conns must be at least 1"
       return 2
+    if o.pgConns ≥ 2 ^ 16 || o.pg.contains (Char.ofNat 0) then
+      IO.eprintln "--pg-conns must be below 65536 and --pg must hold no NUL"
+      return 2
+    let pgConns := if o.pg.isEmpty then 0 else o.pgConns
     IO.println s!"serving on 127.0.0.1:8083 with {o.threads} loops, at most {o.maxConns} connections"
     (← IO.getStdout).flush
-    return (serve 8083 o.threads.toUInt32 o.maxConns.toUInt32 o.chunk.toUSize o.failEvery.toUInt32
+    return (serve 8083 o.threads.toUInt32 o.maxConns.toUInt32 o.pg pgConns.toUInt32 o.chunk.toUSize o.failEvery.toUInt32
       (if o.trace then 1 else 0) o.crashAfterRecv.toUInt32 o.crashAfterSend.toUInt32).toUInt32
 
 end Server.Transport

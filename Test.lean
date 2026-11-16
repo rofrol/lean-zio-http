@@ -3,6 +3,7 @@ import Server.H1Adapter
 import Server.HandParser
 import App.Hello
 import App.Fixture
+import App.Db
 
 /-! `lsrv-test`: the server's Lean side without sockets. Each adapter (H1, the
 production one, and the hand-written comparator) answers the same requests:
@@ -10,16 +11,19 @@ framing of every proper prefix, limits at their exact boundaries, status
 codes, connection rules, Host and request-target validation (H1 only),
 `Expect: 100-continue`, the checks on what the application answers, and the
 Date header. Connection scenarios drive `Conn.step` through partial receives,
-partial sends, the interim response and the shutdown's `refused`. Exit status
+partial sends, the interim response, the shutdown's `refused` and a handler
+that waits for queries. Exit status
 1 when any check fails. -/
 
 open Server
 
-/-- 0 need more, 1 respond and keep going, 2 respond and close, 3 interim response. -/
+/-- 0 need more, 1 respond and keep going, 2 respond and close, 3 interim
+response, 4 waits for a query. -/
 def resultKind : Reply → UInt8
   | .needMore => 0
   | .continue _ => 3
   | .respond _ _ close => if close then 2 else 1
+  | .await .. => 4
 
 def consumed : Reply → Nat
   | .respond n _ _ => n
@@ -28,7 +32,7 @@ def consumed : Reply → Nat
 def responseOf : Reply → String
   | .respond _ r _ => String.fromUTF8! r
   | .continue r => String.fromUTF8! r
-  | .needMore => ""
+  | .needMore | .await .. => ""
 
 def statusOf (r : Reply) : String := ((responseOf r).splitOn "\r\n").head!
 
@@ -115,17 +119,17 @@ def cases : List Case := [
   { name := "response over maxResponseBytes", request := "GET /too-big HTTP/1.1\r\nHost: a\r\n\r\n", kind := 2,
     status := "HTTP/1.1 500 Internal Server Error", app := App.Fixture.app },
   { name := "response with an owned field", request := "GET / HTTP/1.1\r\nHost: a\r\n\r\n", kind := 2,
-    status := "HTTP/1.1 500 Internal Server Error", app := fun _ => { status := 200, headers := #[("Content-Length", "1")] } },
+    status := "HTTP/1.1 500 Internal Server Error", app := fun _ => .done { status := 200, headers := #[("Content-Length", "1")] } },
   { name := "response field with CRLF", request := "GET / HTTP/1.1\r\nHost: a\r\n\r\n", kind := 2,
-    status := "HTTP/1.1 500 Internal Server Error", app := fun _ => { status := 200, headers := #[("X", "a\r\nY: b")] } },
+    status := "HTTP/1.1 500 Internal Server Error", app := fun _ => .done { status := 200, headers := #[("X", "a\r\nY: b")] } },
   { name := "204 with a body", request := "GET / HTTP/1.1\r\nHost: a\r\n\r\n", kind := 2,
-    status := "HTTP/1.1 500 Internal Server Error", app := fun _ => { status := 204, body := "x".toUTF8 } },
+    status := "HTTP/1.1 500 Internal Server Error", app := fun _ => .done { status := 204, body := "x".toUTF8 } },
   { name := "205 with a body", request := "GET / HTTP/1.1\r\nHost: a\r\n\r\n", kind := 2,
-    status := "HTTP/1.1 500 Internal Server Error", app := fun _ => { status := 205, body := "x".toUTF8 } },
+    status := "HTTP/1.1 500 Internal Server Error", app := fun _ => .done { status := 205, body := "x".toUTF8 } },
   { name := "205", request := "GET / HTTP/1.1\r\nHost: a\r\n\r\n", kind := 1,
-    status := "HTTP/1.1 205 Reset Content", app := fun _ => { status := 205 } },
+    status := "HTTP/1.1 205 Reset Content", app := fun _ => .done { status := 205 } },
   { name := "status 99", request := "GET / HTTP/1.1\r\nHost: a\r\n\r\n", kind := 2,
-    status := "HTTP/1.1 500 Internal Server Error", app := fun _ => { status := 99 } },
+    status := "HTTP/1.1 500 Internal Server Error", app := fun _ => .done { status := 99 } },
   { name := "echo", request := "POST /echo HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n\r\nhello", kind := 1,
     status := "HTTP/1.1 200 OK", app := App.Fixture.app },
   -- Expect: 100-continue (RFC 9110 10.1.1): the interim response only while the body is missing.
@@ -251,6 +255,44 @@ def refusedScenario : Check Unit := do
   let (s, _) := Conn.step h Conn.initial (.received (bytes "GET / HTTP/1.1\r\nHo"))
   expectClose "refused with a partial request" (Conn.step h s .refused).2
 
+def expectQuery (what : String) (a : Conn.Action) (sql : String) (params : Array (Option String)) : Check Unit :=
+  match a with
+  | .query q => if q.sql != sql || q.params != params then fail s!"{what}: asked {repr q.sql} {q.params}" else pure ()
+  | _ => fail s!"{what}: did not ask for a query"
+
+def statusLine (d : ByteArray) : String := ((String.fromUTF8! d).splitOn "\r\n").head!
+
+/-- A handler that waits for queries, through `Conn.step` with H1: `/chain`
+asks for a query, continues with its result to a second one built from it,
+then sends the response; a request pipelined behind it waits in the buffer
+(no receive while querying) and is answered right after. A lost connection
+answers 503; a failure report while querying closes. -/
+def queryScenario : Check Unit := do
+  let h := H1Adapter.handle App.Db.app 0
+  let req := "GET /chain HTTP/1.1\r\nHost: a\r\n\r\n"
+  let next := "GET / HTTP/1.1\r\nHost: a\r\n\r\n"
+  let (s1, a1) := Conn.step h Conn.initial (.received (bytes (req ++ next)))
+  expectQuery "query: the first query" a1 "SELECT 1" #[]
+  if s1.buf != bytes next then fail "query: the request was not consumed, or the pipelined one was"
+  let (s2, a2) := Conn.step h s1 (.answered (.rows #["?column?"] #[#[some "1"]]))
+  expectQuery "query: the second query" a2 "SELECT $1::int + 1" #[some "1"]
+  let (s3, a3) := Conn.step h s2 (.answered (.rows #["?column?"] #[#[some "2"]]))
+  let some (resp, _) ← expectSend "query: the response" a3 | return
+  let text := String.fromUTF8! resp
+  if statusLine resp != "HTTP/1.1 200 OK" || !text.endsWith "\r\n\r\n2" then fail s!"query: answered {repr text}"
+  let (s4, a4) := Conn.step h s3 (.sent resp.size)
+  let some (resp2, _) ← expectSend "query: the pipelined request" a4 | return
+  if statusLine resp2 != "HTTP/1.1 200 OK" then fail "query: the pipelined request was not answered"
+  if s4.buf.size != 0 then fail "query: the pipelined request was not consumed"
+  -- A lost connection: 503, and the connection goes on.
+  let (s5, _) := Conn.step h Conn.initial (.received (bytes "GET /db?id=42 HTTP/1.1\r\nHost: a\r\n\r\n"))
+  let (_, a6) := Conn.step h s5 (.answered (.error "08006" "lost"))
+  let some (resp3, _) ← expectSend "query: a lost connection" a6 | return
+  if statusLine resp3 != "HTTP/1.1 503 Service Unavailable" then fail s!"query: a lost connection answered {statusLine resp3}"
+  expectClose "query: a failure while querying" (Conn.step h s5 .failed).2
+  -- An answer out of place (no query asked) closes.
+  expectClose "query: an answer while reading" (Conn.step h Conn.initial (.answered (.rows #[] #[]))).2
+
 def adapterCases (ad : Adapter) : Check Unit := do
   for c in cases do
     let r := ad.handle c.app 0 (bytes c.request)
@@ -275,6 +317,7 @@ def main : IO UInt32 := do
       limitScenario ad
     continueScenario
     refusedScenario
+    queryScenario
     for (secs, want) in dates do
       let got := String.fromUTF8! (Response.pushDate ByteArray.empty secs)
       if got != want then fail s!"date {secs}: {got}, want {want}" : Check Unit).run 0

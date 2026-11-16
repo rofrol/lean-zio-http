@@ -2,7 +2,8 @@
 // socket. The loop keeps no protocol or buffering state: each connection holds
 // a Lean state (lean/Server/Conn.lean), reports the outcome of every operation
 // to it through glue.c, and performs the action it answers (receive, send,
-// close). Around that the loop owns admission (at most `max_conns`
+// close, or a query, which the loop's PostgreSQL pool in pg.zig runs and whose
+// result it reports back). Around that the loop owns admission (at most `max_conns`
 // connections, the rest wait in the kernel's listen queue), the
 // classification of accept errors, and the graceful shutdown on SIGTERM or
 // SIGINT (README, "Production contract").
@@ -11,12 +12,14 @@ const zio = @import("zio");
 const ev = zio.ev;
 const os = zio.os;
 const net = os.net;
+const pg = @import("pg.zig");
 
 /// Conn.Action as decoded by glue.c.
 const Action = extern struct {
-    kind: u8, // 0 recv, 1 send, 2 close, 3 none
+    kind: u8, // 0 recv, 1 send, 2 close, 3 none, 4 query
     room: usize, // recv: most bytes to receive
     len: usize, // send: bytes glue.c copied into out
+    query: ?*anyopaque, // query: the Server.Query, owned
 };
 
 const State = ?*anyopaque; // a Lean Conn.State, owned by the connection
@@ -26,7 +29,9 @@ extern fn ekk_recv(state: *State, data: [*]const u8, n: usize, out: [*]u8, cap: 
 extern fn ekk_sent(state: *State, n: usize, out: [*]u8, cap: usize, act: *Action) void;
 extern fn ekk_fail(state: *State, out: [*]u8, cap: usize, act: *Action) void;
 extern fn ekk_refused(state: *State, out: [*]u8, cap: usize, act: *Action) void;
+extern fn ekk_answer(state: *State, result: ?*anyopaque, out: [*]u8, cap: usize, act: *Action) void;
 extern fn ekk_free(state: State) void;
+extern fn ekk_string_cstr(s: *anyopaque) [*:0]const u8;
 extern fn ekk_thread_init() void;
 extern fn ekk_thread_fini() void;
 extern fn ekk_stop_signals() c_int;
@@ -123,7 +128,9 @@ fn releaseSlot() void {
 }
 
 const Comp = union { recv: ev.NetRecv, send: ev.NetSend, close: ev.NetClose };
-const OpKind = enum { recv, send, close };
+/// A query has no completion of its own: it is the connection's operation in
+/// flight until the pool delivers its result.
+const OpKind = enum { recv, send, close, query };
 
 /// One submitted operation: its completion, stamped with its number on the
 /// connection. Untraced, every operation of a connection reuses the slot
@@ -163,6 +170,8 @@ const Conn = struct {
     /// Failures injected after a receive or a send completed (`fail_every`).
     injected_recv: u64 = 0,
     injected_send: u64 = 0,
+    /// The connection's place in its loop's PostgreSQL pool.
+    waiter: pg.Waiter = .{ .deliver = answered },
 
     /// Numbers and returns the next operation; ends the process if one is outstanding.
     fn begin(self: *Conn, kind: OpKind) *Op {
@@ -199,6 +208,13 @@ const Conn = struct {
                 self.startSend();
             },
             2 => self.close(),
+            4 => {
+                _ = self.begin(.query);
+                // Printed before the pool sees the query, so a test that has
+                // read it knows the query is queued or running.
+                if (testing.trace) std.debug.print("query {d}\n", .{self.id});
+                self.lp.pool.submit(&self.waiter, act.query);
+            },
             // `none` answers only events after close, and none are reported then (Conn.step_close).
             else => @panic("Lean answered none for a live connection"),
         }
@@ -272,6 +288,20 @@ const Conn = struct {
         self.apply(act);
     }
 
+    /// The pool's result for the query in flight (Conn.step_query: the
+    /// connection waits in `querying` for exactly this event).
+    fn answered(w: *pg.Waiter, result: ?*anyopaque) void {
+        const self: *Conn = @fieldParentPtr("waiter", w);
+        if (self.freed) @panic("a query result after the connection was freed");
+        const op = self.cur orelse @panic("a query result with no operation in flight");
+        if (op.kind != .query or self.started != self.done + 1 or op.id != self.started) @panic("a query result for no outstanding query");
+        self.done += 1;
+        self.cur = null;
+        var act: Action = undefined;
+        ekk_answer(&self.state, result, &self.out, out_cap, &act);
+        self.apply(act);
+    }
+
     fn close(self: *Conn) void {
         const op = self.begin(.close);
         op.comp = .{ .close = ev.NetClose.init(self.fd) };
@@ -311,6 +341,8 @@ const LoopCtx = struct {
     stopping: bool = false,
     stop: ev.Async = undefined,
     head: ?*Conn = null,
+    /// The loop's PostgreSQL connections (pg.zig).
+    pool: pg.Pool = undefined,
 
     fn link(self: *LoopCtx, conn: *Conn) void {
         conn.next = self.head;
@@ -407,15 +439,20 @@ const LoopCtx = struct {
                     self.loop.cancel(&op.comp.recv.c);
                 },
                 .send => sends += 1,
-                .close => {},
+                .close, .query => {},
             };
         }
+        // Queries in flight and waiting still run; idle database connections close.
+        self.pool.stop();
         // The shutdown test checks that a send was in flight when the stop came.
         if (testing.trace) std.debug.print("stop {d} {d}\n", .{ receives, sends });
     }
 };
 
 var loops: []LoopCtx = &.{};
+/// The PostgreSQL connection string and the connections per loop (0: none).
+var pg_conninfo: [*:0]const u8 = "";
+var pg_conns: u32 = 0;
 
 /// Writes a loop's one-byte report; a write that fails would leave the
 /// waiter blocked forever, so it ends the process instead.
@@ -435,6 +472,11 @@ fn runLoop(i: usize, lean_thread: bool, report: std.c.fd_t, done: std.c.fd_t) vo
         return;
     };
     defer lp.loop.deinit();
+    const slots = alloc.alloc(pg.Slot, pg_conns) catch {
+        sendReport(report, 1);
+        return;
+    };
+    lp.pool.init(&lp.loop, pg_conninfo, slots, testing.trace);
     lp.stop = ev.Async.init();
     lp.stop.c.callback = LoopCtx.stopCb;
     lp.stop.c.userdata = lp;
@@ -468,14 +510,18 @@ fn awaitReadyThenStop(ready: std.c.fd_t, threads: u32, stop_fd: c_int) void {
 /// Serves on 127.0.0.1:port with `threads` loops (the calling thread runs the
 /// last one) and at most `maxc` connections; prints "ready" once every loop
 /// has registered its acceptor. On SIGTERM or SIGINT every loop shuts down
-/// gracefully; once all have, it prints "stopped" and returns 0. The rest
-/// are the test settings (`Testing`), all zero in normal runs. Returns 1 on
-/// setup failure.
-export fn ekk_serve(port: u16, threads: u32, maxc: u32, chunk: usize, fail_every: u32, trace: u8, crash_recv: u32, crash_send: u32) callconv(.c) u8 {
+/// gracefully; once all have, it prints "stopped" and returns 0. Each loop
+/// has at most `conns` PostgreSQL connections to `conninfo` (a Lean String,
+/// kept for the process's life). The rest are the test settings (`Testing`),
+/// all zero in normal runs. Returns 1 on setup failure.
+export fn ekk_serve(port: u16, threads: u32, maxc: u32, conninfo: *anyopaque, conns: u32, chunk: usize, fail_every: u32, trace: u8, crash_recv: u32, crash_send: u32) callconv(.c) u8 {
     if (threads == 0 or maxc == 0) return 1;
+    pg_conninfo = ekk_string_cstr(conninfo);
+    pg_conns = conns;
     testing = .{ .chunk = chunk, .fail_every = fail_every, .trace = trace != 0, .crash_after_recv = crash_recv, .crash_after_send = crash_send };
     max_conns = maxc;
-    if (ekk_fd_room(@as(c_ulong, maxc) + fd_reserve + 2 * @as(c_ulong, threads)) != 0) {
+    // Each database connection holds libpq's socket and the loop's duplicate.
+    if (ekk_fd_room(@as(c_ulong, maxc) + fd_reserve + 2 * @as(c_ulong, threads) * (1 + @as(c_ulong, conns))) != 0) {
         std.debug.print("RLIMIT_NOFILE cannot hold --max-conns {d} connections\n", .{maxc});
         return 1;
     }

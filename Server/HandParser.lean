@@ -185,7 +185,6 @@ def handle (app : Handler) (now : Nat) (buf : ByteArray) : Reply :=
   | .needMore => .needMore
   | .bad status => .respond buf.size (Server.Response.error now status) true
   | .ok h =>
-    let (bytes, close) := Server.Response.answer now app (toRequest buf h) h.close
-    .respond (h.bodyStart + h.contentLength) bytes close
+    Server.Response.reply (h.bodyStart + h.contentLength) (Server.Response.answer now app (toRequest buf h) h.close)
 
 end Server.HandParser
