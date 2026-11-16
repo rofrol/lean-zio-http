@@ -1,0 +1,6 @@
+Measure the server's worst-case memory per connection, with full input and output at once
+
+Moved on 2026-11-16 from ekklesiai.org's queue, where it was item im36bz (moved by its item m4jfmv). Item ids and decisions (D1, D2) named below are ekklesiai.org's; paths are this repository's.
+Seen in queue item 55ewev (review round 20261116-065425-266b, sol): `bench/boundary`'s memory scenario holds 1,000 connections, each with an 8,000-byte head waiting after `100 Continue`, and measured 42.4 KiB of resident-set growth per connection against the stated bound of about 98 KiB (README.md, "Memory"). It never fills a connection's input buffer (`inCap` = 16,388 B) and its output (up to 65,536 B) at once, so it does not establish the worst case. Also, `Conn.step_inv` bounds the lengths of the Lean byte arrays, not their capacities; an array grown by appending can hold up to about twice its length.
+
+Proposed: a scenario where each connection pipelines a large response request plus a near-`inCap` buffered tail while the client does not read and its receive window is closed (small SO_RCVBUF, and the server's send buffer filled), measuring RSS growth; and either bound capacities (allocate `buf` and `out` at fixed capacity and keep them unshared) or state the bound as twice the lengths.
