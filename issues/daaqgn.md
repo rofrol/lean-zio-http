@@ -1,0 +1,6 @@
+Keep the H1 parser's state across receives instead of reparsing the whole buffer
+
+Moved on 2026-11-16 from ekklesiai.org's queue, where it was item jssz3w (moved by its item m4jfmv). Item ids and decisions (D1, D2) named below are ekklesiai.org's; paths are this repository's.
+Seen in queue item 55ewev: `Server.H1Adapter.parse` (Server/H1Adapter.lean) builds a fresh `H1.Machine` over the whole connection buffer on every receive, so a request split into many receives costs CPU quadratic in its size. `lsrv-bench`'s fragmentation table (README.md, "Fragmented requests", M1 2026-11-16): the largest request (16,388 B) in 1-byte receives costs 4,233 ms with H1 and 1,405 ms with the hand-written parser; in 1,460-byte receives 3.5 ms. Memory stays bounded by `inCap` for any split, so D1 does not block H1's adoption, but a few such peers take most of a loop's CPU.
+
+Options: (a) keep the `H1.Machine` in `Conn.State` between receives (changes the `Server.Wire` adapter interface from `ByteArray → Reply` to a stateful one, and Conn's theorems); (b) accept it until deadlines (separate proposal) bound how long a peer may trickle a request, which caps the CPU per connection; (c) a minimum receive size or rate per connection. Needs the owner's choice; D1 forbids a local workaround of the parser.
