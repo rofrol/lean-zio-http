@@ -12,6 +12,7 @@ byurlg Measure the server's worst-case memory per connection, with full input an
 lpgru3 Controlled-interleaving tests for the zio contracts the graceful shutdown relies on
 i2rh6f Behavior of the PostgreSQL pool while the database is down
 6gmafg Deterministic tests for the PostgreSQL pool's callback orderings and query chains
+yvladm Decide whether per-loop PostgreSQL pools should share connections across loops
 
 ## Needs a decision
 
