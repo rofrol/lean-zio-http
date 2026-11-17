@@ -16,8 +16,6 @@ u4moqo Move the toolchain to the first nightly with lean4 PR 16417 (Std.Http RFC
 
 ## Proposed
 
-pt5vje Should a complete pipelined head held in the kernel survive the end of its head budget during a slow write?
-
 ## Needs a decision
 
 53rwgc Linux acceptance runs for the Lean HTTP server
