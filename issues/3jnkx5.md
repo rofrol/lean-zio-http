@@ -7,3 +7,5 @@ Seen in aazqxm: `zig/src/pg.zig` has no deadline on a query or a connect (README
 Question: Should PostgreSQL deadlines be per query from the handler or server-wide, and does a deadline cancel the query (PQcancel) or dispose of the session, and what does shutdown do with queries in flight?
 Options: specify completion and shutdown semantics first, then a server-wide deadline with PQcancel | per-query deadline from the handler | dispose of the session on a deadline
 Checked 2026-11-16 with sol (consult round 20261116-145342-a8e2): this choice changes a contract, failure behavior or architecture, so it stays with the user; recommendation first.
+
+Checked 2026-11-17 with sol (consult round 20261117-011832-74e7) under the user's delegation: stays with the user: needs handler completion and connect budgets, whether a cancel is acknowledged (and whether PQcancel itself can block), the transaction or session disposition and shutdown semantics; no value is justified yet.
