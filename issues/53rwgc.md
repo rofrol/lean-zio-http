@@ -25,3 +25,5 @@ Decided by the user 2026-11-17: option 2, run on vps.frolow.dev. This is the use
 - Report every figure as measured with the generator on the same 2 vCPUs: a lower bound and a diagnostic, not a clean D2 acceptance. The README says so next to the numbers.
 
 Added 2026-11-17 by the coordinating session with sol (consult call 88b30b66): before the performance runs, run the corrected epoll suite (`zig build test` in zig/, after mzqamr and emb2ob) on the VPS itself and record the result: production conclusions need it. Measure the server on epoll, as mzqamr pins it. Any io_uring figure is an experimental diagnostic only, since its behaviour differs, and it never counts toward acceptance.
+
+2026-11-17: wi7efy (the user's request) now runs before this item. If it lands with the transport suite passing under io_uring, run that suite on the VPS under both backends as well, and count the io_uring figures as a full contender in the epoll-against-io_uring comparison. The 'experimental only' rule above holds only while io_uring is unsupported.
