@@ -7,3 +7,5 @@ Seen in aazqxm: `ekk_pg` (zig/src/pg.c) keeps up to 64 prepared statements per c
 Question: On 0A000/26000, should the pool forget the cached statement and fail the current query without resending it, or close the session?
 Options: forget the entry and fail the current query without replay | close the session
 Checked 2026-11-16 with sol (consult round 20261116-145342-a8e2): this choice changes a contract, failure behavior or architecture, so it stays with the user; recommendation first.
+
+Decided 2026-11-17 by the coordinating session with sol (consult round 20261117-011832-74e7), under the user's delegation of the same day to decide the open questions with sol: invalidate the affected cached statement and fail the current query without replay. Recognize the cached-plan failure specifically (not every 0A000), make sure a later prepare cannot collide with a statement still on the server, and test DDL, 26000 and transactions.
