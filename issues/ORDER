@@ -1,6 +1,5 @@
 ## Next, in order
 
-ytzycm Per-connection idle, read and write deadlines for the Lean HTTP server
 j3avm2 Set TCP_NODELAY on the listening socket, not on each accepted one (zio issue 926)
 ycpzlt Should Server.Query carry a structured "outcome unknown" signal for a query the server abandoned?
 3jnkx5 Deadlines for PostgreSQL queries, connection attempts and shutdown in the Lean server
@@ -13,6 +12,10 @@ grjqox Move dusty-hello's zio pin to the server's (830564437b2c)
 u4moqo Move the toolchain to the first nightly with lean4 PR 16417 (Std.Http RFC fixes)
 
 ## Proposed
+
+dv6ikn Decide when a pipelined request's head budget starts
+5lkloz Test a connection whose close completes before a retired timer's callback
+znioju Test a write deadline expiring during a partial send, in both orders
 
 ## Needs a decision
 
