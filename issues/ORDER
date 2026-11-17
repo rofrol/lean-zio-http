@@ -9,11 +9,11 @@ faahn4 Decide how to settle zio's undocumented setTimer from a timer's own callb
 
 ## Proposed
 
+6p6tu6 Find why pipelined requests cost the Lean server about 32 µs of CPU each and leave responses waiting over 5 s
 q2g4am Act on leanprover/lean4's answers to the Std.Http questions 16522 and 16523
 5f54l4 Should H1Adapter decode chunked request bodies, so HttpArena's baseline and limited-conn run with their whole request mix?
 2ltibq Run a clean D2 acceptance of the Lean HTTP server with the load generator on cores of its own
 frj4id Should the handler contract get a timer, so HttpArena's async profile (and memory under 32K pending requests) can be measured?
-6p6tu6 Find why pipelined requests cost the Lean server about 32 µs of CPU each and leave responses waiting over 5 s
 
 ## Needs a decision
 
