@@ -29,7 +29,7 @@ lacks. An executable that runs the transport also links
 libpq: give it `moreLinkArgs := #["-lpq"]` and put `pg_config --libdir` on
 `LIBRARY_PATH`. Its composition root imports `Server.Transport`, one adapter
 (`Server.H1Adapter`) and the application, and declares
-`server_exports (Server.H1Adapter.handle own app)`, where `own`
+`server_exports (Server.H1Adapter.adapter own app)`, where `own`
 (`Server.Response.OwnFields`, `{}` for none) holds header fields for the
 responses the server writes itself; see `Main.lean` and `Fixture.lean`. Pin the same
 Lean toolchain as `lean-toolchain` here.
@@ -46,7 +46,7 @@ imports it must report.
 | module | role | may import |
 |---|---|---|
 | `Server.Query` | a database query and its result as values, and `Await`, a computation that may wait for queries | nothing |
-| `Server.Wire` | the limits and `Server.Reply`, the adapter's answer to the bytes buffered on a connection | `Server.Query` |
+| `Server.Wire` | the limits, `Server.Reply` (the adapter's answer to the bytes buffered on a connection) and `Server.Adapter`, the adapter's state kept between receives and the law `Adapter.Incremental` it keeps | `Server.Query` |
 | `Server.Handler` | the interface the application implements: `Request → Await Response` | `Server.Query` |
 | `Server.Conn` | a connection's lifecycle: one state type and a pure `step` over the loop's events, with theorems | `Server.Wire` |
 | `Server.Transport` | the loop's Lean side: `ekk_serve`, the command line, the `server_exports` command that exports the loop's entry points | `Server.Wire`, `Server.Conn` |
@@ -336,6 +336,17 @@ Transient allocations during one
 parse are not in this bound; each loop runs one parse at a time, so they are
 bounded per loop, not per connection.
 
+The adapter's state (`Conn.State.parser`) is retained too, but only while a
+request is incomplete: `Conn` keeps it while reading and while sending the
+25-byte interim response, and resets it to `init` once a request is
+consumed, so it never coexists with a response. `Conn` is generic over the
+adapter and does not bound that state; for H1 it is the machine with the
+head parsed so far (at most `maxHeaders` fields within `maxHeadBytes`) and
+its unread input, and the body pulled so far, each holding bytes of the
+buffer. Neither a theorem nor a worst-case measurement bounds it: the
+98 KiB above leaves it about 64 KiB, and one measurement below, a held
+8,000-byte head, puts it near 10 KiB.
+
 The buffer and a full response are not both at their maximum at once: a
 connection receives only while it is not sending, and the loop receives at
 most 8,192 bytes at a time (`recv_cap`, `zig/src/serve.zig`), so while a
@@ -346,7 +357,9 @@ above either state. `bench/boundary` measures both as resident set growth
 on the M1 (2026-11-16):
 
 - 1,000 connections each holding an 8,000-byte head while it waits for
-  its body after `100 Continue`: 42.4 KiB per connection;
+  its body after `100 Continue`: 52.0 KiB per connection (2026-11-17; 42.4
+  KiB before the adapter kept its state, so about 9.6 KiB is H1's retained
+  state for such a head);
 - connections whose client writes 8,192 bytes at once (100 pipelined GETs
   of the fixture's largest response, 60,121 bytes, then an unfinished
   request) and never reads: 90.6 to 90.9 KiB per added connection in
@@ -405,32 +418,40 @@ longer. Whether the bound should count capacities is issue es53kx.
 
 ## Fragmented requests (decision D1)
 
-Every receive makes the adapter parse the whole buffer again, so a request
-split into many receives costs time quadratic in its size, for both parsers.
-`lsrv-bench` feeds requests to `Conn.step` in receives of k bytes (M1,
-2026-11-16; CPU time per request):
+The adapter keeps its parse state between receives (`Server.Adapter`), so
+H1 feeds its machine only the bytes that arrived since the last receive.
+For an adapter that keeps the law `Adapter.Incremental`, `Conn.step_fed`
+proves that the adapter answers every buffer as from its initial state,
+whatever the events in between (an interim `100 Continue`, pipelined
+requests), and `Conn.fragments` that receives each answered with another
+receive end as their concatenation received at once;
+H1's functions are `partial`, so `lsrv-test` checks that law for both
+adapters (pieces of 1, 2, 3, 7 and 64 bytes, each waiting prefix asked
+again as after `100 Continue`, every two-piece split of the smaller
+requests, and the corpus). The hand-written parser keeps no state
+and parses the whole buffer again on every receive. `lsrv-bench` feeds
+requests to `Conn.step` in receives of k bytes (M1, 2026-11-17; CPU time
+per request):
 
 | request | bytes | k | receives | hand-written ms | H1 ms |
 |---|---:|---:|---:|---:|---:|
-| browser GET, 16 headers | 789 | 1 | 789 | 1.2 | 13.4 |
-| browser GET, 16 headers | 789 | 1,460 | 1 | 0.0 | 0.1 |
-| largest head | 8,196 | 1 | 8,196 | 145 | 234 |
-| largest head | 8,196 | 7 | 1,171 | 34 | 62 |
-| largest head | 8,196 | 64 | 129 | 3.8 | 7.1 |
-| largest request | 16,388 | 1 | 16,388 | 1,405 | 4,233 |
-| largest request | 16,388 | 7 | 2,342 | 192 | 598 |
-| largest request | 16,388 | 64 | 257 | 12 | 62 |
-| largest request | 16,388 | 1,460 | 12 | 1.0 | 3.5 |
+| browser GET, 16 headers | 789 | 1 | 789 | 1.2 | 0.5 |
+| browser GET, 16 headers | 789 | 1,460 | 1 | 0.0 | 0.0 |
+| largest head | 8,196 | 1 | 8,196 | 116 | 182 |
+| largest head | 8,196 | 7 | 1,171 | 17 | 27 |
+| largest head | 8,196 | 64 | 129 | 2.0 | 3.2 |
+| largest request | 16,388 | 1 | 16,388 | 758 | 195 |
+| largest request | 16,388 | 7 | 2,342 | 109 | 28 |
+| largest request | 16,388 | 64 | 257 | 12 | 3.3 |
+| largest request | 16,388 | 1,460 | 12 | 0.6 | 0.4 |
 
-The memory bounds above hold for any split, since the buffer never exceeds
-`inCap`; by D1's condition they do not block H1's adoption. The CPU does not
-have such a bound: a peer that sends the largest request one byte per
-segment costs a loop about 4.2 s of CPU in all with H1 (1.4 s with the
-hand-written parser). It is spread over the receives, each of which parses
-at most 16,388 bytes, so the loop serves its other connections in between;
-but a few such peers take most of a loop's CPU. Not worked around here
-(D1: no local workaround of the parser); keeping the parser's state across
-receives changes the adapter's interface and is a separate decision.
+What remains quadratic with H1 is a single long line: the toolchain's H1
+parses a line that has not ended again from its start on every call
+(`parseWith` leaves its input where it was when the line is incomplete), so
+the largest head, almost all of it one header line, still costs 182 ms of CPU in
+one-byte receives, bounded by `maxHeadBytes`. Not worked around here (D1: no
+local workaround of the parser). The memory bounds above hold for any
+split, since the buffer never exceeds `inCap`.
 
 ## Running
 

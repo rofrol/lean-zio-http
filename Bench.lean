@@ -16,8 +16,10 @@ the application (`App.Hello`) and the response bytes (`Server.Response`).
 
 The second table is the fragmentation measurement decision D1 requires: a
 request delivered in receives of `k` bytes, each fed to `Conn.step` as the
-loop does, so that the adapter parses the whole buffer again after every
-receive. It reports the CPU time and allocations for the whole request. The
+loop does. The hand-written parser parses the whole buffer again after every
+receive; H1 keeps its machine between receives and parses again only the line
+it is in the middle of (`Server.H1Adapter`). It reports the CPU time and
+allocations for the whole request. The
 transport's memory per connection does not depend on `k` (README, "Memory"):
 the buffer is bounded by `inCap` whatever the split; what the split costs is
 CPU and transient allocation, which this table measures.
@@ -77,11 +79,11 @@ def h1Parse (b : ByteArray) : Nat :=
 
 /-- Feeds `b` to a new connection in receives of `k` bytes; returns the size
 of the response it sends, 0 if it sends none or closes. -/
-def fragmented (handle : ByteArray → Reply) (k : Nat) (b : ByteArray) : Nat := Id.run do
-  let mut s := Conn.initial
+def fragmented {σ : Type} (ad : Adapter σ) (k : Nat) (b : ByteArray) : Nat := Id.run do
+  let mut s := Conn.initial ad
   let mut off := 0
   while off < b.size do
-    let (s', a) := Conn.step handle s (.received (b.extract off (min b.size (off + k))))
+    let (s', a) := Conn.step ad s (.received (b.extract off (min b.size (off + k))))
     off := off + k
     match a with
     | .recv _ => s := s'
@@ -95,9 +97,12 @@ def fragmentCorpus : List (String × String) :=
 
 def main : IO UInt32 := do
   let mut failures := 0
-  let adapters : List (String × (ByteArray → Nat) × (ByteArray → Reply)) :=
-    [("hand-written", handParse, HandParser.handle {} App.Hello.app 0),
-     ("H1", h1Parse, H1Adapter.handle {} App.Hello.app 0)]
+  let hand := HandParser.adapter {} App.Hello.app 0
+  let h1 := H1Adapter.adapter {} App.Hello.app 0
+  -- Each parser in one call, and a request fed through `Conn.step` in receives of `k` bytes.
+  let adapters : List (String × (ByteArray → Nat) × (ByteArray → Reply) × (Nat → ByteArray → Nat)) :=
+    [("hand-written", handParse, (fun b => (hand.handle hand.init b).2), (fragmented hand)),
+     ("H1", h1Parse, (fun b => (h1.handle h1.init b).2), (fragmented h1))]
   IO.println "request | bytes | parser | parse ns | parse allocs | handle ns | handle allocs"
   for (name, req) in Corpus.requests do
     let b := req.toUTF8
@@ -106,7 +111,7 @@ def main : IO UInt32 := do
     if handParse b != h1Parse b then
       IO.println s!"FAIL {name}: hand-written consumes {handParse b}, H1 {h1Parse b}"
       failures := failures + 1
-    for (pname, p, hdl) in adapters do
+    for (pname, p, hdl, _) in adapters do
       let (pt, pa) ← timeIt p input iters
       let (ht, ha) ← timeIt (fun b => consumedOf (hdl b)) input iters
       IO.println s!"{name} | {b.size} | {pname} | {fmt pt} | {fmt pa} | {fmt ht} | {fmt ha}"
@@ -116,14 +121,14 @@ def main : IO UInt32 := do
     let b := req.toUTF8
     let input ← IO.mkRef b
     for k in [1, 7, 64, 1460] do
-      -- About 2 * 10^8 bytes parsed per run: the adapter reparses the buffer after each receive.
+      -- About 2 * 10^8 bytes parsed per run by a parser that reparses the buffer after each receive.
       let receives := (b.size + k - 1) / k
       let iters := max 1 (200000000 / (receives * b.size / 2 + 1))
-      for (pname, _, hdl) in adapters do
-        if fragmented hdl k b == 0 then
+      for (pname, _, _, frag) in adapters do
+        if frag k b == 0 then
           IO.println s!"FAIL {name} in receives of {k} B through {pname}: no response"
           failures := failures + 1
-        let (t, a) ← timeIt (fragmented hdl k) input iters
+        let (t, a) ← timeIt (frag k) input iters
         IO.println s!"{name} | {b.size} | {k} | {pname} | {receives} | {fmt (t / 1000000)} | {fmt a}"
   IO.println s!"{failures} failures"
   return if failures == 0 then 0 else 1

@@ -4,13 +4,16 @@ import Server.HandParser
 import App.Hello
 import App.Fixture
 import App.Db
+import Corpus
 
 /-! `lsrv-test`: the server's Lean side without sockets. Each adapter (H1, the
 production one, and the hand-written comparator) answers the same requests:
 framing of every proper prefix, limits at their exact boundaries, status
 codes, connection rules, Host and request-target validation (H1 only),
-`Expect: 100-continue`, the checks on what the application answers, and the
-Date header. Connection scenarios drive `Conn.step` through partial receives,
+`Expect: 100-continue`, the checks on what the application answers, the
+Date header, and the adapter's law (`Adapter.Incremental`): a request fed in
+fragments, with the state kept between them, answers as in one call.
+Connection scenarios drive `Conn.step` through partial receives,
 partial sends, the interim response, the shutdown's `refused` and a handler
 that waits for queries. Exit status
 1 when any check fails. -/
@@ -58,10 +61,16 @@ def splitHead : String :=
 /-- An adapter under test, with `App.Hello` unless a case names another application. -/
 structure Adapter where
   name : String
-  handle : Response.OwnFields → Handler → Nat → ByteArray → Reply
+  σ : Type
+  make : Response.OwnFields → Handler → Nat → Server.Adapter σ
 
-def h1 : Adapter := { name := "H1", handle := H1Adapter.handle }
-def hand : Adapter := { name := "hand-written", handle := HandParser.handle }
+/-- The adapter's answer to `buf` in one call, from its initial state. -/
+def Adapter.handle (ad : Adapter) (own : Response.OwnFields) (app : Handler) (now : Nat) (buf : ByteArray) : Reply :=
+  let a := ad.make own app now
+  (a.handle a.init buf).2
+
+def h1 : Adapter := { name := "H1", σ := H1Adapter.Parser, make := H1Adapter.adapter }
+def hand : Adapter := { name := "hand-written", σ := Unit, make := HandParser.adapter }
 
 structure Case where
   name : String
@@ -183,10 +192,10 @@ def expectClose (what : String) (a : Conn.Action) : Check Unit :=
 partial send, the rest of the send, the peer closing, and an event after
 close. -/
 def connScenario (ad : Adapter) : Check Unit := do
-  let h := ad.handle {} App.Hello.app 0
+  let h := ad.make {} App.Hello.app 0
   let w := s!"conn {ad.name}"
   let part1 := bytes "GET / HTTP/1.1\r\nHo"
-  let (s1, a1) := Conn.step h Conn.initial (.received part1)
+  let (s1, a1) := Conn.step h (Conn.initial h) (.received part1)
   expectRecv w a1 (inCap - part1.size)
   let (s2, a2) := Conn.step h s1 (.received (bytes "st: a\r\n\r\n"))
   let some (resp, off) ← expectSend s!"{w}: a complete request" a2 | return
@@ -203,15 +212,15 @@ def connScenario (ad : Adapter) : Check Unit := do
   match (Conn.step h s5 (.sent 1)).2 with
   | .none => pure ()
   | _ => fail s!"{w}: an event after close was acted on"
-  expectClose s!"{w}: a send report while reading" (Conn.step h Conn.initial (.sent 1)).2
+  expectClose s!"{w}: a send report while reading" (Conn.step h (Conn.initial h) (.sent 1)).2
 
 /-- `Expect: 100-continue` through `Conn.step` with H1: the interim response is
 sent once, also across a partial send and a body arriving in two parts, and
 the final response follows the body. -/
 def continueScenario : Check Unit := do
-  let h := H1Adapter.handle {} App.Fixture.app 0
+  let h := H1Adapter.adapter {} App.Fixture.app 0
   let head := bytes "POST /echo HTTP/1.1\r\nHost: a\r\nExpect: 100-continue\r\nContent-Length: 5\r\n\r\n"
-  let (s1, a1) := Conn.step h Conn.initial (.received head)
+  let (s1, a1) := Conn.step h (Conn.initial h) (.received head)
   let some (interim, _) ← expectSend "100-continue: the head" a1 | return
   if interim != Response.continueBytes then fail "100-continue: the first send is not the interim response"
   let (s2, a2) := Conn.step h s1 (.sent 5)
@@ -232,9 +241,9 @@ def continueScenario : Check Unit := do
 head over `maxHeadBytes` followed by the largest body, in receives of 1460
 bytes, is answered with 431 before the buffer fills, not closed silently. -/
 def limitScenario (ad : Adapter) : Check Unit := do
-  let h := ad.handle {} App.Hello.app 0
+  let h := ad.make {} App.Hello.app 0
   let b := bytes (splitHead ++ big maxBodyBytes)
-  let mut s := Conn.initial
+  let mut s := (Conn.initial h)
   let mut off := 0
   while off < b.size do
     let (s', a) := Conn.step h s (.received (b.extract off (min b.size (off + 1460))))
@@ -250,9 +259,9 @@ def limitScenario (ad : Adapter) : Check Unit := do
 
 /-- The shutdown: a declined receive closes the connection in every live phase. -/
 def refusedScenario : Check Unit := do
-  let h := H1Adapter.handle {} App.Hello.app 0
-  expectClose "refused while reading" (Conn.step h Conn.initial .refused).2
-  let (s, _) := Conn.step h Conn.initial (.received (bytes "GET / HTTP/1.1\r\nHo"))
+  let h := H1Adapter.adapter {} App.Hello.app 0
+  expectClose "refused while reading" (Conn.step h (Conn.initial h) .refused).2
+  let (s, _) := Conn.step h (Conn.initial h) (.received (bytes "GET / HTTP/1.1\r\nHo"))
   expectClose "refused with a partial request" (Conn.step h s .refused).2
 
 def expectQuery (what : String) (a : Conn.Action) (sql : String) (params : Array (Option String)) : Check Unit :=
@@ -268,10 +277,10 @@ then sends the response; a request pipelined behind it waits in the buffer
 (no receive while querying) and is answered right after. A lost connection
 answers 503; a failure report while querying closes. -/
 def queryScenario : Check Unit := do
-  let h := H1Adapter.handle {} App.Db.app 0
+  let h := H1Adapter.adapter {} App.Db.app 0
   let req := "GET /chain HTTP/1.1\r\nHost: a\r\n\r\n"
   let next := "GET / HTTP/1.1\r\nHost: a\r\n\r\n"
-  let (s1, a1) := Conn.step h Conn.initial (.received (bytes (req ++ next)))
+  let (s1, a1) := Conn.step h (Conn.initial h) (.received (bytes (req ++ next)))
   expectQuery "query: the first query" a1 "SELECT 1" #[]
   if s1.buf != bytes next then fail "query: the request was not consumed, or the pipelined one was"
   let (s2, a2) := Conn.step h s1 (.answered (.rows #["?column?"] #[#[some "1"]]))
@@ -285,13 +294,74 @@ def queryScenario : Check Unit := do
   if statusLine resp2 != "HTTP/1.1 200 OK" then fail "query: the pipelined request was not answered"
   if s4.buf.size != 0 then fail "query: the pipelined request was not consumed"
   -- A lost connection: 503, and the connection goes on.
-  let (s5, _) := Conn.step h Conn.initial (.received (bytes "GET /db?id=42 HTTP/1.1\r\nHost: a\r\n\r\n"))
+  let (s5, _) := Conn.step h (Conn.initial h) (.received (bytes "GET /db?id=42 HTTP/1.1\r\nHost: a\r\n\r\n"))
   let (_, a6) := Conn.step h s5 (.answered (.error "08006" "lost"))
   let some (resp3, _) ← expectSend "query: a lost connection" a6 | return
   if statusLine resp3 != "HTTP/1.1 503 Service Unavailable" then fail s!"query: a lost connection answered {statusLine resp3}"
   expectClose "query: a failure while querying" (Conn.step h s5 .failed).2
   -- An answer out of place (no query asked) closes.
-  expectClose "query: an answer while reading" (Conn.step h Conn.initial (.answered (.rows #[] #[]))).2
+  expectClose "query: an answer while reading" (Conn.step h (Conn.initial h) (.answered (.rows #[] #[]))).2
+
+/-- Two continuations' first steps alike: the same response, or the same query. -/
+def sameStep : Await (ByteArray × Bool) → Await (ByteArray × Bool) → Bool
+  | .done (a, c), .done (b, d) => a == b && c == d
+  | .query q _, .query r _ => q.sql == r.sql && q.params == r.params
+  | _, _ => false
+
+/-- Two answers alike: the same kind, bytes consumed and response bytes; a
+query's continuation is a function, compared by the query it asks and by its
+first step on a row, on no rows and on an error. -/
+def sameReply : Reply → Reply → Bool
+  | .needMore, .needMore => true
+  | .continue a, .continue b => a == b
+  | .respond n a c, .respond m b d => n == m && a == b && c == d
+  | .await n q k, .await m r l =>
+    n == m && q.sql == r.sql && q.params == r.params &&
+      [Query.Result.rows #["id", "randomnumber"] #[#[some "42", some "7"]], .rows #[] #[], .error "08006" "lost"].all
+        fun res => sameStep (k res) (l res)
+  | _, _ => false
+
+/-- The adapter's law (`Adapter.Incremental`): `b` fed in pieces of `k` bytes,
+each call with the state the previous one kept while its answer waited (as
+`Conn` does), answers every prefix as one call from the initial state does. -/
+def lawFor (ad : Adapter) (app : Handler) (what : String) (b : ByteArray) (k : Nat) : Check Unit := do
+  let a := ad.make {} app 0
+  let mut p := a.init
+  let mut e := 0
+  while e < b.size do
+    e := min b.size (e + k)
+    let buf := b.extract 0 e
+    let (p', r) := a.handle p buf
+    let whole := (a.handle a.init buf).2
+    if !sameReply r whole then
+      fail s!"{ad.name} law, {what} in pieces of {k} B: at {e} bytes kind {resultKind r} status {statusOf r}, in one call kind {resultKind whole} status {statusOf whole}"
+      return
+    if !r.waits then return
+    -- `Fed` also allows an empty extension: `Conn` asks again about the same
+    -- buffer once the interim response is sent.
+    let (p'', r') := a.handle p' buf
+    if !sameReply r' whole then
+      fail s!"{ad.name} law, {what} in pieces of {k} B: asked again at {e} bytes kind {resultKind r'} status {statusOf r'}, in one call kind {resultKind whole} status {statusOf whole}"
+      return
+    p := p''
+
+def lawCases (ad : Adapter) : Check Unit := do
+  for c in cases do
+    let b := bytes c.request
+    for k in [1, 2, 3, 7, 64] do lawFor ad c.app c.name b k
+    -- Every split in two (the second call extends the first's buffer).
+    for i in [1:b.size] do
+      if b.size ≤ 600 then
+        let a := ad.make {} c.app 0
+        let (p, r) := a.handle a.init (b.extract 0 i)
+        if r.waits then
+          let r2 := (a.handle p b).2
+          if !sameReply r2 (a.handle a.init b).2 then
+            fail s!"{ad.name} law, {c.name} split at {i}: kind {resultKind r2} status {statusOf r2}"
+  for (name, req) in Corpus.requests do
+    let b := bytes req
+    for k in (if b.size ≤ 2000 then [1, 7, 64, 1460] else [64, 1460, 4096]) do
+      lawFor ad App.Hello.app name b k
 
 def adapterCases (ad : Adapter) : Check Unit := do
   for c in cases do
@@ -399,6 +469,7 @@ def main : IO UInt32 := do
       ownFieldCases ad
       connScenario ad
       limitScenario ad
+      lawCases ad
     continueScenario
     refusedScenario
     queryScenario

@@ -9,13 +9,18 @@ machine `Std.Http.Protocol.H1` turns the bytes buffered on a connection into a
 `Server.Reply`. Only this module imports `Std.Http`; the application sees
 `Server.Request` and `Server.Response` alone.
 
-Each call runs a fresh `Machine .receiving` over the whole buffer, from the
-request boundary at its start: `feed`, then `processRead` (start line and
-header block), then `pullBody` until the body is complete (a server-side
-machine leaves the body to the caller, H1.lean:1861). The machine's own writer
-is not used: `Server.Response` writes the bytes. Rebuilding the machine on
-every receive repeats the parse of everything buffered; `lsrv-bench`'s
-fragmentation table measures what that costs (README).
+The machine lives on the connection while a request is incomplete
+(`Parser`, the adapter's state in `Server.Adapter`): each call `feed`s only the
+bytes received since the last one, then runs `processRead` (start line and
+header block) and `pullBody` until the body is complete (a server-side machine
+leaves the body to the caller, H1.lean:1861). So a request arriving in many
+receives is parsed once, not again from its start on every receive; what H1
+itself parses again is the line it is in the middle of (`parseWith` leaves
+its input where it was on a line that has not ended, H1.lean:646), so the
+cost of a request in 1-byte receives still grows with the square of its
+longest line. Each request starts from a fresh machine (`Parser.init`). The
+machine's own writer is not used: `Server.Response` writes the bytes.
+`lsrv-bench`'s fragmentation table measures what a split costs (README).
 
 What H1 checks and this adapter relies on: request-line syntax, a registered
 method (else 501), HTTP/1.0 or 1.1 (1.x above 1 read as 1.1, else 505), the
@@ -69,6 +74,17 @@ inductive Parsed where
   body), and whether the connection closes after the response. -/
   | ok (head : Request.Head) (body : ByteArray) (consumed : Nat) (close : Bool)
 
+/-- What the adapter keeps on a connection while a request is incomplete:
+the H1 machine, the bytes of the connection's buffer already fed to it, the
+body pulled so far, and whether the `100-continue` the head asked for was
+granted. Its input holds the buffer's unread suffix, so `buf.size -
+remainingBytes` is what the machine has consumed of the buffer. -/
+structure Parser where
+  machine : H1.Machine .receiving := { config }
+  fed : Nat := 0
+  body : ByteArray := .empty
+  continued : Bool := false
+
 /-- Pulls body chunks until the body is complete or the input runs out. -/
 partial def drainBody (m : H1.Machine .receiving) (body : ByteArray) : H1.Machine .receiving × ByteArray :=
   match m.reader.state with
@@ -89,28 +105,46 @@ def readingHead : H1.Reader.State .receiving → Bool
   | .needStartLine | .needHeader _ => true
   | _ => false
 
-/-- Parses the request at the start of `buf`.
+/-- Parses the request at the start of `buf`, given what `p` kept from the
+earlier calls for it (`buf` extends the buffer of the call that returned `p`).
 
 H1 bounds the start line and the header block separately, each by
 `maxHeadBytes`; the connection's `inCap` holds one head of `maxHeadBytes` in
 all. So a head (empty lines before it included, CRLFCRLF excluded) longer than
 `maxHeadBytes` is refused with 431 here, complete or not, and every request the
 adapter accepts fits in `inCap`: the connection never fills its buffer while
-the adapter waits for more. -/
-def parse (buf : ByteArray) : Parsed :=
-  let m := (({ config } : H1.Machine .receiving).feed buf).processRead
+the adapter waits for more. The check runs while the head is incomplete at
+the call's start; once a call has read the whole head, it has passed.
+
+The answer does not depend on how the buffer was split into calls
+(`Server.Adapter.Incremental`, which `lsrv-test` checks): this function's own
+decisions read the machine's state, which H1 reaches alike however its input
+was split, and the head's size and the body as accumulated across calls. -/
+def Parser.parse (p : Parser) (buf : ByteArray) : Parser × Parsed :=
+  let wasHead := readingHead p.machine.reader.state
+  let m := (p.machine.feed (buf.extract p.fed buf.size)).processRead
+  let p := { p with fed := buf.size }
   let headBytes := if readingHead m.reader.state then buf.size else buf.size - m.reader.input.remainingBytes
-  if m.error.isNone && headBytes > maxHeadBytes + 4 then .bad 431 else
-  if chunkedBody m.reader.state then .bad 501 else
+  if wasHead && m.error.isNone && headBytes > maxHeadBytes + 4 then ({ p with machine := m }, .bad 431) else
+  if chunkedBody m.reader.state then ({ p with machine := m }, .bad 501) else
   let expects := m.isReaderAwaitingContinue
   let m := if expects then m.canContinue .continue else m
-  let (m, body) := drainBody m ByteArray.empty
+  let continued := p.continued || expects
+  let (m, body) := drainBody m p.body
+  -- The machine queues an event on every call that needs more input, and its
+  -- output holds the interim response it writes; the adapter reads neither,
+  -- so both are dropped rather than kept growing on the connection.
+  let m := m.takeEvents.1.takeOutput.1
+  let p := { p with machine := m, body, continued }
   match m.error with
-  | some e => .bad (errorStatus e)
+  | some e => (p, .bad (errorStatus e))
   | none =>
     match m.reader.state with
-    | .complete => .ok m.reader.messageHead body (buf.size - m.reader.input.remainingBytes) (!m.keepAlive)
-    | _ => if expects then .awaitingBody else .needMore
+    | .complete => (p, .ok m.reader.messageHead body (buf.size - m.reader.input.remainingBytes) (!m.keepAlive))
+    | _ => (p, if continued then .awaitingBody else .needMore)
+
+/-- Parses the request at the start of `buf` in one call. -/
+def parse (buf : ByteArray) : Parsed := (Parser.parse {} buf).2
 
 /-- The request-target exactly as sent: the bytes between the request line's
 first and second SP. H1 has validated the line, so both exist. -/
@@ -131,15 +165,22 @@ def toRequest (buf : ByteArray) (h : Request.Head) (body : ByteArray) : Server.R
     headers := h.headers.toArray.map fun (n, v) => (n.value, v.value)
     body }
 
-/-- Answers the bytes buffered on a connection with the application's `app`;
-the responses the server writes itself carry `own`'s fields.
-`now` is the wall clock in Unix seconds, for the Date header. -/
-def handle (own : Server.Response.OwnFields) (app : Handler) (now : Nat) (buf : ByteArray) : Reply :=
-  match parse buf with
-  | .needMore => .needMore
-  | .awaitingBody => .continue Server.Response.continueBytes
-  | .bad status => .respond buf.size (Server.Response.error own now status) true
-  | .ok h body consumed close =>
-    Server.Response.reply consumed (Server.Response.answer own now app (toRequest buf h body) close)
+/-- Answers the bytes buffered on a connection with the application's `app`,
+given the parser state `p` kept for them; the responses the server writes
+itself carry `own`'s fields. `now` is the wall clock in Unix seconds, for the
+Date header. -/
+def handle (own : Server.Response.OwnFields) (app : Handler) (now : Nat) (p : Parser) (buf : ByteArray) :
+    Parser × Reply :=
+  let (p, parsed) := p.parse buf
+  (p, match parsed with
+    | .needMore => .needMore
+    | .awaitingBody => .continue Server.Response.continueBytes
+    | .bad status => .respond buf.size (Server.Response.error own now status) true
+    | .ok h body consumed close =>
+      Server.Response.reply consumed (Server.Response.answer own now app (toRequest buf h body) close))
+
+/-- The adapter the transport drives: `server_exports (Server.H1Adapter.adapter own app)`. -/
+def adapter (own : Server.Response.OwnFields) (app : Handler) (now : Nat) : Server.Adapter Parser :=
+  { init := {}, handle := handle own app now }
 
 end Server.H1Adapter

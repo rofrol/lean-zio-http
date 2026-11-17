@@ -11,45 +11,56 @@ exports the loop's entry points (`ekk_conn_open`, `ekk_conn_on_recv`,
 
 namespace Server.Transport
 
+variable {σ : Type}
+
 /-- A protocol adapter as the transport drives it: the wall clock in Unix
-seconds, then the bytes buffered on a connection. -/
-abbrev Adapter := Nat → ByteArray → Reply
+seconds, then the adapter. Each event gets the adapter for its own time, so
+the state one call keeps is handed to the next call's adapter: `init` and the
+state an adapter keeps must not depend on the clock (only the responses may,
+such as their Date), or `Conn`'s theorems, stated for one adapter, do not
+describe the transport. `Server.H1Adapter` and `Server.HandParser` pass the
+clock only to the response writer. -/
+abbrev Adapter (σ : Type) := Nat → Server.Adapter σ
+
+/-- The connection state of `adapter`'s connections, for the exports' types. -/
+abbrev ConnState {σ : Type} (_ : Adapter σ) : Type := Conn.State σ
 
 /-- A new connection: the initial state and its first action, a receive. -/
-def connOpen : Conn.State × Conn.Action := (Conn.initial, .recv inCap)
+def connOpen (adapter : Adapter σ) : Conn.State σ × Conn.Action := (Conn.initial (adapter 0), .recv inCap)
 
-def onRecv (adapter : Adapter) (now : UInt64) (s : Conn.State) (data : ByteArray) : Conn.State × Conn.Action :=
+def onRecv (adapter : Adapter σ) (now : UInt64) (s : Conn.State σ) (data : ByteArray) : Conn.State σ × Conn.Action :=
   Conn.step (adapter now.toNat) s (.received data)
 
-def onSent (adapter : Adapter) (now : UInt64) (s : Conn.State) (n : USize) : Conn.State × Conn.Action :=
+def onSent (adapter : Adapter σ) (now : UInt64) (s : Conn.State σ) (n : USize) : Conn.State σ × Conn.Action :=
   Conn.step (adapter now.toNat) s (.sent n.toNat)
 
-def onFail (adapter : Adapter) (s : Conn.State) : Conn.State × Conn.Action :=
+def onFail (adapter : Adapter σ) (s : Conn.State σ) : Conn.State σ × Conn.Action :=
   Conn.step (adapter 0) s .failed
 
-def onRefused (adapter : Adapter) (s : Conn.State) : Conn.State × Conn.Action :=
+def onRefused (adapter : Adapter σ) (s : Conn.State σ) : Conn.State σ × Conn.Action :=
   Conn.step (adapter 0) s .refused
 
-def onAnswer (adapter : Adapter) (now : UInt64) (s : Conn.State) (r : Query.Result) : Conn.State × Conn.Action :=
+def onAnswer (adapter : Adapter σ) (now : UInt64) (s : Conn.State σ) (r : Query.Result) : Conn.State σ × Conn.Action :=
   Conn.step (adapter now.toNat) s (.answered r)
 
 set_option hygiene false in
 /-- Writes the loop's entry points for `adapter` in the executable that uses
-it: `server_exports (Server.H1Adapter.handle {} App.Hello.app)`. Unhygienic, so
-the export names reach the C symbol table as written. -/
+it: `server_exports (Server.H1Adapter.adapter {} App.Hello.app)`. Unhygienic, so
+the export names reach the C symbol table as written. The loop holds the
+connection state as an opaque object, whatever the adapter's state type. -/
 macro "server_exports " adapter:term : command => `(
-  @[export ekk_conn_open] def connOpen (_ : UInt8) : Server.Conn.State × Server.Conn.Action :=
-    Server.Transport.connOpen
-  @[export ekk_conn_on_recv] def onRecv (now : UInt64) (s : Server.Conn.State) (data : ByteArray) :
-      Server.Conn.State × Server.Conn.Action := Server.Transport.onRecv $adapter now s data
-  @[export ekk_conn_on_sent] def onSent (now : UInt64) (s : Server.Conn.State) (n : USize) :
-      Server.Conn.State × Server.Conn.Action := Server.Transport.onSent $adapter now s n
-  @[export ekk_conn_on_fail] def onFail (s : Server.Conn.State) : Server.Conn.State × Server.Conn.Action :=
-    Server.Transport.onFail $adapter s
-  @[export ekk_conn_on_refused] def onRefused (s : Server.Conn.State) : Server.Conn.State × Server.Conn.Action :=
-    Server.Transport.onRefused $adapter s
-  @[export ekk_conn_on_answer] def onAnswer (now : UInt64) (s : Server.Conn.State) (r : Server.Query.Result) :
-      Server.Conn.State × Server.Conn.Action := Server.Transport.onAnswer $adapter now s r)
+  @[export ekk_conn_open] def connOpen (_ : UInt8) : Server.Transport.ConnState $adapter × Server.Conn.Action :=
+    Server.Transport.connOpen $adapter
+  @[export ekk_conn_on_recv] def onRecv (now : UInt64) (s : Server.Transport.ConnState $adapter) (data : ByteArray) :
+      Server.Transport.ConnState $adapter × Server.Conn.Action := Server.Transport.onRecv $adapter now s data
+  @[export ekk_conn_on_sent] def onSent (now : UInt64) (s : Server.Transport.ConnState $adapter) (n : USize) :
+      Server.Transport.ConnState $adapter × Server.Conn.Action := Server.Transport.onSent $adapter now s n
+  @[export ekk_conn_on_fail] def onFail (s : Server.Transport.ConnState $adapter) :
+      Server.Transport.ConnState $adapter × Server.Conn.Action := Server.Transport.onFail $adapter s
+  @[export ekk_conn_on_refused] def onRefused (s : Server.Transport.ConnState $adapter) :
+      Server.Transport.ConnState $adapter × Server.Conn.Action := Server.Transport.onRefused $adapter s
+  @[export ekk_conn_on_answer] def onAnswer (now : UInt64) (s : Server.Transport.ConnState $adapter) (r : Server.Query.Result) :
+      Server.Transport.ConnState $adapter × Server.Conn.Action := Server.Transport.onAnswer $adapter now s r)
 
 /-- The loop's settings, passed to `ekk_serve` (zig/src/serve.zig). -/
 structure Options where
