@@ -2,9 +2,9 @@
 
 2kaoxd Move zio to the commit that fixes issue 927 and retire the StopGate subset contract
 lgxdi7 Prepare the upstream question for mxzlsx (Std.Http H1 reparses an unfinished field line)
+mxzlsx Decide how to handle Std.Http H1 parsing an unfinished line again from its start: ask upstream, or approve a supported-subset contract
 4lmjda Collect PostgreSQL rows in chunks with libpq 17 as the minimum (xkkwcb)
 u4moqo Move the toolchain to the first nightly with lean4 PR 16417 (Std.Http RFC fixes)
-mxzlsx Decide how to handle Std.Http H1 parsing an unfinished line again from its start: ask upstream, or approve a supported-subset contract
 
 ## Proposed
 
