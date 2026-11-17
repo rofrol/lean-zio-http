@@ -59,6 +59,7 @@ imports it must report.
 | `Main`, `Fixture`, `MainDb` | composition roots `lsrv`, `lsrv-fixture`, `lsrv-db`: H1 and one application | `Server.Transport`, `Server.H1Adapter`, `App.*` |
 | `MainHand`, `FixtureHand` | `lsrv-hand`, `lsrv-fixture-hand`: the same with the hand-written parser | `Server.Transport`, `Server.HandParser`, `App.*` |
 | `Test`, `Bench`, `Compare`, `Corpus`, `Arch` | tests and measurements | anything |
+| `docs.upstream.*` | reproducers for the drafts of upstream reports in `docs/upstream/`, run with `lean --run`, not built by Lake | `Std.Http.Protocol.H1` |
 
 "Contracts" are `Server.Query`, `Server.Wire` and `Server.Handler`. The
 transport knows neither HTTP nor the application; the application sees

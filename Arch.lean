@@ -38,7 +38,9 @@ def rule (m : Name) : Option (Name → Bool) :=
   | `App.Fixture | `App.Db => some (· ∈ [`Server.Handler, `App.Hello])
   -- Tests and measurement tools may import anything.
   | `Test | `Bench | `Compare | `Corpus | `Arch => some fun _ => true
-  | _ => none
+  -- Reproducers for upstream reports, run with `lean --run` and not built by
+  -- Lake: Std's HTTP/1.1 machine alone, so each stays self-contained.
+  | m => if under `docs.upstream m then some (· == `Std.Http.Protocol.H1) else none
 
 /-- The `.lean` files under `dir`, skipping Lake's build directory, as module names. -/
 partial def modules (root dir : System.FilePath) : IO (Array (Name × System.FilePath)) := do
