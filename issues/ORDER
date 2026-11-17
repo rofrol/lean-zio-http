@@ -1,6 +1,5 @@
 ## Next, in order
 
-tc5rsx Bound the memory of a PostgreSQL result before it is fully received
 tdtseh Decide how to bound the H1 adapter's state a connection retains
 mpimfx Decide whether to allocate a response with the capacity it needs
 kvnm3u Decide whether the type, not a comment, should keep the clock out of the adapter's kept state
@@ -8,6 +7,9 @@ sy3ims Decide whether to report upstream that Std.Http's H1 reparses an unfinish
 u4moqo Move the toolchain to the first nightly with lean4 PR 16417 (Std.Http RFC fixes)
 
 ## Proposed
+
+qsqb5f How a PostgreSQL result over Query.maxResultBytes is received and how it ends the session
+4ia52d Count each row and field in Query.maxResultBytes
 
 ## Needs a decision
 
