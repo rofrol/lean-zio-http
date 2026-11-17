@@ -9,3 +9,5 @@ Options: specify completion and shutdown semantics first, then a server-wide dea
 Checked 2026-11-16 with sol (consult round 20261116-145342-a8e2): this choice changes a contract, failure behavior or architecture, so it stays with the user; recommendation first.
 
 Checked 2026-11-17 with sol (consult round 20261117-011832-74e7) under the user's delegation: stays with the user: needs handler completion and connect budgets, whether a cancel is acknowledged (and whether PQcancel itself can block), the transaction or session disposition and shutdown semantics; no value is justified yet.
+
+Related (bx6zh5, closed 2026-11-17): a failed coalesced connect fails every waiting query even when busy healthy connections could serve them later. Keeping waiters instead was rejected because, without query deadlines, an open connection is no evidence of eventual capacity. Once deadlines are decided here, revisit whether waiters may wait for open connections.
