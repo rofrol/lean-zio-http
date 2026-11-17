@@ -4,7 +4,20 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const lean_include = b.option([]const u8, "lean-include", "Lean include directory") orelse @panic("-Dlean-include required");
-    const zio = b.dependency("zio", .{ .target = target, .optimize = optimize });
+    // On Linux zio's event loop runs on epoll, never io_uring (decided
+    // 2026-11-17, item mzqamr; README, "Modules", `zig/`). zio's default there,
+    // `.linux` (Backend(.auto), src/ev/backends/linux.zig), prefers io_uring,
+    // which queues a send at `loop.add` without trying the syscall first, so
+    // every send looks parked to serve.zig (`sendParked`): the transport and its
+    // tests assume a readiness backend, and io_uring is unsupported. The pin is
+    // a build option, not a `zio_options` declaration in serve.zig, because a
+    // test binary's root is Zig's test runner: only the build option reaches
+    // the library and every test module alike. serve.zig refuses to compile
+    // on zio's `.linux` or `.io_uring` backend.
+    const zio = if (target.result.os.tag == .linux)
+        b.dependency("zio", .{ .target = target, .optimize = optimize, .backend = .epoll })
+    else
+        b.dependency("zio", .{ .target = target, .optimize = optimize });
     const mod = b.createModule(.{
         .root_source_file = b.path("src/serve.zig"),
         .target = target,

@@ -94,7 +94,17 @@ only `Server.Query` values.
   connection's completion from its own callback relies on zio's contract
   (pinned 830564437b2c, `src/ev/loop.zig` `finishCompletion`): the completion is
   marked dead before its callback runs, and for a completion without a group
-  owner the callback is the last thing the loop does with it. Each loop
+  owner the callback is the last thing the loop does with it. The loops run
+  on zio's readiness backends: kqueue on macOS and, on Linux, epoll, pinned
+  in `zig/build.zig` (decided 2026-11-17, item mzqamr). zio's Linux default
+  prefers io_uring, which submits a send to the kernel without first trying
+  the syscall, so each send would look parked to the loop and start the
+  readiness poll beside it, a cost the loop otherwise pays only for a send
+  that waits (section "Deadlines"), and the transport's tests that assume a
+  send completes at once fail under it.
+  io_uring is unsupported: `zig/src/serve.zig` does not compile on zio's
+  `.linux` or `.io_uring` backend, and measurements on Linux count only on epoll (an
+  io_uring figure is experimental). Each loop
   also owns a PostgreSQL pool (`src/pg.zig`, section "PostgreSQL"). The
   library needs libpq's headers (`-Dpq-include`) and the servers link
   `-lpq`: libpq 17 or later (pipeline mode, and its chunked-rows mode,

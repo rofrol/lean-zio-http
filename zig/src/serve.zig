@@ -21,6 +21,16 @@ const os = zio.os;
 const net = os.net;
 const pg = @import("pg.zig");
 
+// The transport assumes a readiness backend: a send is tried at once and only
+// one that would block waits in the loop (`sendParked`). On Linux that is
+// epoll, pinned in build.zig; io_uring, zio's Linux default, is unsupported
+// (item mzqamr). `.linux` and `.io_uring` are the backends that may run on
+// io_uring.
+comptime {
+    if (ev.backend == .linux or ev.backend == .io_uring)
+        @compileError("serve.zig does not support zio's io_uring-capable backend ." ++ @tagName(ev.backend) ++ " (build.zig pins epoll on Linux)");
+}
+
 /// Conn.Action as decoded by glue.c.
 pub const Action = extern struct {
     kind: u8, // 0 recv, 1 send, 2 close, 3 none, 4 query
