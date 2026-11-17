@@ -474,7 +474,39 @@ const Single = struct {
         self.lp.stop.c.callback = stopWrapped;
     }
 
+    /// Ends whatever the test left of its loop, then frees it, so that a
+    /// test that returned early (a failed `try`, before its stop and
+    /// `finish`) leaves no connection, slot or deadline to the tests after
+    /// it. It stops the loop if the stop has not run, makes every current
+    /// deadline still waiting due (a send the fake asked for always runs
+    /// under the write deadline, whose expiry closes it even when its client
+    /// never reads),
+    /// and runs the loop to its end. Something still open before that is a
+    /// leak: it is logged at error level, which fails a test that passed
+    /// (Zig's test runner reports a passing test that logged an error as a
+    /// failure: lib/compiler/test_runner.zig `log`, counted in
+    /// `log_err_count`; Maker/Step/Run.zig "logged {d} errors", Zig 0.17.1).
+    /// For a test that failed, the line only adds to what it printed.
     fn deinit(self: *Single) void {
+        var open: u32 = 0;
+        var it = self.lp.head;
+        while (it) |conn| : (it = conn.next) open += 1;
+        const slots = serve.slots_used.load(.monotonic);
+        if (open != 0 or slots != 0) {
+            std.log.err("the test left {d} connections open and {d} slots held; Single.deinit drains them", .{ open, slots });
+            it = self.lp.head;
+            while (it) |conn| : (it = conn.next) {
+                const arm = conn.arm orelse continue;
+                // Only a timer still waiting in the heap is moved: one that
+                // has fired already has its callback on its way (zio's
+                // `setTimer` asserts it is not re-armed mid-fire).
+                const st = arm.timer.c.loadState();
+                if (st.phase == .running and !arm.timer.c.has_result) self.lp.loop.setTimer(&arm.timer, .{ .duration = .zero });
+            }
+        }
+        if (!self.lp.stopping) self.lp.stop.notify();
+        self.lp.loop.run() catch |err| std.debug.panic("Single.deinit could not run the loop to its end: {}", .{err});
+        if (self.lp.head != null or serve.slots_used.load(.monotonic) != 0) @panic("Single.deinit left a connection or a slot behind");
         self.lp.loop.deinit();
         self.listener.close();
         closeEvents();
