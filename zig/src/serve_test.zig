@@ -760,10 +760,24 @@ fn setBuffer(fd: c.fd_t, opt: u32) !void {
     if (c.setsockopt(fd, c.SOL.SOCKET, opt, std.mem.asBytes(&small_buffer), @sizeOf(c_int)) != 0) return error.SetSockOpt;
 }
 
+/// Polls the loop until the readiness poll is in flight beside a parked
+/// send, at most `max_steps` polls.
+fn stepUntilPolling(s: *Single) !void {
+    const conn = s.lp.head.?;
+    var step: usize = 0;
+    while (!conn.polling) : (step += 1) {
+        if (step == max_steps) {
+            s.dump();
+            return error.PollNeverStarted;
+        }
+        try s.lp.loop.poll(.zero);
+        s.collect();
+    }
+}
+
 /// Connects a client with a small receive buffer, has it send a request
 /// ('R'), and steps the loop until the fake has started the response of
-/// `len` bytes, its send on a small send buffer, with the readiness poll
-/// beside it.
+/// `len` bytes, its send on a small send buffer.
 fn requestResponse(s: *Single, len: usize) !c.fd_t {
     respond = len;
     recv_keeps = true;
@@ -786,6 +800,7 @@ fn requestResponse(s: *Single, len: usize) !c.fd_t {
 fn pipelinedBehindResponse(s: *Single) !c.fd_t {
     const cl = try requestResponse(s, response_len);
     errdefer _ = c.close(cl);
+    try stepUntilPolling(s);
     try send(cl, "G");
     try s.stepUntil(.arrived, 1);
     return cl;
@@ -910,18 +925,17 @@ test "a complete pipelined head whose budget ends while its response is still bl
     try s.finish();
 }
 
-test "a response written before any next byte arrives: the poll beside it is canceled and reports nothing" {
+test "a response sent at once starts no poll, and the receive after it reports what arrived" {
     var s: Single = undefined;
     try s.init(64);
     defer s.deinit();
-    // Small enough for the socket buffers: the send completes at once.
+    // Small enough for the socket buffers: the send completes when it is
+    // submitted, so the fake's watch starts no poll.
     const cl = try requestResponse(&s, 16);
     defer _ = c.close(cl);
     const conn = s.lp.head.?;
     try s.stepUntil(.written, 1);
-    try std.testing.expect(!conn.watching);
-    // The client's end of input: the receive reports it, and the close
-    // comes only after the canceled poll's completion.
+    try std.testing.expectEqual(@as(u64, 0), conn.polls);
     _ = c.shutdown(cl, c.SHUT.WR);
     try s.stepUntil(.free, 1);
     try expectLog(&s, &.{
@@ -941,8 +955,9 @@ test "a response whose write deadline ends before any next byte arrives closes o
     defer s.deinit();
     const cl = try requestResponse(&s, response_len);
     defer _ = c.close(cl);
+    try stepUntilPolling(&s);
     const conn = s.lp.head.?;
-    try std.testing.expect(conn.polling and conn.watching);
+    try std.testing.expect(conn.watching and !conn.poll_stale);
     try std.testing.expect(conn.ahead_arm == null);
     dueNow(&s);
     try s.stepUntil(.free, 1);
@@ -961,16 +976,34 @@ test "a send that fails while the poll beside it is in flight closes only after 
     try s.init(64);
     defer s.deinit();
     defer serve.testing = .{};
-    respond_on_open = 64;
-    // Every completed send is reported as failed: the first one's failure
-    // closes in the same callback that cancels the poll, so the close must
-    // wait for that poll's completion (`close_pending`).
-    serve.testing.fail_every = 1;
-    const cl = try s.listener.connect();
+    respond_on_open = response_len;
+    const cl = socket(c.AF.INET, c.SOCK.STREAM, 0);
+    if (cl < 0) return error.Socket;
     defer _ = c.close(cl);
+    try setBuffer(cl, c.SO.RCVBUF);
+    if (c.connect(cl, @ptrCast(&s.listener.addr), @sizeOf(c.sockaddr.in)) != 0) return error.Connect;
     awaitReadable(s.listener.fd);
-    try s.stepUntil(.fail, 1);
+    try s.stepUntil(.open, 1);
+    // The client reads nothing: the sends complete at once until the
+    // buffers fill, and the one that parks has the poll beside it.
+    try stepUntilPolling(&s);
     const conn = s.lp.head.?;
+    // From now on every completed send is reported as failed: once the
+    // client reads, the parked send completes, and its failure closes in
+    // the callback that cancels the poll, so the close must wait for that
+    // poll's completion (`close_pending`).
+    serve.testing.fail_every = 1;
+    var buf: [65536]u8 = undefined;
+    var round: usize = 0;
+    while (s.count(.fail) == 0) : (round += 1) {
+        if (round == max_drain) {
+            s.dump();
+            return error.NoSendFailed;
+        }
+        _ = c.recv(cl, &buf, buf.len, c.MSG.DONTWAIT);
+        try s.lp.loop.poll(.zero);
+        s.collect();
+    }
     try std.testing.expect(conn.close_pending and conn.polling and conn.poll_stale);
     try std.testing.expect(conn.cur == null);
     try s.stepUntil(.free, 1);

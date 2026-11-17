@@ -255,9 +255,10 @@ pub const Conn = struct {
     arm: ?*Arm = null,
     /// The timer of the head budget beside a send (Conn.Phase.ahead), if any.
     ahead_arm: ?*Arm = null,
-    /// The readiness poll beside a send: in flight while `polling`. Lean's
-    /// state wants it while `watching`; one canceled because Lean stopped
-    /// watching is `poll_stale` until its completion, which then reports
+    /// The readiness poll beside a send: in flight while `polling`. It is
+    /// wanted (`watching`) while Lean's state watches and the send waits in
+    /// the kernel (`sendParked`); one canceled because it is no longer
+    /// wanted is `poll_stale` until its completion, which then reports
     /// nothing. A close waits for the poll's completion (`close_pending`),
     /// so that no completion outlives the connection.
     poll: ev.NetPoll = undefined,
@@ -265,6 +266,8 @@ pub const Conn = struct {
     watching: bool = false,
     poll_stale: bool = false,
     close_pending: bool = false,
+    /// Readiness polls started on this connection, for the tests.
+    polls: u64 = 0,
     /// Retired arms whose callbacks are still to run: the connection is
     /// freed only after the last of them.
     retired_arms: u32 = 0,
@@ -348,10 +351,10 @@ pub const Conn = struct {
         self.ahead_arm = null;
     }
 
-    /// Keeps the readiness poll in flight exactly while Lean's state
-    /// watches. A poll canceled here completes later and reports nothing;
-    /// until then no other can start, and its completion starts the next
-    /// one if Lean watches again.
+    /// Keeps the readiness poll in flight exactly while it is wanted. A poll
+    /// canceled here completes later and reports nothing; until then no
+    /// other can start, and its completion starts the next one if it is
+    /// wanted again.
     fn watch(self: *Conn, want: bool) void {
         self.watching = want;
         if (want) {
@@ -365,6 +368,7 @@ pub const Conn = struct {
     fn startPoll(self: *Conn) void {
         self.polling = true;
         self.poll_stale = false;
+        self.polls += 1;
         self.poll = ev.NetPoll.init(self.fd, .recv);
         self.poll.c.callback = pollCb;
         self.poll.c.userdata = self;
@@ -413,13 +417,30 @@ pub const Conn = struct {
         }
     }
 
+    /// Whether the operation in flight is a send that zio could not
+    /// complete when it was submitted: zio tries the syscall at once and
+    /// parks the send only when the socket's buffer is full (sockreg.zig,
+    /// `submitIo`), queuing a completed one's callback for later in the
+    /// same poll (`defer_callback`).
+    fn sendParked(self: *const Conn) bool {
+        const op = self.cur orelse return false;
+        return op.kind == .send and op.comp.send.c.loadState().phase == .running;
+    }
+
     /// Performs the action Lean answered, after setting the timers to the
-    /// deadlines of Lean's new state and the readiness poll to its
-    /// watching; during shutdown a receive is declined and reported as
-    /// `refused` instead.
+    /// deadlines of Lean's new state; during shutdown a receive is declined
+    /// and reported as `refused` instead. While Lean's state watches, the
+    /// readiness poll runs only beside a send that waits in the kernel: a
+    /// send completed at submission is reported later in the same poll and
+    /// followed at once by the response's next send (which gets the poll if
+    /// it waits) or by the receive that finds any byte that arrived
+    /// meanwhile, so the poll would only cost a poll(2) probe and a
+    /// registration per response (README, "PostgreSQL", measured that
+    /// probe's cost).
     fn apply(self: *Conn, act: Action) void {
         self.track(act.deadline, act.gen, act.ahead, act.ahead_gen);
-        self.watch(act.watch != 0);
+        const wants = act.watch != 0;
+        if (!wants) self.watch(false);
         switch (act.kind) {
             0 => {
                 if (act.room == 0) return self.fail(); // excluded by Conn.step_recv
@@ -445,6 +466,7 @@ pub const Conn = struct {
             3 => if (self.cur == null) @panic("Lean answered none with no operation in flight"),
             else => @panic("Lean answered an unknown action"),
         }
+        if (wants) self.watch(self.sendParked());
     }
 
     /// Reports a failed operation; Conn.step answers it with close.

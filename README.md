@@ -87,7 +87,8 @@ only `Server.Query` values.
   `lean_initialize_thread`, which libleanrt exports but `lean.h` does not
   declare. It keeps at most one operation in flight per connection and ends
   the process when a completion finds none outstanding; beside a send it may
-  also keep a readiness poll, which carries no data (section "Deadlines"),
+  also keep a readiness poll while the send waits on the kernel, which
+  carries no data (section "Deadlines"),
   and a close waits for that poll's completion. Reusing a
   connection's completion from its own callback relies on zio's contract
   (pinned 830564437b2c, `src/ev/loop.zig` `finishCompletion`): the completion is
@@ -178,10 +179,17 @@ only `Server.Query` values.
   earlier phase is stale and changes nothing (`Conn.step_expired_stale`,
   `expired_old_stale`). A later request's first byte is known at the
   receive that brought it, when it came with the previous request; otherwise
-  the loop, while it writes a response with nothing buffered, keeps a
-  readiness poll on the socket beside the send and reports `Event.arrived`
-  when the socket becomes readable (the bytes stay in the kernel; a peer's
-  end of input counts too, and the receive after the response reports it).
+  the loop, while it writes a response with nothing buffered and the send
+  waits on the kernel, keeps a readiness poll on the socket beside the send
+  and reports `Event.arrived` when the socket becomes readable (the bytes
+  stay in the kernel; a peer's end of input counts too, and the receive
+  after the response reports it). A send the kernel takes whole at its
+  submission starts no poll: the loop goes on at once with the response's
+  next send, which gets the poll if it waits, or with the receive that sees
+  what arrived, so that head's budget starts late by at most the server's
+  own work in between. The poll costs a probe and a
+  registration (section "PostgreSQL" measures that cost on macOS), which a
+  poll on every keep-alive response would add to each request.
   Bytes that arrive while a query runs are seen when its response starts, so
   that head's budget starts late by at most the query's duration. When the
   head budget ends during the write and the next request's head is already
