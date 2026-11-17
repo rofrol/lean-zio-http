@@ -13,8 +13,6 @@ ogcdwm Should the transport tests run on Linux, so the Unix-domain parked-send t
 
 ## Proposed
 
-4ialzb Should the server enforce 504 for a query that expired, whatever the handler answers?
-
 ## Needs a decision
 
 53rwgc Linux acceptance runs for the Lean HTTP server
