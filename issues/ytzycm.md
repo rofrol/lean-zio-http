@@ -8,3 +8,5 @@ Deadlines are designed timers on an external producer (the peer), which policy r
 Question: Which per-connection deadlines (idle, head read, body read, write progress, shutdown drain) with which values, and should they be a timedOut event in Conn.step so the theorems cover them?
 Options: specify the contract and values first, as a timedOut event in Conn.step | only idle and write-progress deadlines now | none until the Linux runs
 Checked 2026-11-16 with sol (consult round 20261116-145342-a8e2): this choice changes a contract, failure behavior or architecture, so it stays with the user; recommendation first.
+
+Checked 2026-11-17 with sol (consult round 20261117-011832-74e7) under the user's delegation: stays with the user: deadline values are operational requirements; no value is justified yet. Prefer explicit expiry events in Conn.step with theorem coverage once the user sets the values (peer budgets, the supervisor's shutdown deadline).
