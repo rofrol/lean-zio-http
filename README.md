@@ -102,10 +102,11 @@ only `Server.Query` values.
 - Command line: `lsrv [THREADS] [--port N] [--max-conns N] [--pg CONNINFO]
   [--pg-conns N] [--idle-ms N] [--head-ms N] [--body-ms N] [--write-ms N]
   [--pg-query-ms N] [--pg-query-max-ms N] [--pg-connect-ms N]
-  [--pg-statement-ms N]` (`--pg-conns`, default 4, is per loop; without
-  `--pg` no pool is made and every query fails with `08006`; the four
-  connection budgets, in milliseconds, are in "Deadlines" below, the four
-  database budgets in section "PostgreSQL", "Deadlines"), then the test
+  [--pg-statement-ms N] [--drain-ms N]` (`--pg-conns`, default 4, is per
+  loop; without `--pg` no pool is made and every query fails with `08006`;
+  the four connection budgets, in milliseconds, are in "Deadlines" below,
+  the four database budgets in section "PostgreSQL", "Deadlines", the
+  drain in "Shutdown"), then the test
   settings:
   `--chunk N` caps every receive and send at N bytes, `--fail-every N`
   reports every N-th completed receive and every N-th completed send to Lean
@@ -207,7 +208,7 @@ only `Server.Query` values.
   (`Conn.step_expired_ahead_partial` covers the partial head). Which of a due timer and
   a ready receive or send wins is the order zio runs their callbacks in; an
   expiry counts once it is reported, and a completion that arrives after it
-  is not reported. The shutdown's own drain bound is a separate item.
+  is not reported. The shutdown has its own bound, the drain ("Shutdown").
 - **Admission.** At most `--max-conns` connections (default 4,096) are open
   process-wide; the rest wait in the kernel's listen queue. A loop arms its
   accept only with a free slot, and an accepted connection keeps the slot
@@ -250,11 +251,19 @@ only `Server.Query` values.
   dispatched. When all loops have returned the process prints `stopped` and
   exits with status 0. A peer that does not read its response holds the
   shutdown at most for the write budget (`--write-ms`), after which its
-  connection closes; a shorter bound for the whole shutdown is the
-  supervisor's (SIGKILL).
-  A query in flight or waiting for a pool slot also holds the shutdown
-  until it is answered, at most for its completion budget (section
-  "PostgreSQL", "Deadlines").
+  connection closes, and a query in flight or waiting for a pool slot at
+  most for its completion budget (section "PostgreSQL", "Deadlines"). The
+  drain bounds the whole: `--drain-ms` (default 10,000, from 1 to below
+  2^32; decided 2026-11-17, item ytzycm) from a loop's stop, armed only
+  while the loop has connections open and taken off when the last closes.
+  When it ends, the pool answers every query (`error 57014` for one not
+  yet sent, `abandoned 57014` for one running, whose session it closes
+  without PQcancel) and answers later ones at once, unsent; a send in
+  flight is canceled, a handler that answers after that end gets its
+  connection closed instead of a response, and every connection closes;
+  no send starts after that end. So a loop's shutdown ends by the drain, except
+  for a connect in flight that no query waits for, which ends by its own
+  `--pg-connect-ms`.
 - **Transport tests.** `zig build test` in `zig/` (`bench.sh` runs it) also
   runs `src/serve_test.zig`. It drives `serve.zig`'s loops on real sockets,
   with a fake of `glue.c` that reports every call as an event, and checks
@@ -292,6 +301,12 @@ only `Server.Query` values.
   after the receive is ready, or a test timer in the same batch), not
   timed. `bench/boundary`'s `deadlines` scenario checks the idle, head and
   body expiries end to end with short budgets.
+  (6) The drain: one that ends with a send waiting in the kernel cancels
+  it, unreported, and closes the connection; every shutdown test's run
+  returns only because the drain was taken off when the last connection
+  closed. The pool's tests check its end (`Pool.abort`): the running query
+  abandoned, the queued one unsent, both sessions closed, a later query
+  answered at once.
 - **Not yet:** chunked
   request bodies, percent-decoding and query parsing, Go's larger limits.
 
@@ -461,7 +476,9 @@ else meanwhile; the loop serves its other connections (`Conn.step_query`,
   backslash).
   `bench/dbcheck` checks the deadlines against the private cluster (a query
   expiring in flight and in the queue, `statement_timeout`, a connect to a
-  listener that never answers) and changes a column's type under a cached statement and back,
+  listener that never answers, the shutdown's drain ending with a query
+  running and one queued: both connections closed unanswered, the session
+  closed without a cancel) and changes a column's type under a cached statement and back,
   and runs an `INSERT ... RETURNING` over the bound (abandoned with
   `54000`, the session closed, the insert wholly applied or not at all).
   A chain of queries that fail synchronously, each asked again from its

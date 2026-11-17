@@ -375,13 +375,13 @@ pub const Slot = struct {
     /// The query's deadline passed while busy: its session is disposed of
     /// (never reused, no PQcancel) and the query abandoned with `57014`,
     /// delivered from the pool's `ready` list.
-    fn expire(self: *Slot) void {
+    fn expire(self: *Slot, message: [*:0]const u8) void {
         const w = self.waiter.?;
         if (self.acc) |a| ekk_query_drop(a);
         self.acc = null;
         self.waiter = null;
         self.teardown();
-        self.pool.ready(w, ekk_pg_abandoned("57014", "the query's deadline passed; its session was closed, so whether it took effect is unknown"));
+        self.pool.ready(w, ekk_pg_abandoned("57014", message));
     }
 
     /// The connect's deadline passed: its session ends like a failed one,
@@ -463,6 +463,9 @@ pub const Pool = struct {
     /// The loop is shutting down: idle connections close, and a slot that
     /// finds no waiter closes too.
     stopping: bool = false,
+    /// The shutdown's drain ended (`abort`): every query is answered at
+    /// once, unsent, and no connect starts.
+    aborted: bool = false,
     /// `dispatch` is running further up the stack: a nested call returns at
     /// once and the running one picks up what changed, so a run of
     /// synchronous connect failures (the database down) is a loop, not a
@@ -485,7 +488,10 @@ pub const Pool = struct {
     pub fn submit(self: *Pool, w: *Waiter, q: Lean) void {
         std.debug.assert(w.query == null and w.next == null and w.result == null);
         const ms = ekk_query_timeout_ms(q, self.budgets.query_ms, self.budgets.query_max_ms);
-        if (ms == 0) {
+        if (self.aborted) {
+            ekk_query_drop(q);
+            self.ready(w, ekk_pg_error("57014", "the server's shutdown drain ended (--drain-ms); the query was not sent"));
+        } else if (ms == 0) {
             ekk_query_drop(q);
             self.ready(w, ekk_pg_error("22023", "Query.timeoutMs must be at least 1 and at most the server's ceiling (--pg-query-max-ms)"));
         } else {
@@ -618,7 +624,7 @@ pub const Pool = struct {
             self.ready(w, ekk_pg_error("57014", "the query's deadline passed before it was sent"));
         }
         for (self.slots) |*s| switch (s.state) {
-            .busy => if (due(s.waiter.?.deadline, t)) s.expire(),
+            .busy => if (due(s.waiter.?.deadline, t)) s.expire("the query's deadline passed; its session was closed, so whether it took effect is unknown"),
             .connecting => if (due(s.connect_deadline, t)) s.connectExpire(),
             else => {},
         };
@@ -658,6 +664,31 @@ pub const Pool = struct {
     /// connections close now, the others once no query waits.
     pub fn stop(self: *Pool) void {
         self.stopping = true;
+        self.dispatch();
+    }
+
+    /// The loop's shutdown drain ended: a waiting query is answered
+    /// `error 57014` (never sent), a running one `abandoned 57014` with its
+    /// session closed (`Slot.expire`), the connect in flight ends, and from
+    /// now on `submit` answers every query at once, unsent. Every result is
+    /// delivered before this returns; a delivery that submits is answered
+    /// in the same run of `dispatch`.
+    pub fn abort(self: *Pool) void {
+        std.debug.assert(!self.dispatching);
+        self.stopping = true;
+        self.aborted = true;
+        self.dispatching = true;
+        while (self.dequeue()) |w| {
+            ekk_query_drop(w.query);
+            w.query = null;
+            self.ready(w, ekk_pg_error("57014", "the server's shutdown drain ended (--drain-ms) before the query was sent"));
+        }
+        for (self.slots) |*s| switch (s.state) {
+            .busy => s.expire("the server's shutdown drain ended (--drain-ms); the query's session was closed, so whether it took effect is unknown"),
+            .connecting => s.teardown(),
+            else => {},
+        };
+        self.dispatching = false;
         self.dispatch();
     }
 };

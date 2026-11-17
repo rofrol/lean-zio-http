@@ -529,6 +529,7 @@ const Single = struct {
         due_injected = null;
         serve.testing = .{};
         serve.budget_ms = .{ never, never, never, never };
+        serve.drain_ms = never;
         stops = 0;
         serve.max_conns = 8;
         self.listener = switch (family) {
@@ -572,6 +573,11 @@ const Single = struct {
             }
         }
         if (!self.lp.stopping) self.lp.stop.notify();
+        // A drain still armed ends now, closing what is open.
+        if (self.lp.drain_armed) {
+            const st = self.lp.drain.c.loadState();
+            if (st.phase == .running and !self.lp.drain.c.has_result) self.lp.loop.setTimer(&self.lp.drain, .{ .duration = .zero });
+        }
         self.lp.loop.run() catch |err| std.debug.panic("Single.deinit could not run the loop to its end: {}", .{err});
         if (self.lp.head != null or serve.slots_used.load(.monotonic) != 0) @panic("Single.deinit left a connection or a slot behind");
         self.lp.loop.deinit();
@@ -618,10 +624,13 @@ const Single = struct {
         }
     }
 
-    /// Runs the loop to its end: after the shutdown it has nothing left in flight.
+    /// Runs the loop to its end: after the shutdown it has nothing left in
+    /// flight, and the drain (`never` in these tests) was taken off when the
+    /// last connection closed, or the run would not have returned.
     fn finish(self: *Single) !void {
         try self.lp.loop.run();
         try std.testing.expect(self.lp.head == null);
+        try std.testing.expect(!self.lp.drain_armed);
         try std.testing.expectEqual(@as(u32, 0), serve.slots_used.load(.monotonic));
         try std.testing.expectEqual(@as(u32, 1), stops);
     }
@@ -958,6 +967,32 @@ fn drainUntilWritten(s: *Single, cl: c.fd_t) !void {
         try s.lp.loop.poll(.zero);
         s.collect();
     }
+}
+
+test "the shutdown's drain ends with a send waiting in the kernel: the send is canceled, unreported, and the connection closes" {
+    var s: Single = undefined;
+    try s.init(64);
+    defer s.deinit();
+    const cl = try requestResponse(&s, response_len);
+    defer _ = c.close(cl);
+    try stepUntilPolling(&s);
+    s.lp.stop.notify();
+    var step: usize = 0;
+    while (stops == 0) : (step += 1) {
+        if (step == max_steps) return error.StopNeverRan;
+        try s.lp.loop.poll(.zero);
+    }
+    // The send goes on after the stop, under the drain.
+    try std.testing.expect(s.lp.drain_armed);
+    try std.testing.expect(s.lp.head.?.cur.?.kind == .send);
+    s.lp.loop.setTimer(&s.lp.drain, .{ .duration = .zero });
+    try s.stepUntil(.free, 1);
+    try expectLog(&s, &.{
+        .{ .kind = .open },
+        .{ .kind = .recv, .n = 1, .byte = 'R' },
+        .{ .kind = .free },
+    });
+    try s.finish();
 }
 
 test "a partial pipelined head behind a blocked response: finishing the response neither starts nor resets its budget" {

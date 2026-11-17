@@ -440,6 +440,22 @@ pub const Conn = struct {
         }
     }
 
+    /// The loop's shutdown drain ended: a send in flight is canceled and
+    /// its completion closes, as after an expiry (`expire`); Lean is not
+    /// asked, and its state is freed at the close. A receive in flight was
+    /// canceled by the stop (`LoopCtx.stopCb`) and its completion closes
+    /// through `refuse`; a close goes on. No query is in flight: the pool's
+    /// `abort` has answered every one before this runs.
+    fn cut(self: *Conn) void {
+        if (self.closing or self.close_pending) return;
+        const op = self.cur orelse @panic("a connection with no operation in flight at the drain's end");
+        switch (op.kind) {
+            .send => self.expire(),
+            .recv, .close => {},
+            .query => @panic("a query in flight after the pool's abort"),
+        }
+    }
+
     /// Whether the operation in flight is a send that zio could not
     /// complete when it was submitted: zio tries the syscall at once and
     /// parks the send only when the socket's buffer is full (sockreg.zig,
@@ -472,6 +488,12 @@ pub const Conn = struct {
             },
             1 => {
                 if (act.len == 0) return self.fail(); // excluded by Conn.step_send
+                if (self.lp.drained) {
+                    // The drain ended: nothing more is sent (`Conn.cut`).
+                    self.disarm();
+                    self.watch(false);
+                    return self.close();
+                }
                 self.out_len = capChunk(act.len);
                 self.startSend();
             },
@@ -605,6 +627,7 @@ pub const Conn = struct {
         self.state = null;
         const lp = self.lp;
         lp.unlink(self);
+        if (lp.stopping and lp.head == null) lp.endDrain();
         releaseSlot();
         if (testing.trace) {
             std.debug.print("free {d} {d} {d} {d}\n", .{ self.id, self.done, self.injected_recv, self.injected_send });
@@ -634,6 +657,13 @@ pub const LoopCtx = struct {
     paused: bool = false,
     stopping: bool = false,
     stop: ev.Async = undefined,
+    /// The shutdown's drain (`drain_ms`), armed by the stop while
+    /// connections are open and taken off when the last of them closes.
+    drain: ev.Timer = undefined,
+    drain_armed: bool = false,
+    /// The drain ended: every connection closes, and a send Lean asks for
+    /// afterwards (a handler answered by `Pool.abort`) closes instead.
+    drained: bool = false,
     head: ?*Conn = null,
     /// The loop's PostgreSQL connections (pg.zig).
     pool: pg.Pool = undefined,
@@ -718,7 +748,10 @@ pub const LoopCtx = struct {
     /// receive in flight is canceled (its callback reports `refused`, or the
     /// result it had). Sends run to completion; Lean still answers requests
     /// already buffered, and every receive it asks for afterwards is declined.
-    /// `loop.run` returns once nothing of this loop is in flight.
+    /// While connections are open the drain runs (`drainCb`), so the shutdown
+    /// ends by `drain_ms` at the latest, plus a connect in flight that no
+    /// query waits for (its own `--pg-connect-ms`). `loop.run` returns once
+    /// nothing of this loop is in flight.
     pub fn stopCb(_: *ev.Loop, c: *ev.Completion) void {
         const self: *LoopCtx = @ptrCast(@alignCast(c.userdata.?));
         self.stopping = true;
@@ -739,8 +772,37 @@ pub const LoopCtx = struct {
         }
         // Queries in flight and waiting still run; idle database connections close.
         self.pool.stop();
+        if (self.head != null) {
+            self.drain = ev.Timer.init(.none);
+            self.drain.c.callback = drainCb;
+            self.drain.c.userdata = self;
+            self.drain_armed = true;
+            self.loop.setTimer(&self.drain, .fromMilliseconds(drain_ms));
+        }
         // The shutdown test checks that a send was in flight when the stop came.
         if (testing.trace) std.debug.print("stop {d} {d}\n", .{ receives, sends });
+    }
+
+    /// The last connection closed during the shutdown: the drain has
+    /// nothing left to bound. A callback already on its way finds no
+    /// connection and an empty pool queue.
+    fn endDrain(self: *LoopCtx) void {
+        if (self.drain_armed and self.loop.clearTimer(&self.drain)) self.drain_armed = false;
+    }
+
+    /// The drain ended with work still open: the pool answers every query
+    /// and closes its sessions (`Pool.abort`), a handler that answers then
+    /// gets its connection closed instead of a send (`Conn.apply`), and
+    /// every send in flight is canceled and its connection closes
+    /// (`Conn.cut`). No send starts after the drain's end.
+    fn drainCb(_: *ev.Loop, c: *ev.Completion) void {
+        const self: *LoopCtx = @ptrCast(@alignCast(c.userdata.?));
+        self.drain_armed = false;
+        self.drained = true;
+        self.pool.abort();
+        var it = self.head;
+        while (it) |conn| : (it = conn.next) conn.cut();
+        if (testing.trace) std.debug.print("drain ended\n", .{});
     }
 };
 
@@ -761,6 +823,10 @@ extern fn ekk_pg_options(conninfo: [*:0]const u8, statement_ms: c_uint, out: *?[
 /// The tests (serve_test.zig) set it themselves; 0 there makes a timer due
 /// at once.
 pub var budget_ms: [4]u32 = .{ 1, 1, 1, 1 };
+/// The shutdown's drain in milliseconds, at least 1 (Transport.Options.drainMs):
+/// from a loop's stop to the forced close of what is still open there. The
+/// tests (serve_test.zig) set it themselves.
+pub var drain_ms: u32 = 1;
 
 /// Writes a loop's one-byte report; a write that fails would leave the
 /// waiter blocked forever, so it ends the process instead.
@@ -897,13 +963,14 @@ pub fn openListener(port: u16) ?Listening {
 /// kept for the process's life). `idle_ms` to `write_ms` are the
 /// per-connection deadlines' budgets (`budget_ms`); `query_ms` to
 /// `statement_ms` the pool's (`pg_budgets`, and PostgreSQL's
-/// statement_timeout in `pg_options`). The rest are the test settings
+/// statement_timeout in `pg_options`); `drain` the shutdown's (`drain_ms`). The rest are the test settings
 /// (`Testing`), all zero in normal runs. Returns 1 on setup failure.
-export fn ekk_serve(port: u16, threads: u32, maxc: u32, conninfo: *anyopaque, conns: u32, idle_ms: u32, head_ms: u32, body_ms: u32, write_ms: u32, query_ms: u32, query_max_ms: u32, connect_ms: u32, statement_ms: u32, chunk: usize, fail_every: u32, trace: u8, crash_recv: u32, crash_send: u32) callconv(.c) u8 {
+export fn ekk_serve(port: u16, threads: u32, maxc: u32, conninfo: *anyopaque, conns: u32, idle_ms: u32, head_ms: u32, body_ms: u32, write_ms: u32, query_ms: u32, query_max_ms: u32, connect_ms: u32, statement_ms: u32, drain: u32, chunk: usize, fail_every: u32, trace: u8, crash_recv: u32, crash_send: u32) callconv(.c) u8 {
     if (threads == 0 or maxc == 0) return 1;
     budget_ms = .{ idle_ms, head_ms, body_ms, write_ms };
     for (budget_ms) |ms| if (ms == 0) return 1;
-    if (query_ms == 0 or query_max_ms < query_ms or connect_ms == 0 or statement_ms == 0) return 1;
+    if (query_ms == 0 or query_max_ms < query_ms or connect_ms == 0 or statement_ms == 0 or drain == 0) return 1;
+    drain_ms = drain;
     pg_budgets = .{ .query_ms = query_ms, .query_max_ms = query_max_ms, .connect_ms = connect_ms };
     pg_conninfo = ekk_string_cstr(conninfo);
     pg_conns = conns;

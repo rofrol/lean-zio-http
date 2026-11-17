@@ -93,11 +93,11 @@ type srv struct {
 	lines chan string
 }
 
-// The database budgets of the tests that do not test them, beyond any run
-// (delay: external deadline: the pool's database budgets, out of the way of
-// tests that hold queries on locks).
+// The database budgets and the shutdown's drain of the tests that do not
+// test them, beyond any run (delay: external deadline: the pool's database
+// budgets and the drain, out of the way of tests that hold queries on locks).
 var far = []string{"--pg-query-ms", "600000", "--pg-query-max-ms", "600000", "--pg-connect-ms", "600000",
-	"--pg-statement-ms", "600000"}
+	"--pg-statement-ms", "600000", "--drain-ms", "600000"}
 
 // start runs lsrv-db with `args` and the private cluster's conninfo.
 func start(args ...string) *srv {
@@ -573,6 +573,41 @@ func testConnectDeadline() {
 	s.stop("connect deadline")
 }
 
+// The shutdown's drain ends with one query running on a lock and one queued
+// behind it: both connections close without an answer, the running query's
+// session is closed without a cancel (its backend waits on until the lock is
+// released), and the server exits.
+func testDrain() {
+	s := start("1", "--pg-conns", "1", "--trace", "--drain-ms", short)
+	c := connect()
+	l := lockHeld(17)
+	running := getAsync("/lock?key=17")
+	if !awaitWaiters(c, 1) {
+		fail("drain: the running query never waited for the lock")
+	}
+	queued := getAsync("/lock?key=18")
+	s.await("drain: queued", 2, func(l string) bool { return strings.HasPrefix(l, "query ") })
+	s.cmd.Process.Signal(syscall.SIGTERM)
+	s.await("drain: ended", 1, func(l string) bool { return l == "drain ended" })
+	for _, q := range []struct {
+		what string
+		ch   chan answer
+	}{{"running", running}, {"queued", queued}} {
+		if a := <-q.ch; a.err == nil {
+			fail("drain: the %s query was answered %d %q; want its connection closed", q.what, a.status, a.body)
+		}
+	}
+	s.finish("drain")
+	if !awaitWaiters(c, 1) {
+		fail("drain: the closed session's backend no longer waits")
+	}
+	l.Close(ctx)
+	if !awaitNoBackends(c) {
+		fail("drain: the closed session's backend never ended")
+	}
+	c.Close(ctx)
+}
+
 func main() {
 	flag.Parse()
 	if *conninfo == "" || *pgdata == "" || *pglog == "" {
@@ -587,7 +622,7 @@ func main() {
 		{"restart", testRestart}, {"errors", testErrors},
 		{"schema change", testSchemaChange}, {"oversized", testOversized}, {"down", testDown}, {"shutdown", testShutdown},
 		{"query deadline", testQueryDeadline}, {"statement_timeout", testStatementTimeout},
-		{"connect deadline", testConnectDeadline},
+		{"connect deadline", testConnectDeadline}, {"drain", testDrain},
 	} {
 		before := failures
 		t.run()

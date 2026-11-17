@@ -1132,6 +1132,49 @@ test "f: a budget of 0 or above the ceiling is refused with 22023, unsent" {
     try fx.deinit();
 }
 
+test "f: the shutdown drain's end answers every query, closes every session and refuses later queries unsent" {
+    var fx: Fixture = .{};
+    try fx.initBudgets(2, .{ .query_ms = far, .query_max_ms = far, .connect_ms = far });
+    var a: TestWaiter = .{ .pool = &fx.pool };
+    const peer = try sentAndBusy(&fx, &a, query());
+    // b waits for a second session, whose connect waits on the server.
+    _ = try fx.pair();
+    fake.start.push(&.{1});
+    fake.connect_poll.push(&.{1});
+    var b: TestWaiter = .{ .pool = &fx.pool };
+    b.submit();
+    try std.testing.expectEqual(.connecting, fx.pool.slots[1].state);
+    fx.pool.stop();
+    try std.testing.expectEqual(@as(usize, 0), a.n + b.n);
+    // a's handler asks again from its delivery (TestWaiter.deliver panics
+    // on a delivery nested in another).
+    a.again = 1;
+    fx.pool.abort();
+    // All are answered within abort: a abandoned (it was sent), b unsent,
+    // and a's second query unsent, in the same run of dispatch.
+    try std.testing.expectEqual(.abandoned, a.got[0].kind);
+    try std.testing.expectEqualSlices(u8, "57014", &a.got[0].sqlstate);
+    try std.testing.expectEqual(@as(usize, 2), a.n);
+    try std.testing.expectEqual(.err, a.got[1].kind);
+    try std.testing.expectEqualSlices(u8, "57014", &a.got[1].sqlstate);
+    try std.testing.expectEqual(.err, b.got[0].kind);
+    try std.testing.expectEqualSlices(u8, "57014", &b.got[0].sqlstate);
+    try fx.until(&fx, Fixture.allDisconnected);
+    try std.testing.expectEqual(@as(usize, 2), fake.count.get(.finish));
+    try std.testing.expectError(error.Write, poke(peer));
+    // A later query is answered at once, unsent, and starts no connect.
+    const starts = fake.count.get(.start);
+    in_submit = true;
+    fx.pool.submit(&a.w, query());
+    in_submit = false;
+    try std.testing.expectEqual(@as(usize, 3), a.n);
+    try std.testing.expectEqual(.err, a.got[2].kind);
+    try std.testing.expectEqualSlices(u8, "57014", &a.got[2].sqlstate);
+    try std.testing.expectEqual(starts, fake.count.get(.start));
+    try std.testing.expect(fx.pool.timer_due == null);
+    try fx.deinit();
+}
+
 // ---- (g) a lost connection: sent or not ----
 
 test "g: a connection found failed before the query reached libpq fails it with error 08006" {

@@ -164,6 +164,12 @@ structure Options where
   options: 4 s, below the query budget, so the server usually ends a long
   statement itself and the session survives. -/
   pgStatementMs : Nat := 4000
+  /-- The shutdown's drain in milliseconds, at least 1: 10 s from a loop's stop
+  to the forced close of what is still open there (queries answered, their
+  sessions closed, sends canceled). The overall shutdown bound the owner set
+  (decided 2026-11-17, item ytzycm; built by item 3jnkx5), an external
+  deadline for the supervisor that stops the server (policy rule 10). -/
+  drainMs : Nat := 10000
   /-- Test settings (`Testing` in zig/src/serve.zig); all zero in normal runs. -/
   chunk : Nat := 0
   failEvery : Nat := 0
@@ -173,7 +179,7 @@ structure Options where
 
 @[extern "ekk_serve"]
 opaque serve (port : UInt16) (threads : UInt32) (maxConns : UInt32) (pg : @& String) (pgConns : UInt32)
-  (idleMs headMs bodyMs writeMs : UInt32) (pgQueryMs pgQueryMaxMs pgConnectMs pgStatementMs : UInt32) (chunk : USize) (failEvery : UInt32) (trace : UInt8) (crashAfterRecv : UInt32) (crashAfterSend : UInt32) : UInt8
+  (idleMs headMs bodyMs writeMs : UInt32) (pgQueryMs pgQueryMaxMs pgConnectMs pgStatementMs : UInt32) (drainMs : UInt32) (chunk : USize) (failEvery : UInt32) (trace : UInt8) (crashAfterRecv : UInt32) (crashAfterSend : UInt32) : UInt8
 
 def parseArgs : List String → Options → Except String Options
   | [], o => .ok o
@@ -192,6 +198,7 @@ def parseArgs : List String → Options → Except String Options
     | "--pg-query-max-ms", some k => parseArgs rest { o with pgQueryMaxMs := k }
     | "--pg-connect-ms", some k => parseArgs rest { o with pgConnectMs := k }
     | "--pg-statement-ms", some k => parseArgs rest { o with pgStatementMs := k }
+    | "--drain-ms", some k => parseArgs rest { o with drainMs := k }
     | "--chunk", some k => parseArgs rest { o with chunk := k }
     | "--fail-every", some k => parseArgs rest { o with failEvery := k }
     | "--crash-after-recv", some k => parseArgs rest { o with crashAfterRecv := k }
@@ -207,7 +214,7 @@ def parseArgs : List String → Options → Except String Options
 
 /-- `[THREADS] [--port N] [--max-conns N] [--pg CONNINFO] [--pg-conns N]
 [--idle-ms N] [--head-ms N] [--body-ms N] [--write-ms N] [--pg-query-ms N]
-[--pg-query-max-ms N] [--pg-connect-ms N] [--pg-statement-ms N] [--chunk N]
+[--pg-query-max-ms N] [--pg-connect-ms N] [--pg-statement-ms N] [--drain-ms N] [--chunk N]
 [--fail-every N] [--trace] [--crash-after-recv N] [--crash-after-send N]`;
 the last five are the loop's test settings. Serves on 127.0.0.1:PORT (default
 8083) until SIGTERM or SIGINT, then shuts down gracefully and returns 0
@@ -229,8 +236,8 @@ def main (args : List String) : IO UInt32 := do
     if o.pgConns ≥ 2 ^ 16 || o.pg.contains (Char.ofNat 0) then
       IO.eprintln "--pg-conns must be below 65536 and --pg must hold no NUL"
       return 2
-    if [o.idleMs, o.headMs, o.bodyMs, o.writeMs].any (fun ms => ms == 0 || ms ≥ 2 ^ 32) then
-      IO.eprintln "--idle-ms, --head-ms, --body-ms and --write-ms must be at least 1 and below 4294967296"
+    if [o.idleMs, o.headMs, o.bodyMs, o.writeMs, o.drainMs].any (fun ms => ms == 0 || ms ≥ 2 ^ 32) then
+      IO.eprintln "--idle-ms, --head-ms, --body-ms, --write-ms and --drain-ms must be at least 1 and below 4294967296"
       return 2
     if [o.pgQueryMs, o.pgQueryMaxMs, o.pgConnectMs, o.pgStatementMs].any (fun ms => ms == 0 || ms ≥ 2 ^ 31)
         || o.pgQueryMaxMs < o.pgQueryMs then
@@ -239,7 +246,7 @@ def main (args : List String) : IO UInt32 := do
     let pgConns := if o.pg.isEmpty then 0 else o.pgConns
     return (serve o.port.toUInt16 o.threads.toUInt32 o.maxConns.toUInt32 o.pg pgConns.toUInt32
       o.idleMs.toUInt32 o.headMs.toUInt32 o.bodyMs.toUInt32 o.writeMs.toUInt32
-      o.pgQueryMs.toUInt32 o.pgQueryMaxMs.toUInt32 o.pgConnectMs.toUInt32 o.pgStatementMs.toUInt32 o.chunk.toUSize o.failEvery.toUInt32
+      o.pgQueryMs.toUInt32 o.pgQueryMaxMs.toUInt32 o.pgConnectMs.toUInt32 o.pgStatementMs.toUInt32 o.drainMs.toUInt32 o.chunk.toUSize o.failEvery.toUInt32
       (if o.trace then 1 else 0) o.crashAfterRecv.toUInt32 o.crashAfterSend.toUInt32).toUInt32
 
 end Server.Transport
