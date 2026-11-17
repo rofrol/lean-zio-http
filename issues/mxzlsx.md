@@ -26,3 +26,5 @@ Options: ask upstream with the byte-count reproducer (needs your go and the GitH
 
 Decided by the user 2026-11-17: ask upstream. lgxdi7 prepares the reproducer and the draft; this item then posts it on leanprover/lean4 from the user's gh account and waits for a maintainer's answer, which settles bug (fork path) versus limitation (quote it next to Server/H1Adapter.lean).
 Done by: the coordinating session
+
+Decided by the user 2026-11-17, while lgxdi7 ran: publish it. The coordinating session posts the draft on leanprover/lean4 from the user's gh account as soon as lgxdi7 has written it and the session has read it.
