@@ -1,5 +1,6 @@
 ## Next, in order
 
+askkog Run libpq-lines.sh against the libpq 17+ lines after the chunked-rows change (4lmjda)
 7mzw77 Accept that stale-statement recognition relies on PostgreSQL's undocumented source-function field
 grjqox Move dusty-hello's zio pin to the server's (830564437b2c)
 u4moqo Move the toolchain to the first nightly with lean4 PR 16417 (Std.Http RFC fixes)
@@ -10,7 +11,6 @@ ogcdwm Should the transport tests run on Linux, so the Unix-domain parked-send t
 ## Proposed
 
 q2g4am Act on leanprover/lean4's answers to the Std.Http questions 16522 and 16523
-askkog Run libpq-lines.sh against the libpq 17+ lines after the chunked-rows change (4lmjda)
 
 ## Needs a decision
 
