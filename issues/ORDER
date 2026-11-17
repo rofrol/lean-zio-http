@@ -14,8 +14,6 @@ ogcdwm Should the transport tests run on Linux, so the Unix-domain parked-send t
 
 ## Proposed
 
-q7lol5 Should a query whose connection is lost after it was sent be answered Query.Result.abandoned instead of error 08006?
-
 ## Needs a decision
 
 53rwgc Linux acceptance runs for the Lean HTTP server
