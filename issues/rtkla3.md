@@ -4,3 +4,5 @@ Split from 6gmafg on 2026-11-16 (consult round 20261116-145342-a8e2): a long syn
 Question: Should a synchronous error chain yield to the loop between queries?
 Options: decide after 6gmafg's deterministic evidence | add a scheduling boundary now | keep synchronous chains
 Checked 2026-11-16 with sol (consult round 20261116-145342-a8e2): this choice changes a contract, failure behavior or architecture, so it stays with the user; recommendation first.
+
+Checked 2026-11-17 with sol (consult round 20261117-011832-74e7) under the user's delegation: deferred until 6gmafg's deterministic starvation evidence.
