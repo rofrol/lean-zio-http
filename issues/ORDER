@@ -8,10 +8,9 @@ es53kx Bound the capacity of connection buffers or qualify the memory claim
 tc5rsx Bound the memory of a PostgreSQL result before it is fully received
 u4moqo Move the toolchain to the first nightly with lean4 PR 16417 (Std.Http RFC fixes)
 kvnm3u Decide whether the type, not a comment, should keep the clock out of the adapter's kept state
+sy3ims Decide whether to report upstream that Std.Http's H1 reparses an unfinished line from its start on every call
 
 ## Proposed
-
-sy3ims Decide whether to report upstream that Std.Http's H1 reparses an unfinished line from its start on every call
 
 ## Needs a decision
 
