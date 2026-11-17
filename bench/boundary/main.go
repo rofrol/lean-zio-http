@@ -39,7 +39,7 @@ import (
 // setsockopt(TCP_NODELAY) fails with EINVAL on an accepted socket whose peer
 // reset it before the accept (setsockopt(2): "[EINVAL] The socket has been
 // shut down"; reproduced 2026-11-16), and zio's os/net.zig setsockopt (pinned
-// 9bef33d) logs every errno but NOPROTOOPT as unexpected. serve.zig ignores the
+// 830564437b2c) logs every errno but NOPROTOOPT as unexpected. serve.zig ignores the
 // error and the connection's receive then fails and closes it, which the
 // accounting still checks. Recorded in issues/dqsipn.md.
 const zioShutWarning = "warning(zio): unexpected error: .INVAL (22) - please file a bug report: https://github.com/lalinsky/zio/issues/new"

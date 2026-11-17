@@ -88,7 +88,7 @@ only `Server.Query` values.
   declare. It keeps at most one operation in flight per connection and ends
   the process when a completion finds none outstanding. Reusing a
   connection's completion from its own callback relies on zio's contract
-  (pinned 9bef33d, `src/ev/loop.zig` `finishCompletion`): the completion is
+  (pinned 830564437b2c, `src/ev/loop.zig` `finishCompletion`): the completion is
   marked dead before its callback runs, and for a completion without a group
   owner the callback is the last thing the loop does with it. Each loop
   also owns a PostgreSQL pool (`src/pg.zig`, section "PostgreSQL"). The
@@ -212,23 +212,21 @@ only `Server.Query` values.
   closing loop has acknowledged that the close finished), each loop
   acknowledges a snapshot of its own admission state, so the test sees both acceptors
   pause when the server is full, a connection wait in the listen queue,
-  and the loop whose connection closed re-arm and take it. (4) A stop
-  notify in progress holds the loop's teardown until it returns. The pinned
-  zio's `Async.notify` can let the loop take the stop and end before
-  notify's own wake reaches the loop's poller; if the loop's `deinit` closed
-  the poller first, that wake would fail and the process would panic
-  instead of exiting with status 0. zio documents notify only as
-  thread-safe, so serve.zig keeps a supported-subset contract that is not
-  an upstream guarantee (`StopGate` in `serve.zig`, approved by the owner
-  until upstream answers https://github.com/lalinsky/zio/issues/927; it is
-  rechecked at each zio update): a loop is deinitialized only after every
-  `notify()` on its handles has returned, and no notify starts after its
-  loop's teardown. The signal thread notifies under a per-loop gate and
-  skips a retired loop; the loop's thread retires and deinits its loop
-  under the same gate. The test runs notify's steps one by one inside the
-  gate, lets another event end the loop before the last step, and checks
-  that the teardown waits; without the gate it fails. (5) A loop that ended
-  without a notify is retired by its teardown, and a later notify skips it.
+  and the loop whose connection closed re-arm and take it. (4) The loop
+  does not take its stop while the stop's notifier is still waking it.
+  zio 9bef33d's `Async.notify` could let the loop take the stop, end and
+  close its poller in `deinit` before notify's own wake syscall, which then
+  panicked instead of the process exiting with status 0
+  (https://github.com/lalinsky/zio/issues/927). The pinned zio fixes it
+  (https://github.com/lalinsky/zio/pull/928): notify "is now safe to call
+  at any time while the `Async` itself is alive", so the signal thread
+  calls it plainly; each loop's `stop` lives in `loops`, which is never
+  freed. `notify` has no point a test can pause it at, so the test
+  performs its steps itself, as zio's own test does
+  (`src/ev/test/async_stress.zig`), stops it before its wake syscall, lets
+  a byte wake the loop, and checks that serve's shutdown waits until the
+  notify finishes. With 9bef33d's steps (its `pending` was a plain counter)
+  the loop takes the stop at once and the test fails.
 - **Not yet:** idle, read and write deadlines per connection (a peer can hold
   a connection slot as long as it likes), deadlines for queries, chunked
   request bodies, percent-decoding and query parsing, Go's larger limits.
