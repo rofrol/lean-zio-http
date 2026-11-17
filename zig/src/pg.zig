@@ -14,7 +14,9 @@
 //   `57014` for a query whose deadline passed before it was sent), or the
 //   query abandoned (`Result.abandoned`: `08006` when the connection was
 //   lost after the query was handed to libpq, `57014` when its deadline
-//   passed after that, `54000` when its result crossed
+//   passed after that, unless its answer was already known and only the
+//   Close of its forgotten statement was pending (`Slot.answered`),
+//   `54000` when its result crossed
 //   Query.maxResultBytes; each closes its session, so its outcome is
 //   unknown). A query is never retried: once it may have reached the
 //   server, losing the connection or closing its session fails it.
@@ -158,8 +160,8 @@ pub const Slot = struct {
     flushing: bool = false,
     /// busy: collect returned 2, so `acc` is the query's answer while the
     /// session closes the statement it forgot (pg.c); a connection lost
-    /// from here on ends the session but delivers that answer (a deadline
-    /// still abandons it with 57014, as for any busy query).
+    /// or a deadline passed from here on ends the session but delivers that
+    /// answer (`lost`, `expire`).
     answered: bool = false,
     /// Readability: a receive of one byte with MSG_PEEK, which leaves the
     /// bytes to libpq. zio tries a receive first and parks on its kqueue or
@@ -425,16 +427,23 @@ pub const Slot = struct {
         w.deliver(w, err);
     }
 
-    /// The query's deadline passed while busy: its session is disposed of
-    /// (never reused, no PQcancel) and the query abandoned with `57014`,
-    /// delivered from the pool's `ready` list.
+    /// The query's deadline passed while busy (or the shutdown drain ended):
+    /// its session is disposed of (never reused, no PQcancel) and the query
+    /// abandoned with `57014`, or answered with its own result when that is
+    /// already known (`answered`: only the Close of its forgotten statement
+    /// was pending, which an expiry must not turn into an unknown outcome;
+    /// decided 2026-11-17, item ncvxfx); delivered from the pool's `ready`
+    /// list.
     fn expire(self: *Slot, message: [*:0]const u8) void {
         const w = self.waiter.?;
-        if (self.acc) |a| ekk_query_drop(a);
+        const r = if (self.answered) self.acc else blk: {
+            if (self.acc) |a| ekk_query_drop(a);
+            break :blk ekk_pg_abandoned("57014", message);
+        };
         self.acc = null;
         self.waiter = null;
         self.teardown();
-        self.pool.ready(w, ekk_pg_abandoned("57014", message));
+        self.pool.ready(w, r);
     }
 
     /// The connect's deadline passed: its session ends like a failed one,
@@ -674,8 +683,9 @@ pub const Pool = struct {
 
     /// The deadline timer ended: everything due by the clock now
     /// expires. A queued query is unlinked and answered `57014` (never
-    /// sent); a busy slot's query is abandoned and its session disposed of
-    /// (`Slot.expire`); the connect in flight ends (`Slot.connectExpire`).
+    /// sent); a busy slot's session is disposed of and its query abandoned,
+    /// or answered when its answer is already known (`Slot.expire`); the
+    /// connect in flight ends (`Slot.connectExpire`).
     /// Deliveries run from `dispatch`, after the state is repaired; one a
     /// connect's end makes at once (`failWaiting`) may submit, and that
     /// query waits for the `dispatch` below.
@@ -758,8 +768,9 @@ pub const Pool = struct {
     }
 
     /// The loop's shutdown drain ended: a waiting query is answered
-    /// `error 57014` (never sent), a running one `abandoned 57014` with its
-    /// session closed (`Slot.expire`), the connect in flight ends, and from
+    /// `error 57014` (never sent), a running one `abandoned 57014` (or its
+    /// own answer, when already known) with its session closed
+    /// (`Slot.expire`), the connect in flight ends, and from
     /// now on `submit` answers every query at once, unsent. Every result is
     /// delivered before this returns; a delivery that submits is answered
     /// in the same run of `dispatch`.

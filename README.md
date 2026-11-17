@@ -394,9 +394,11 @@ else meanwhile; the loop serves its other connections (`Conn.step_query`,
   Prepare. Before that query is answered, the forgotten statement is closed
   on the server (a Close with its own Sync, one more round trip), so the
   server holds only the statements the connection caches; a connection
-  whose Close fails, or that is lost during it, is closed and the query
-  answered with its own error (its deadline still abandons it with
-  `57014`, as for any busy query).
+  whose Close fails, or that is lost during it, or whose query's deadline
+  (or the shutdown drain) ends during it, is closed and the query answered
+  with its own error, never replayed: its execution failed without effect,
+  and only the statement's cleanup is uncertain, so it stays an `error`,
+  not `abandoned 57014` (decided 2026-11-17, item ncvxfx).
   Parameters and results are text; one statement per query.
 - **Results and errors.** Every query is answered exactly once: rows (text
   values, `none` for NULL, invalid UTF-8 replaced), PostgreSQL's error with
@@ -473,7 +475,10 @@ else meanwhile; the loop serves its other connections (`Conn.step_query`,
   is answered `abandoned 57014` and its session closed at once with
   PQfinish, without PQcancel: the backend may run on until its
   `statement_timeout` or until it next writes to the closed connection, a
-  write may commit, and the query is never sent again. A connect that ends
+  write may commit, and the query is never sent again. One whose own
+  answer is already known, with only the Close of a forgotten statement
+  pending, is answered with that answer instead and its session closed the
+  same way ("Statements"). A connect that ends
   at its deadline fails the queries waiting with `08006`, as a failed
   connect does. Expiry is judged against the pool's state when the timer's
   callback runs (the waiter still queued, the slot still busy with it, the

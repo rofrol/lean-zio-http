@@ -617,6 +617,51 @@ test "a: a connection lost after collect has the answer (2) delivers that answer
     try fx.deinit();
 }
 
+test "a: a deadline or the drain's end during the Close (2) delivers the known error, not 57014, and closes the session" {
+    // Forced order, no clock race: collect returns 2 (the query's error
+    // known, the Close of its forgotten statement flushed), and the Close's
+    // reply is held, since the fake's collect runs only when the peer sends
+    // a byte and the test sends none. With the slot answered-but-closing,
+    // the query's deadline is made due and the timer's callback run (as the
+    // loop would run it), or the drain ends (`abort`).
+    for ([_]bool{ false, true }) |drain_end| {
+        var fx: Fixture = .{};
+        try fx.initBudgets(1, .{ .query_ms = far, .query_max_ms = far, .connect_ms = far });
+        var w: TestWaiter = .{ .pool = &fx.pool };
+        const peer = try sentAndBusy(&fx, &w, query());
+        const s = slot0(&fx);
+        fake.consume.push(&.{1});
+        fake.flush.push(&.{0});
+        fake.collect.push(&.{2});
+        try poke(peer);
+        try fx.until(&fake, struct {
+            fn f(x: *Fake) bool {
+                return x.count.get(.collect) == 1;
+            }
+        }.f);
+        // The path under test: busy, answered, the Close's reply not in.
+        try std.testing.expect(s.state == .busy and s.answered and s.acc != null);
+        try std.testing.expectEqual(@as(usize, 0), w.n);
+        const mark = fake.calls;
+        if (drain_end) {
+            fx.pool.stop();
+            fx.pool.abort();
+        } else {
+            w.w.deadline = .zero;
+            try std.testing.expect(fx.loop.clearTimer(&fx.pool.timer));
+            fx.pool.timer.c.callback.?(&fx.loop, &fx.pool.timer.c);
+        }
+        try fx.until(&fx, Fixture.allDisconnected);
+        // One delivery, the query's own error; no read, the session ended.
+        try expectKinds(mark, &.{ .deliver, .finish });
+        try std.testing.expectEqual(@as(usize, 1), w.n);
+        try std.testing.expectEqual(.err, w.got[0].kind);
+        try std.testing.expectEqualSlices(u8, "0A000", &w.got[0].sqlstate);
+        try std.testing.expectError(error.Write, poke(peer));
+        try fx.deinit();
+    }
+}
+
 test "a: a query sent while the stale send poll is outstanding uses that poll" {
     var fx: Fixture = .{};
     try fx.init(1);
