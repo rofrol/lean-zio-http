@@ -15,7 +15,10 @@
    field; Result.rows = constructor 0 (columns, rows), Result.error =
    constructor 1 (sqlstate, message). */
 
-/* Query.maxResultBytes in lean/Server/Query.lean. */
+/* Query.maxResultBytes in Server/Query.lean; lsrv-test (Test.lean,
+   resultBoundAgrees) reads the line below and fails when the two differ.
+   It must stay the only line naming the bound with the preprocessor's
+   keyword, its value a plain decimal number. */
 #define EKK_MAX_RESULT_BYTES 1048576
 
 void ekk_query_drop(lean_object *q) { lean_dec(q); }

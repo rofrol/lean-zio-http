@@ -16,7 +16,8 @@ fragments, with the state kept between them, answers as in one call.
 Connection scenarios drive `Conn.step` through partial receives,
 partial sends, the interim response, the shutdown's `refused` and a handler
 that waits for queries. On the corpus `lsrv-bench` measures, both parsers
-consume the same bytes, and its fragmented requests are answered. Exit status
+consume the same bytes, and its fragmented requests are answered. The pool's
+result bound in `zig/src/pg.c` equals `Query.maxResultBytes`. Exit status
 1 when any check fails. -/
 
 open Server
@@ -613,8 +614,42 @@ def responseCapacityScenario : Check Unit := do
             if retainedBytes out != 81920 then
               fail s!"response capacity, {what}, close {close}: a {retainedBytes out}-byte block at the limit, want 81,920"
 
+/-! ## The pool's result bound
+
+`zig/src/pg.c` cannot read a Lean definition, so it states
+`Query.maxResultBytes` again as `EKK_MAX_RESULT_BYTES`, the bound the pool
+enforces. This reads it from the source, relative to the repository's root
+(`check.sh` runs `lsrv-test` there). Every line that mentions both `define`
+and `EKK_MAX_RESULT_BYTES` counts as a definition, so one in another spelling
+(`# define`, a trailing comment, parentheses) or in a comment is not passed
+over; the check fails unless there is exactly one, written
+`#define EKK_MAX_RESULT_BYTES <decimal>`, its value `Query.maxResultBytes`.
+That one line inside a block comment would pass here, but then pg.c, which
+uses the name, does not compile. -/
+
+def pgSource : System.FilePath := "zig/src/pg.c"
+
+def resultBoundAgrees : Check Unit := do
+  let src ← try IO.FS.readFile pgSource
+    catch e => fail s!"result bound: cannot read {pgSource}: {e}"; return
+  let mentions (line word : String) := (line.splitOn word).length > 1
+  let defines := (src.splitOn "\n").filter fun line =>
+    mentions line "define" && mentions line "EKK_MAX_RESULT_BYTES"
+  match defines with
+  | [line] =>
+    match (line.splitToList Char.isWhitespace).filter (· ≠ "") with
+    | ["#define", "EKK_MAX_RESULT_BYTES", v] =>
+      match v.toNat? with
+      | some n =>
+        if n != Query.maxResultBytes then
+          fail s!"result bound: {pgSource} defines EKK_MAX_RESULT_BYTES {n}, Query.maxResultBytes is {Query.maxResultBytes}"
+      | none => fail s!"result bound: {pgSource} defines EKK_MAX_RESULT_BYTES as {v}, not a decimal number"
+    | _ => fail s!"result bound: {pgSource} has `{line.trimAsciiEnd}`, not `#define EKK_MAX_RESULT_BYTES <decimal>`"
+  | ls => fail s!"result bound: {pgSource} has {ls.length} lines defining EKK_MAX_RESULT_BYTES, want 1"
+
 def main : IO UInt32 := do
   let ((), failures) ← (do
+    resultBoundAgrees
     retainedScenario
     responseCapacityScenario
     ownFieldRule

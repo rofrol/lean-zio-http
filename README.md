@@ -609,7 +609,8 @@ also provides libpq; Homebrew `postgresql@18`):
 It builds all parts, runs the Lean tests (`lsrv-test`: both adapters on the
 same requests, limits at their exact boundaries, Host and target
 validation, `100-continue`, the response checks, and connections through
-`Conn.step`), the module boundary check (`lsrv-arch`), a check that `zig/`
+`Conn.step`, and that `zig/src/pg.c`'s result bound equals
+`Query.maxResultBytes`), the module boundary check (`lsrv-arch`), a check that `zig/`
 built for x86_64 Linux at the Lean toolchain's glibc references no libc
 symbol that glibc lacks (and that the same build for glibc 2.41 does), the parser comparison
 (`lsrv-compare`), the boundary tests and the
