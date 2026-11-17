@@ -970,28 +970,48 @@ fn drainUntilWritten(s: *Single, cl: c.fd_t) !void {
 }
 
 test "the shutdown's drain ends with a send waiting in the kernel: the send is canceled, unreported, and the connection closes" {
+    // On a Unix-domain pair whose client never reads, so the parked send
+    // stays in the kernel until the drain ends (see the write deadline's
+    // test of the same kind, "a write deadline that ends while its send
+    // waits in the kernel ..."): on loopback TCP it may become ready on its
+    // own, and the drain would then find nothing to cancel.
     var s: Single = undefined;
-    try s.init(64);
+    try s.initOn(64, .unix);
     defer s.deinit();
-    const cl = try requestResponse(&s, response_len);
+    respond_on_open = response_len;
+    const cl = try s.listener.connect();
+    // Closed before `s.deinit` runs (defers run last first): should a check
+    // below fail with the send still parked, the close ends it.
     defer _ = c.close(cl);
+    awaitReadable(s.listener.fd);
+    try s.stepUntil(.open, 1);
+    // The readiness poll in flight is the event that the send waits in the
+    // kernel (serve.zig starts it only beside a parked send, `sendParked`).
     try stepUntilPolling(&s);
+    const conn = s.lp.head.?;
     s.lp.stop.notify();
     var step: usize = 0;
     while (stops == 0) : (step += 1) {
         if (step == max_steps) return error.StopNeverRan;
         try s.lp.loop.poll(.zero);
     }
-    // The send goes on after the stop, under the drain.
+    // The send goes on after the stop, under the drain, still in the kernel.
     try std.testing.expect(s.lp.drain_armed);
-    try std.testing.expect(s.lp.head.?.cur.?.kind == .send);
+    try spyOnSendCompletion(conn);
+    try std.testing.expect(!writableNow(conn.fd));
     s.lp.loop.setTimer(&s.lp.drain, .{ .duration = .zero });
     try s.stepUntil(.free, 1);
     try expectLog(&s, &.{
         .{ .kind = .open },
-        .{ .kind = .recv, .n = 1, .byte = 'R' },
         .{ .kind = .free },
     });
+    // The drain's end canceled the send: its one completion carried
+    // error.Canceled, to the closing connection, and wrote nothing.
+    try std.testing.expectEqual(@as(u32, 1), spied.calls);
+    try std.testing.expect(spied.closing);
+    try std.testing.expect(spied.canceled);
+    try std.testing.expect(!spied.failed);
+    try std.testing.expectEqual(@as(usize, 0), spied.wrote);
     try s.finish();
 }
 
@@ -1341,9 +1361,8 @@ fn sendSpy(loop: *ev.Loop, comp: *ev.Completion) void {
     spied_callback.?(loop, comp);
 }
 
-/// Puts `sendSpy` in front of the callback of the parked send in flight,
-/// and `timerSpy` in front of the write deadline's.
-fn spyOnSend(conn: *serve.Conn) !void {
+/// Puts `sendSpy` in front of the callback of the parked send in flight.
+fn spyOnSendCompletion(conn: *serve.Conn) !void {
     try expectParkedSend(conn);
     const comp = &conn.cur.?.comp.send.c;
     spied = .{};
@@ -1351,6 +1370,12 @@ fn spyOnSend(conn: *serve.Conn) !void {
     spied_send = comp;
     spied_callback = comp.callback;
     comp.callback = sendSpy;
+}
+
+/// `spyOnSendCompletion`, and `timerSpy` in front of the write deadline's
+/// callback.
+fn spyOnSend(conn: *serve.Conn) !void {
+    try spyOnSendCompletion(conn);
     const timer = &conn.arm.?.timer.c;
     spied_timer_callback = timer.callback;
     timer.callback = timerSpy;
