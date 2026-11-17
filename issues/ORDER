@@ -2,6 +2,7 @@
 
 5lkloz Test a connection whose close completes before a retired timer's callback
 ub3d5m Make a failed transport test leave no state that fails the tests after it
+se4hhx Should a transport test force a send that stays in the kernel when its write deadline expires?
 ycpzlt Should Server.Query carry a structured "outcome unknown" signal for a query the server abandoned?
 3jnkx5 Deadlines for PostgreSQL queries, connection attempts and shutdown in the Lean server
 lgxdi7 Prepare the upstream question for mxzlsx (Std.Http H1 reparses an unfinished field line)
@@ -14,8 +15,6 @@ u4moqo Move the toolchain to the first nightly with lean4 PR 16417 (Std.Http RFC
 3gvmy3 Should the transport check mechanically that every loop callback runs on its own loop?
 
 ## Proposed
-
-se4hhx Should a transport test force a send that stays in the kernel when its write deadline expires?
 
 ## Needs a decision
 
