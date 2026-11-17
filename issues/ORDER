@@ -1,6 +1,5 @@
 ## Next, in order
 
-cxhvkb Where an item's time goes: bench.sh's load measurements, not the cold build
 daaqgn Keep the H1 parser's state across receives instead of reparsing the whole buffer
 i35sos Invalidate the per-connection statement cache after a schema change
 i2rh6f Behavior of the PostgreSQL pool while the database is down
@@ -9,6 +8,9 @@ tc5rsx Bound the memory of a PostgreSQL result before it is fully received
 u4moqo Move the toolchain to the first nightly with lean4 PR 16417 (Std.Http RFC fixes)
 
 ## Proposed
+
+6zs4mr check.sh still takes about nine minutes: lsrv-bench, not the load measurements, holds most of it
+p5pyti The servers exit silently when their port is taken, and the checks share 127.0.0.1:8083 with ekklesiai.org's
 
 ## Needs a decision
 
