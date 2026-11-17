@@ -7,3 +7,5 @@ Seen in aazqxm bench.sh (2026-11-16): lean-db's p99 at 64 connections is 3.6 ms 
 Question: Should the PostgreSQL pools stay per loop, steer accepts by pool load, or become one shared pool with cross-loop handoff?
 Options: keep per-loop pools until imbalance evidence from the Linux runs | steer accepts by pool load | a shared pool with cross-loop handoff
 Checked 2026-11-16 with sol (consult round 20261116-145342-a8e2): this choice changes a contract, failure behavior or architecture, so it stays with the user; recommendation first.
+
+Checked 2026-11-17 with sol (consult round 20261117-011832-74e7) under the user's delegation: deferred: keep per-loop pools until Linux runs (53rwgc) correlate per-loop queueing, occupied slots and latency; aggregate p99 alone does not show imbalance.
