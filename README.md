@@ -897,8 +897,9 @@ split, since the buffer never exceeds `inCap`.
 ## Running
 
 Run everything (macOS or Linux; needs the Lean toolchain from
-`lean-toolchain`, Zig 0.17, Go and PostgreSQL with `pg_config`, which
-also provides libpq; Homebrew `postgresql@18`):
+`lean-toolchain`, Zig 0.17, Go, PostgreSQL with `pg_config`, which
+also provides libpq (Homebrew `postgresql@18`), and `bc`, without which
+`bench.sh` stops at its start):
 
 ```sh
 ./bench.sh
@@ -989,6 +990,22 @@ qualification: x86_64, kernel 6.12 and Debian 13's own kernel are not
 covered by an OrbStack run; the suite's run on the deployed server's own
 host is in "HttpArena on the VPS". Its last recorded result is in
 `zig/src/serve_test.zig`'s header.
+
+`./bench.sh` runs in the same image (item rqc3ql: it has `bc`, which
+`bench.sh` needs for the CPU per request and lean's share of Go).
+`./linux-check.sh` runs only `./check.sh`; to measure in the container,
+build the image and run `./bench.sh` on a copy of the tree, as
+`linux-check.sh` does (epoll, the build's default; the measurements are of
+the container on this machine, comparable only with each other):
+
+```sh
+docker build -t lsrv-linux-check linux
+git ls-files -z --cached --others --exclude-standard |
+  COPYFILE_DISABLE=1 tar --null -T - -cf /tmp/lsrv-tree.tar
+docker run --rm -v lsrv-linux-cache:/home/check/.cache \
+  -v /tmp/lsrv-tree.tar:/tree.tar:ro lsrv-linux-check sh -c \
+  'mkdir src && tar --warning=no-unknown-keyword -xf /tree.tar -C src && cd src && ./bench.sh'
+```
 
 `bench/boundary` starts the fixture server (`lsrv-fixture`, and
 `lsrv-fixture-hand` with `-no-continue`) with the test settings and checks:

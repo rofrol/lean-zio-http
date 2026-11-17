@@ -12,6 +12,9 @@
 # Any failing test, check or load run stops the script with a nonzero status.
 set -eu
 cd "$(dirname "$0")"
+# The CPU per request and lean's share of Go are computed with bc; without
+# it they would print empty, so stop before the long run instead.
+command -v bc >/dev/null || { echo "bench.sh needs bc (CPU per request, lean-db/go-db): install it"; exit 1; }
 ./check.sh
 . bench/lib.sh
 # Built by check.sh's lake build.

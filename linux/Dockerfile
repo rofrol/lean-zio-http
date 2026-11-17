@@ -1,5 +1,6 @@
 # The Linux validation host (item ogcdwm): Debian trixie with the tools
-# ./check.sh needs. Pinned by version and SHA-256: Zig (the version the macOS
+# ./check.sh and ../bench.sh need (bc: bench.sh's CPU per request and
+# lean's share of Go; item rqc3ql). Pinned by version and SHA-256: Zig (the version the macOS
 # runs use), the Lean toolchain named by lean-toolchain and Go
 # (bench/*/go.mod). The base image is pinned by its digest (item zg4hrz).
 # PostgreSQL 17 (libpq and the server for the private cluster) comes from
@@ -18,7 +19,7 @@
 FROM debian:trixie@sha256:9c6e381421d0f48d1b8133e573f33c185ee16cbf505eda9c4a8a4791b25ea8a6
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      ca-certificates curl xz-utils zstd git \
+      ca-certificates curl xz-utils zstd git bc \
       libpq-dev postgresql-17 postgresql-client-17 \
     && rm -rf /var/lib/apt/lists/*
 
