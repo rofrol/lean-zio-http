@@ -10,3 +10,5 @@ Options:
 3. Accept the cost and record it.
 
 Recommendation: 1 then 2, as a separate item after the accept fix.
+
+Considered 2026-11-17 by the coordinating session with sol (consult call 36443c1b): later, after the accept fix and measurements under the corrected load. Profile first. Pursue upstream parser fixes, or feeding H1 a slice within its documented contract, only where the evidence warrants.
