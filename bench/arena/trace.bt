@@ -1,0 +1,51 @@
+// bench/arena/local-inner.sh runs this beside each sample (item 6p6tu6;
+// README, "The over-5 s tail: connections accepted late"). $1: the server's
+// process name, of which the first 6 characters are compared; $2: the inode
+// of the sample's network namespace (the kernel probes see every namespace).
+//
+// Accept delay of each server-side connection on port 8080: from the
+// handshake's completion (the child socket going SYN_RECV -> ESTABLISHED) to
+// accept(2) returning it (inet_csk_accept). A connection still unaccepted
+// when the trace ends is counted in @established and not in @accepted; one
+// closed before its accept is forgotten, so its address cannot match a later
+// socket.
+//
+// The acknowledgement that every probe is attached: the first connection
+// seen both established and accepted, after a system call of the server's,
+// prints "ready" and is not counted (local-inner.sh makes it with curl).
+tracepoint:sock:inet_sock_set_state
+/((struct sock *)args->skaddr)->__sk_common.skc_net.net->ns.inum == $2/
+{
+  if (args->sport == 8080 && args->oldstate == 3 && args->newstate == 1) {
+    @est[(uint64)args->skaddr] = nsecs;
+    if (@ready) { @established = count(); }
+  }
+  if (args->newstate == 7 && @est[(uint64)args->skaddr] != 0) {
+    delete(@est[(uint64)args->skaddr]);
+  }
+}
+kretprobe:inet_csk_accept
+/retval && @est[(uint64)retval] != 0/
+{
+  if (@ready) {
+    $d = (nsecs - @est[(uint64)retval]) / 1000000;
+    @accept_ms = hist($d);
+    @accepted = count();
+    if ($d > 1000) { @over_1s = count(); }
+    if ($d > 5000) { @over_5s = count(); }
+    @max_ms = max($d);
+  } else if (@sys_seen) {
+    @ready = 1;
+    printf("ready\n");
+  }
+  delete(@est[(uint64)retval]);
+}
+// The server's system calls by number (Linux arm64 numbering: 63 read,
+// 64 write, 206 sendto, 207 recvfrom, 242 accept4, 441 epoll_pwait2).
+tracepoint:raw_syscalls:sys_enter
+/strncmp(comm, str($1), 6) == 0/
+{
+  @sys_seen = 1;
+  if (@ready) { @sys[args->id] = count(); }
+}
+END { clear(@est); clear(@ready); clear(@sys_seen); }
