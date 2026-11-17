@@ -6,11 +6,11 @@ im7c5q Should dusty-hello give dusty the real zio module instead of its stub?
 zg4hrz Pin the Linux validation container's base image and packages
 rqc3ql Install bc in the Linux validation image, so bench.sh reports CPU per request there
 qgrnr3 Backend-independent tests of the transport's completion, cancel and expiry orderings
+faahn4 Decide how to settle zio's undocumented setTimer from a timer's own callback
 
 ## Proposed
 
 q2g4am Act on leanprover/lean4's answers to the Std.Http questions 16522 and 16523
-faahn4 Decide how to settle zio's undocumented setTimer from a timer's own callback
 
 ## Needs a decision
 
