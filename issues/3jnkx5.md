@@ -20,3 +20,5 @@ Submission, completion, connect failure and expiry are pool events with operatio
 Shutdown stops admission, closes idle connections and lets admitted work finish within its budgets and ytzycm's 10 s drain; when the drain expires, everything still open is disposed of.
 After that, revisit bx6zh5: a failed connect may keep its waiters only while healthy busy sessions exist, and only up to those waiters' own deadlines.
 Order of commits: pool deadlines and session disposal with database integration tests, then shutdown, then the waiter change.
+
+Also, from qyqvew (decided 2026-11-17 by the coordinating session with sol, consult round 20261117-113634-6679, under the user's delegation): while a request waits for its query, a pipelined head's budget starts only when the response's write starts, so it starts late by at most the query's duration. Once the query deadline lands, update README "Deadlines" to say the query deadline bounds that lateness, and that this is not an absolute deadline from the head's first byte on the wire.
