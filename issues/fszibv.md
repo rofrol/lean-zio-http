@@ -1,5 +1,0 @@
-Explain the drop of bench.sh's lean-db/go-db ratio below its goal
-
-Seen in uebwlv's gate (job log of rr2-uebwlv, integrated at d3cefd8): `./bench.sh` printed "lean-db/go-db c=1 .74 c=64 .83 (goal: at least 0.9)". In 3jnkx5's gate one item earlier (integrated at 750d4b5), the same line read c=1 0.92, c=64 1.11. uebwlv changed only zig/src/serve_test.zig, so either the measurement is noisy on this shared Mac or 3jnkx5's pool changes (one pool timer, statement_timeout in the startup options, the deadline bookkeeping) cost throughput that one run hid. bench.sh still exits 0 below the goal.
-
-Work: measure the ratio at 750d4b5's parent (before 3jnkx5) and at main, five runs each, interleaved, and report the spread. If main is lower beyond the spread, find the cause in 3jnkx5's commits (4fb22cc, c7afffb, f37e961) with a profile and fix it under that item's design, or file a Needs-a-decision item if the fix would change a decided deadline. If the difference is within the spread, record the spread next to the goal in README and say whether bench.sh should fail below the goal; a change to bench.sh's verdict goes to Needs a decision.
