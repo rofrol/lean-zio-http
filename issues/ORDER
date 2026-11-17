@@ -21,3 +21,4 @@ rtkla3 Whether a handler's synchronous PostgreSQL error chain needs a scheduling
 kaslrv Run the worst-case memory scenario on Linux
 3pund6 Decide what follows from the classification of Linux pending-connection accept errnos (xihdtw)
 7mzw77 Accept that stale-statement recognition relies on PostgreSQL's undocumented source-function field
+ycpzlt Should Server.Query carry a structured "outcome unknown" signal for a query the server abandoned?
