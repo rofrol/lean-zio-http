@@ -1,6 +1,5 @@
 ## Next, in order
 
-2kaoxd Move zio to the commit that fixes issue 927 and retire the StopGate subset contract
 ytzycm Per-connection idle, read and write deadlines for the Lean HTTP server
 ycpzlt Should Server.Query carry a structured "outcome unknown" signal for a query the server abandoned?
 3jnkx5 Deadlines for PostgreSQL queries, connection attempts and shutdown in the Lean server
