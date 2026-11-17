@@ -7,3 +7,5 @@ Seen in aazqxm: with the database stopped, every query starts a fresh connection
 Question: While the database is down, keep connect-per-query, or coalesce so one connect attempt in flight serves all waiters (and what each waiter gets)?
 Options: coalesce, with waiter outcomes decided explicitly | keep connect-per-query and document it
 Checked 2026-11-16 with sol (consult round 20261116-145342-a8e2): this choice changes a contract, failure behavior or architecture, so it stays with the user; recommendation first.
+
+Decided 2026-11-17 by the coordinating session with sol (consult round 20261117-011832-74e7), under the user's delegation of the same day to decide the open questions with sol: coalesce connection establishment per loop: one attempt in flight, existing waiters bounded; on failure each of those waiters completes once with 503, on success they go through normal pool admission. A later request may start a new attempt. No query replay, no reconnect loop, no timer. Document that this bounds concurrent attempts, not the sustained attempt rate.
