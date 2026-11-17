@@ -4,3 +4,5 @@ Seen in item cxhvkb (2026-11-17): the first `./check.sh` run failed all 11 `benc
 
 Question: How should a check that cannot get its port fail, and should lean-zio-http's checks stop sharing fixed ports with other repositories' checks run concurrently by rr2?
 Options: print the bind/listen error (errno and address) before exiting 1, keeping fixed ports | that, plus checks that bind port 0 and read the chosen port from the server's ready line | that, plus rr2 serialising runs that use the same ports across repositories
+
+Decided 2026-11-17 by the coordinating session with sol (consult round from call a7c4f2f4), under the user's delegation of the same day: print the bind/listen error (errno and address) to stderr before exiting nonzero; test servers bind port 0 and announce the assigned address on a ready line written after listen succeeds; this repository's check and benchmark clients read that address instead of assuming 8083; normal serving defaults unchanged. Test with an occupied port and concurrent runs; no sleeps or retries. Not serializing rr2 across repositories; ekklesiai.org's side goes through its own queue.
