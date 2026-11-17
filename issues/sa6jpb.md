@@ -5,3 +5,5 @@ Question: Should the interim 100 Continue also carry the own fields?
 Options: no, final responses only, as implemented (record the reading in ekklesiai.org's DECISIONS.md, "Search engine indexing") | yes, write them on 100 Continue too (`continueBytes` becomes a function of `own`)
 
 Recommendation (consult round 20261116-183449-f682, sol, under the user's delegation of 2026-11-16): keep today's behavior (final responses only) pending ekklesiai.org's confirmation; it is not recorded as settled.
+
+Checked 2026-11-17 with sol (consult round 20261117-011832-74e7) under the user's delegation: stays with the user: the consumer's confirmation and its decision record are in ekklesiai.org. Final responses only, as implemented, meanwhile.
