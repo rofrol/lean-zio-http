@@ -1,6 +1,5 @@
 ## Next, in order
 
-znorfg Should the transport tests' cleanup and leak report get a committed check of their own?
 53rwgc Linux acceptance runs for the Lean HTTP server
 ogcdwm Should the transport tests run on Linux, so the Unix-domain parked-send test is checked on epoll and io_uring?
 ncvxfx Should a query whose deadline expires during the statement Close keep its known error?
