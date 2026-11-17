@@ -661,7 +661,7 @@ example : Response.ownFieldsValid #[("Content-Type", "text/html")] = false := by
 
 The bound README "Memory" derives for what `H1Adapter.Parser` holds while a
 request is incomplete, by part, in bytes of allocator blocks (toolchain
-nightly-2026-11-14, mimalloc 3.4.5 `mi_good_size`), and the check that the
+nightly-2026-11-17, mimalloc 3.4.5 `mi_good_size`), and the check that the
 blocks the state actually holds stay within each part on requests that drive
 each part to its largest. -/
 

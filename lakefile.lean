@@ -56,7 +56,7 @@ Linux with that glibc. Zig's std calls a libc function only when the target's
 glibc has it, so the archive then references no symbol the linker Lean runs
 cannot resolve; with the host's newer glibc it references `copy_file_range`,
 `statx`, `execveat` and `arc4random_buf`, which glibc 2.26 (Lean's
-nightly-2026-11-14) lacks (issue 4n7czb). Lean's toolchain copies glibc's
+nightly-2026-11-17) lacks (issue 4n7czb). Lean's toolchain copies glibc's
 `libc-<version>.so` to `lib/glibc/libc.so`, dropping the version from the name
 (`script/prepare-llvm-linux.sh` in leanprover/lean4), so the version is read
 from the version names the library defines. -/

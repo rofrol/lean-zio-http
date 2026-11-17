@@ -613,7 +613,10 @@ holds at most `inCap` = 16,388 bytes and a response being sent at most
 
 **Allocations** (derived; toolchain nightly-2026-11-14, its runtime at
 lean4 commit 62e0cf0, mimalloc 3.4.5; a block size is what the toolchain's
-`mi_good_size` returns for the object, on the M1):
+`mi_good_size` returns for the object, on the M1). Rechecked for
+nightly-2026-11-17 (lean4 commit 55069db, item u4moqo): `src/runtime/object.cpp`,
+`object.h`, `alloc.cpp` and `lean.h` are unchanged, mimalloc is still 3.4.5,
+and `lsrv-test` measures the same bytes for every retained-state case:
 
 - The loop's connection: a 16,712-byte `Conn` (`@sizeOf`, Zig 0.17.1) from
   `std.heap.c_allocator` (`zig/src/serve.zig`), a 20,480-byte malloc block
@@ -930,7 +933,11 @@ below are under its `src/lean/Std/Http/`. Numbers from one `bench.sh` run on
 the M1 (2026-11-16). Written before the module split: `Http.lean` is now
 `Server/HandParser.lean`, `H1Adapter.lean` is `Server/H1Adapter.lean`,
 `lsrv-h1` is now `lsrv` and the old `lsrv` is `lsrv-hand`; the adapter has
-since started answering `Expect: 100-continue` (above).
+since started answering `Expect: 100-continue` (above). Line numbers are at
+nightly-2026-11-14. The verdicts in "Where the verdicts differ" are at
+nightly-2026-11-17 (item u4moqo), the first nightly with
+https://github.com/leanprover/lean4/pull/16417; what that changed is listed
+there.
 
 ### Does H1 run without Std.Async and fit `Conn.step`?
 
@@ -955,7 +962,7 @@ What H1 accepts and rejects that matters here: limits are separate for the
 start line (`maxStartLineLength`, 414 at 1750; `maxUriLength`,
 `Protocol/H1/Parser.lean:248`), the header block (`maxHeaders`,
 `maxHeaderBytes`, 431 at 1821-1830) and each name and value (`maxHeaderNameLength`
-256, `maxHeaderValueLength`, 400); there is no limit on the whole head as in
+256, `maxHeaderValueLength`, 400; 431 since nightly-2026-11-17); there is no limit on the whole head as in
 `Http.parse`. Methods must be registered IANA names, case-sensitive, else 501
 (`Parser.lean:235`); HTTP/1.x with x > 1 is read as 1.1 and other versions get
 505 (`Parser.lean:303`, `H1.lean:1759`); the target must be valid URI syntax
@@ -1023,29 +1030,47 @@ bytes; a request line of 8,193 bytes is 431 and 414 (RFC 9112 §3: a server
 "SHOULD respond with a 414"; both close).
 
 Malformed input: 61 templates on 40 requests each (2,440, of which 732
-differ) and 30,000 single-byte edits (2,732 differ). Every disagreement,
-grouped (an edit at a field's CRLF is counted with the value it ends):
+differ) and 30,000 single-byte edits (2,701 differ; 2,732 at
+nightly-2026-11-14). Every disagreement, grouped (an edit at a field's CRLF is
+counted with the value it ends):
 
 | input | hand-written | H1 | cases | what decides it |
 |---|---|---|---:|---|
 | Host value not a valid host (`a b`, `a@b`, `a:99999`, edited bytes, `::`) | ok | 400 | 971 | RFC 9112 §3.2: a server MUST answer 400 to a Host field with an invalid value. H1 conforms; the hand-written parser does not check Host syntax. |
 | bare CR or bare LF in the head (CR or LF deleted, a byte inserted between them) | need-more until the buffer is full, then close without a response | 400 | 677 | RFC 9112 §2.2: a bare CR MUST be treated as invalid or replaced by SP; a lone LF MAY be accepted. Both conform; H1 answers at once. |
-| method not a registered name (`BREW`, `get`, edited bytes) | ok (404), or 400 when the edit puts SP in it | 501 | 477 | RFC 9110 §9.1: methods are case-sensitive; an unrecognized one SHOULD get 501. H1 follows the SHOULD; the hand-written parser accepts any token and routes it to 404. |
+| method not a registered name (`BREW`, `get`, edited bytes) | ok (404), or 400 (7 cases) | 501 | 453 | RFC 9110 §9.1: methods are case-sensitive; an unrecognized one SHOULD get 501. H1 follows the SHOULD; the hand-written parser accepts any token and routes it to 404. |
 | target not URI syntax (`/a#f`, `/a%zz`, `a`, non-ASCII byte, `/` deleted, edited bytes) | ok | 400 | 503 | RFC 9112 §3.2 (origin-form is an absolute path, no fragment) and §3: an invalid request line SHOULD get 400. H1 follows it. |
 | `GET *`, `CONNECT a:443` with another Host | ok | 400 | 68 | RFC 9112 §3.2.4 (`*` only for OPTIONS), §3.2.3 and RFC 9110 §9.3.6 (authority-form only for CONNECT). H1 conforms. |
-| header name over 256 bytes | ok | 400 | 40 | RFC 9110 §5.4: a server MAY reject a field it finds too large with a 4xx (431, RFC 6585 §5). Both conform; H1's `maxHeaderNameLength` is fixed at 256 here. |
+| header name over 256 bytes | ok | 431 | 40 | RFC 9110 §5.4: a server MAY reject a field it finds too large with a 4xx (431, RFC 6585 §5). Both conform; H1's `maxHeaderNameLength` is fixed at 256 here. |
 | Connection value not a list of tokens (`close;x`, `% keep-alive`, `,` deleted) | keep alive unless it finds `close` | close | 350 | RFC 9110 §7.6.1 defines no handling of an invalid value; closing is the safer reading. |
 | Transfer-Encoding with Content-Length, or not ending in `chunked`, or empty | 501 | 400 | 187 | RFC 9112 §6.1: TE with CL "ought to be handled as an error" and the connection closed; a coding the server does not understand SHOULD get 501. H1's 400 for codings that cannot frame the body follows §6.3 (3); either status is defensible. |
 | Content-Length `99999999999` | 400 | 413 | 22 | RFC 9110 §8.6 (a valid number) and §15.5.14: a body over the limit gets 413; the hand-written parser rejects more than 10 digits as invalid. Both close. |
 | HTTP/0.9, HTTP/2.0, HTTP/0.1, HTTP/9.0 | 400 | 505 | 86 | RFC 9110 §15.6.6: 505 for an unsupported major version. H1 is more precise. |
 | HTTP/1.2, HTTP/1.9 | 400 | ok, as 1.1 | 41 | RFC 9110 §6.2: a recipient SHOULD process a higher minor version as the highest it supports. H1 conforms. |
 | empty line before the request line | 400 | ok | 35 | RFC 9112 §2.2: a server SHOULD ignore at least one empty line before the request line. H1 conforms. |
-| no SP between target and version (`GET /xHTTP/1.1`, CR or DEL in its place) | 400 | need-more | 7 | RFC 9112 §3: an invalid request line SHOULD get 400. H1 reads the target up to the next SP (`Parser.lean:249`), so it waits for more bytes and answers 414 only after 8,192; the hand-written parser conforms. |
 
-In short, H1 is stricter and closer to RFC 9112 and 9110 in every group but
-the last, where it is slower to reject a malformed request line. Neither
-parser accepted anything the other framed differently: no request was
+In short, H1 rejects more malformed input, follows RFC 9112 and 9110 at least
+as closely in every group, and no longer waits for more bytes where the
+hand-written parser rejects. Neither parser accepted anything the other framed differently: no request was
 consumed with a different length or body by the two.
+
+What https://github.com/leanprover/lean4/pull/16417 (merged as
+13921a64bf71, first in nightly-2026-11-17) changed in these verdicts, from
+`lsrv-compare` on the same commit of this repository under both toolchains
+(item u4moqo); the valid requests and the limits at their boundaries give the
+same results under both:
+
+- No SP between target and version (`GET /xHTTP/1.1`, CR or DEL in its
+  place, 7 cases): H1 answered need-more, reading the target up to the next SP
+  and answering 414 only after 8,192 bytes
+  (https://github.com/leanprover/lean4/issues/16479, filed from D1's option
+  2); it now answers 400 as the hand-written parser does. No case is left
+  where H1 waits for more bytes and the hand-written parser rejects.
+- SP inserted in or replacing a byte of the method (24 cases): H1 answered
+  501; it now answers 400 as the hand-written parser does (RFC 9112 §3: an
+  invalid request line).
+- A header name over 256 bytes (40 cases): H1 answered 400; it now answers
+  431, as for a value over `maxHeaderValueLength`.
 
 ### Proposal for D1 (decided: D1 in the decision record)
 

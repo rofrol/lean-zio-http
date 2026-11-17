@@ -13,10 +13,10 @@ The machine lives on the connection while a request is incomplete
 (`Parser`, the adapter's state in `Server.Adapter`): each call `feed`s only the
 bytes received since the last one, then runs `processRead` (start line and
 header block) and `pullBody` until the body is complete (a server-side machine
-leaves the body to the caller, H1.lean:1861). So a request arriving in many
+leaves the body to the caller, H1.lean:1928). So a request arriving in many
 receives is parsed once, not again from its start on every receive; what H1
 itself parses again is the line it is in the middle of (`parseWith` leaves
-its input where it was on a line that has not ended, H1.lean:646), so the
+its input where it was on a line that has not ended, H1.lean:653), so the
 cost of a request in 1-byte receives still grows with the square of its
 longest line. Each request starts from a fresh machine (`Parser.init`). The
 machine's own writer is not used: `Server.Response` writes the bytes.
@@ -43,8 +43,8 @@ open Std.Http Std.Http.Protocol
 /-- The limits of `Server.Wire` mapped onto H1's. H1 bounds the start line and
 the header block separately (Config.lean), where the connection bounds the
 whole buffer by `inCap`; `maxHeaderValueLength` is the whole buffer, so that a
-complete head over the limit gets 431 from the aggregate `maxHeaderBytes`
-check (H1.lean:1828) rather than 400 from a value cut off at its own limit.
+complete head over the limit is bounded by the aggregate `maxHeaderBytes`
+check alone (H1.lean:1852, 431).
 H1 maps the request-target's count limits (path segments, query parameters) to
 `maxUriLength` as well (`requestTargetConfig`), so a target may parse into an
 element per byte, which the adapter keeps until the request completes. -/
@@ -57,7 +57,7 @@ def config : H1.Config :=
     maxBodySize := maxBodyBytes }
 
 /-- The status H1's own server answers each error with: a copy of the private
-`errorResponseStatus` (H1.lean:1502). -/
+`errorResponseStatus` (H1.lean:1512). -/
 def errorStatus : H1.Error → Nat
   | .unsupportedVersion => 505
   | .unsupportedTransferCoding => 501
