@@ -1,5 +1,6 @@
 ## Next, in order
 
+6p6tu6 Find why pipelined requests cost the Lean server about 32 µs of CPU each and leave responses waiting over 5 s
 ncvxfx Should a query whose deadline expires during the statement Close keep its known error?
 im7c5q Should dusty-hello give dusty the real zio module instead of its stub?
 zg4hrz Pin the Linux validation container's base image and packages
@@ -9,7 +10,6 @@ faahn4 Decide how to settle zio's undocumented setTimer from a timer's own callb
 
 ## Proposed
 
-6p6tu6 Find why pipelined requests cost the Lean server about 32 µs of CPU each and leave responses waiting over 5 s
 q2g4am Act on leanprover/lean4's answers to the Std.Http questions 16522 and 16523
 5f54l4 Should H1Adapter decode chunked request bodies, so HttpArena's baseline and limited-conn run with their whole request mix?
 
