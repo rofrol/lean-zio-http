@@ -47,16 +47,18 @@ and that the queue items about the server move here:
 ## Verification
 
 `./bench.sh` (README, "Running"): builds everything, runs `lsrv-test`,
-`lsrv-arch`, `lsrv-compare`, `lsrv-bench`, the PostgreSQL pool's and the
+`lsrv-arch`, `lsrv-compare`, the PostgreSQL pool's and the
 transport's tests (`zig build test` in `zig/`, README "PostgreSQL" and
 "Production contract"), the Zig/Lean boundary tests, the
 end-to-end checks against both parsers, the database checks on a private
-PostgreSQL cluster, and the load measurements. Any failure stops it with a
+PostgreSQL cluster, and the measurements (`lsrv-bench`, then the load
+runs). Any failure stops it with a
 nonzero status. It takes several minutes: run it as a visible job.
 Measurements are comparative and machine-dependent; a pass/fail verdict comes
 only from the tests and checks.
 
-`./check.sh` runs the same builds, tests and checks without the load
-measurements; `./bench.sh` runs it first. Use `./check.sh` while editing;
+`./check.sh` runs the same builds, tests and checks without the
+measurements; `./bench.sh` runs it first. `lsrv-bench` only measures; the
+correctness of what it measures is checked in `lsrv-test` (item 6zs4mr). Use `./check.sh` while editing;
 the whole `./bench.sh` stays every item's gate before it ends (decided
 2026-11-17, item cxhvkb).

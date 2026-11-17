@@ -5,7 +5,8 @@
 # PostgreSQL pool's and the transport's tests (zig build test, which need no
 # database), a check that zig/ built for Linux at the Lean toolchain's glibc
 # calls nothing that glibc lacks, the module boundary check (lsrv-arch), the
-# parsers' comparison and cost (lsrv-compare, lsrv-bench), the Zig/Lean
+# parsers' comparison (lsrv-compare; lsrv-test checks the corpus lsrv-bench
+# measures, and bench.sh runs lsrv-bench), the Zig/Lean
 # boundary tests (bench/boundary, which start the fixture servers themselves)
 # and the end-to-end checks against the Lean server, each twice: with the
 # toolchain's Std.Http.Protocol.H1 behind Server.H1Adapter (lsrv, decision
@@ -95,7 +96,6 @@ fi
 .lake/build/bin/lsrv-compare >"$tmp/compare.txt" || { cat "$tmp/compare.txt"; exit 1; }
 sed -n '1,/^## Malformed/p' "$tmp/compare.txt"
 grep -E '^[0-9]+ requests: [0-9]+ verdicts' "$tmp/compare.txt"
-.lake/build/bin/lsrv-bench
 bench/boundary/boundary
 bench/boundary/boundary -no-continue -fixture .lake/build/bin/lsrv-fixture-hand
 # A port another process holds (here a running lsrv's): a server asked for it

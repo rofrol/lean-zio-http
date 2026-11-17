@@ -476,8 +476,10 @@ validation, `100-continue`, the response checks, and connections through
 `Conn.step`), the module boundary check (`lsrv-arch`), a check that `zig/`
 built for x86_64 Linux at the Lean toolchain's glibc references no libc
 symbol that glibc lacks (and that the same build for glibc 2.41 does), the parser comparison
-and benchmark (`lsrv-compare`, `lsrv-bench`), the boundary tests and the
-end-to-end checks (the last two against both parsers), then measures each
+(`lsrv-compare`), the boundary tests and the
+end-to-end checks (the last two against both parsers), then measures both
+parsers' cost per request in isolation (`lsrv-bench`, which prints each row
+as it is measured) and each
 server at 1, 64 and 256 connections for 10 s, printing requests per second,
 latency percentiles and server CPU time per request; the Lean servers must
 then stop gracefully on SIGTERM. Then it creates a private PostgreSQL
@@ -488,8 +490,11 @@ and every server it started is stopped on exit. A server that stops
 answering keeps it from ending; that is a failure to trace, never a result.
 
 `./bench.sh` first runs `./check.sh`: every build, test and check above,
-without the load measurements (and so without `dusty-hello`, `bench/load`,
-`bench/goserver` and `bench/pgserver`). Run `./check.sh` on its own while
+without the measurements (and so without `lsrv-bench`, `dusty-hello`,
+`bench/load`, `bench/goserver` and `bench/pgserver`). What `lsrv-bench`
+measures is also checked, in `lsrv-test`: both parsers consume the same
+bytes of each corpus sequence, and each fragmented request is answered after
+its last receive as in one receive (item 6zs4mr). Run `./check.sh` on its own while
 editing; the whole `./bench.sh`, measurements included, is the gate for
 integrating a change (item cxhvkb). Both scripts share their helpers and the
 private cluster's setup through `bench/lib.sh`; `bench.sh` measures on a

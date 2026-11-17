@@ -1,7 +1,9 @@
 #!/bin/sh
 # Every item's integration gate: runs ./check.sh (the builds, tests and
 # correctness checks, which also runs on its own while editing), then the
-# load measurements. It measures each server: requests per second, latency,
+# measurements. lsrv-bench measures both parsers' cost per request and per
+# fragmented request, without sockets (one line per measured case). Then it
+# measures each server: requests per second, latency,
 # and server CPU time per request at 1, 64 and 256 keep-alive connections,
 # 10 s per run, all on this machine. Then it creates a fresh private
 # PostgreSQL cluster (bench/lib.sh, pg_start) and measures lsrv-db against
@@ -12,6 +14,8 @@ set -eu
 cd "$(dirname "$0")"
 ./check.sh
 . bench/lib.sh
+# Built by check.sh's lake build.
+.lake/build/bin/lsrv-bench
 (cd dusty-hello && zig build -Doptimize=ReleaseFast)
 (cd bench/load && go build -o load .)
 (cd bench/goserver && go build -o server .)

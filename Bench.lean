@@ -1,7 +1,4 @@
 import Corpus
-import Server.Conn
-import Server.H1Adapter
-import Server.HandParser
 import App.Hello
 
 /-! `lsrv-bench`: both parsers in isolation on identical byte sequences
@@ -24,8 +21,11 @@ transport's memory per connection does not depend on `k` (README, "Memory"):
 the buffer is bounded by `inCap` whatever the split; what the split costs is
 CPU and transient allocation, which this table measures.
 
-Exit status 1 when the two parsers do not consume the same bytes of a
-sequence, or a fragmented request is not answered. -/
+A measurement only: `lsrv-test` checks that the two parsers consume the same
+bytes of each sequence and that every fragmented request is answered, so
+`check.sh` runs those checks and `bench.sh` runs this. Each row is printed
+and flushed as soon as it is measured, so a run that prints nothing for
+minutes is stuck, not measuring. -/
 
 open Server
 
@@ -33,6 +33,12 @@ open Server
 def consumedOf : Reply → Nat
   | .respond n r _ => n + r.size
   | _ => 0
+
+/-- Prints a line and flushes it, so that each row appears as it is measured. -/
+def say (line : String) : IO Unit := do
+  let out ← IO.getStdout
+  out.putStrLn line
+  out.flush
 
 /-- Runs `f` on the bytes in `input` `iters` times; returns (ns per call, allocations per call).
 The input is read from a reference on every iteration, so the call is not hoisted out of the loop. -/
@@ -44,7 +50,7 @@ def run (f : ByteArray → Nat) (input : IO.Ref ByteArray) (iters : Nat) : IO (F
     acc := acc + f (← input.get)
   let t1 ← IO.monoNanosNow
   let h1 ← IO.getNumHeartbeats
-  if acc == 0 then IO.println "  (nothing consumed)"
+  if acc == 0 then say "  (nothing consumed)"
   return ((t1 - t0).toFloat / iters.toFloat, (h1 - h0).toFloat / iters.toFloat)
 
 def median (xs : Array Float) : Float :=
@@ -65,59 +71,29 @@ def timeIt (f : ByteArray → Nat) (input : IO.Ref ByteArray) (iters : Nat) : IO
     allocs := a
   return (median ts, allocs)
 
-def handParse (b : ByteArray) : Nat :=
-  match HandParser.parse b with
-  | .needMore => 0
-  | .bad s => s
-  | .ok h => h.bodyStart + h.contentLength
+/-- Size of the response to `b` fed in receives of `k` bytes, 0 when there is none. -/
+def fragmentedSize {σ : Type} (ad : Adapter σ) (k : Nat) (b : ByteArray) : Nat :=
+  ((Corpus.fragmented ad k b).map (·.size)).getD 0
 
-def h1Parse (b : ByteArray) : Nat :=
-  match H1Adapter.parse b with
-  | .needMore | .awaitingBody => 0
-  | .bad s => s
-  | .ok _ _ n _ => n
-
-/-- Feeds `b` to a new connection in receives of `k` bytes; returns the size
-of the response it sends, 0 if it sends none or closes. -/
-def fragmented {σ : Type} (ad : Adapter σ) (k : Nat) (b : ByteArray) : Nat := Id.run do
-  let mut s := Conn.initial ad
-  let mut off := 0
-  while off < b.size do
-    let (s', a) := Conn.step ad s (.received (b.extract off (min b.size (off + k))))
-    off := off + k
-    match a with
-    | .recv _ => s := s'
-    | .send d _ => return if off ≥ b.size then d.size else 0
-    | _ => return 0
-  return 0
-
-/-- The sequences of the fragmentation table: a typical request and the largest ones. -/
-def fragmentCorpus : List (String × String) :=
-  (Corpus.requests.filter fun (n, _) => n == "browser GET, 16 headers" || n == "largest head (8192 B)" || n == "largest request (16388 B)")
-
-def main : IO UInt32 := do
-  let mut failures := 0
+def main : IO Unit := do
   let hand := HandParser.adapter {} App.Hello.app 0
   let h1 := H1Adapter.adapter {} App.Hello.app 0
   -- Each parser in one call, and a request fed through `Conn.step` in receives of `k` bytes.
   let adapters : List (String × (ByteArray → Nat) × (ByteArray → Reply) × (Nat → ByteArray → Nat)) :=
-    [("hand-written", handParse, (fun b => (hand.handle hand.init b).2), (fragmented hand)),
-     ("H1", h1Parse, (fun b => (h1.handle h1.init b).2), (fragmented h1))]
-  IO.println "request | bytes | parser | parse ns | parse allocs | handle ns | handle allocs"
+    [("hand-written", Corpus.handParse, (fun b => (hand.handle hand.init b).2), (fragmentedSize hand)),
+     ("H1", Corpus.h1Parse, (fun b => (h1.handle h1.init b).2), (fragmentedSize h1))]
+  say "request | bytes | parser | parse ns | parse allocs | handle ns | handle allocs"
   for (name, req) in Corpus.requests do
     let b := req.toUTF8
     let input ← IO.mkRef b
     let iters := 40000000 / (b.size + 200)
-    if handParse b != h1Parse b then
-      IO.println s!"FAIL {name}: hand-written consumes {handParse b}, H1 {h1Parse b}"
-      failures := failures + 1
     for (pname, p, hdl, _) in adapters do
       let (pt, pa) ← timeIt p input iters
       let (ht, ha) ← timeIt (fun b => consumedOf (hdl b)) input iters
-      IO.println s!"{name} | {b.size} | {pname} | {fmt pt} | {fmt pa} | {fmt ht} | {fmt ha}"
-  IO.println ""
-  IO.println "fragmented request | bytes | receive size | parser | receives | ms per request | allocs per request"
-  for (name, req) in fragmentCorpus do
+      say s!"{name} | {b.size} | {pname} | {fmt pt} | {fmt pa} | {fmt ht} | {fmt ha}"
+  say ""
+  say "fragmented request | bytes | receive size | parser | receives | ms per request | allocs per request"
+  for (name, req) in Corpus.fragmentCorpus do
     let b := req.toUTF8
     let input ← IO.mkRef b
     for k in [1, 7, 64, 1460] do
@@ -125,10 +101,5 @@ def main : IO UInt32 := do
       let receives := (b.size + k - 1) / k
       let iters := max 1 (200000000 / (receives * b.size / 2 + 1))
       for (pname, _, _, frag) in adapters do
-        if frag k b == 0 then
-          IO.println s!"FAIL {name} in receives of {k} B through {pname}: no response"
-          failures := failures + 1
         let (t, a) ← timeIt (frag k) input iters
-        IO.println s!"{name} | {b.size} | {k} | {pname} | {receives} | {fmt (t / 1000000)} | {fmt a}"
-  IO.println s!"{failures} failures"
-  return if failures == 0 then 0 else 1
+        say s!"{name} | {b.size} | {k} | {pname} | {receives} | {fmt (t / 1000000)} | {fmt a}"

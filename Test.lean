@@ -15,7 +15,8 @@ Date header, and the adapter's law (`Adapter.Incremental`): a request fed in
 fragments, with the state kept between them, answers as in one call.
 Connection scenarios drive `Conn.step` through partial receives,
 partial sends, the interim response, the shutdown's `refused` and a handler
-that waits for queries. Exit status
+that waits for queries. On the corpus `lsrv-bench` measures, both parsers
+consume the same bytes, and its fragmented requests are answered. Exit status
 1 when any check fails. -/
 
 open Server
@@ -345,6 +346,28 @@ def lawFor (ad : Adapter) (app : Handler) (what : String) (b : ByteArray) (k : N
       return
     p := p''
 
+/-- The corpus `lsrv-bench` measures: the two parsers consume the same bytes
+of each sequence, and each request of its fragmentation table, fed to a new
+connection through `Conn.step` in receives of 1, 7, 64 and 1460 bytes, is
+answered after its last receive with the nonempty response it gets in one
+receive. -/
+def corpusScenario : Check Unit := do
+  for (name, req) in Corpus.requests do
+    let b := bytes req
+    if Corpus.handParse b != Corpus.h1Parse b then
+      fail s!"corpus {name}: hand-written consumes {Corpus.handParse b}, H1 {Corpus.h1Parse b}"
+  for ad in [h1, hand] do
+    let a := ad.make {} App.Hello.app 0
+    for (name, req) in Corpus.fragmentCorpus do
+      let b := bytes req
+      let some whole := Corpus.fragmented a b.size b
+        | fail s!"corpus {ad.name} {name}: no response in one receive"
+      if whole.size == 0 then fail s!"corpus {ad.name} {name}: an empty response in one receive"
+      for k in [1, 7, 64, 1460] do
+        match Corpus.fragmented a k b with
+        | none => fail s!"corpus {ad.name} {name} in receives of {k} B: no response after the last receive"
+        | some d => if d != whole then fail s!"corpus {ad.name} {name} in receives of {k} B: another response than in one receive"
+
 def lawCases (ad : Adapter) : Check Unit := do
   for c in cases do
     let b := bytes c.request
@@ -473,6 +496,7 @@ def main : IO UInt32 := do
     continueScenario
     refusedScenario
     queryScenario
+    corpusScenario
     for (secs, want) in dates do
       let got := String.fromUTF8! (Response.pushDate ByteArray.empty secs)
       if got != want then fail s!"date {secs}: {got}, want {want}" : Check Unit).run 0

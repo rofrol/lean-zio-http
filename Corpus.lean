@@ -1,7 +1,10 @@
-import Server.Wire
+import Server.Conn
+import Server.H1Adapter
+import Server.HandParser
 
 /-! Byte sequences both parsers are measured and compared on (item 7bccgi):
-the spike's test requests (Test.lean, bench/check) and a typical browser GET. -/
+the spike's test requests (Test.lean, bench/check) and a typical browser GET;
+and the parsers' calls `lsrv-test` checks on them and `lsrv-bench` measures. -/
 
 namespace Corpus
 
@@ -57,5 +60,38 @@ def requests : List (String × String) := [
   ("largest head (8192 B)", maxHeadRequest),
   ("largest request (16388 B)", maxRequest)
 ]
+
+/-- The sequences of the fragmentation table: a typical request and the largest ones. -/
+def fragmentCorpus : List (String × String) :=
+  requests.filter fun (n, _) => n == "browser GET, 16 headers" || n == "largest head (8192 B)" || n == "largest request (16388 B)"
+
+/-- Bytes the hand-written parser consumes, its status on a rejection, or 0 when it needs more. -/
+def handParse (b : ByteArray) : Nat :=
+  match HandParser.parse b with
+  | .needMore => 0
+  | .bad s => s
+  | .ok h => h.bodyStart + h.contentLength
+
+/-- Bytes H1 consumes, its status on a rejection, or 0 when it needs more. -/
+def h1Parse (b : ByteArray) : Nat :=
+  match H1Adapter.parse b with
+  | .needMore | .awaitingBody => 0
+  | .bad s => s
+  | .ok _ _ n _ => n
+
+/-- Feeds `b` to a new connection in receives of `k` bytes, each through
+`Conn.step` as the loop does; the response it sends after the last receive,
+`none` if it sends one earlier, closes, or sends none. -/
+def fragmented {σ : Type} (ad : Adapter σ) (k : Nat) (b : ByteArray) : Option ByteArray := Id.run do
+  let mut s := Conn.initial ad
+  let mut off := 0
+  while off < b.size do
+    let (s', a) := Conn.step ad s (.received (b.extract off (min b.size (off + k))))
+    off := off + k
+    match a with
+    | .recv _ => s := s'
+    | .send d _ => return if off ≥ b.size then some d else none
+    | _ => return none
+  return none
 
 end Corpus
