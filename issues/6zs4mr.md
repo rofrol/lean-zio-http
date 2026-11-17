@@ -4,3 +4,5 @@ Seen in item cxhvkb (2026-11-17), which split `./check.sh` (builds, tests, corre
 
 Question: Should lsrv-bench's correctness assertions run in check.sh with a small sample (or move into lsrv-test), and its timing tables move to bench.sh's measurements?
 Options: keep lsrv-bench whole in check.sh (as now) | move its assertions into lsrv-test or a quick lsrv-bench mode in check.sh, its tables to bench.sh only | first time each step of check.sh (one timed run) and decide on that
+
+Decided 2026-11-17 by the coordinating session with sol (consult round from call a7c4f2f4), under the user's delegation of the same day: move lsrv-bench's correctness assertions (parser consumption, fragmented responses and their edge cases) into lsrv-test or a quick correctness mode used by check.sh, and its timing tables into bench.sh only. Reduce measurement repetitions, never correctness coverage; the full bench.sh still fails on a correctness violation. Runs after p5pyti.
