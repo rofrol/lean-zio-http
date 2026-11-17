@@ -1,12 +1,14 @@
 ## Next, in order
 
-qsqb5f How a PostgreSQL result over Query.maxResultBytes is received and how it ends the session
 wxn5yg Check mechanically that pg.c's EKK_MAX_RESULT_BYTES equals Query.maxResultBytes
 kvnm3u Decide whether the type, not a comment, should keep the clock out of the adapter's kept state
 sy3ims Decide whether to report upstream that Std.Http's H1 reparses an unfinished line from its start on every call
 u4moqo Move the toolchain to the first nightly with lean4 PR 16417 (Std.Http RFC fixes)
 
 ## Proposed
+
+xkkwcb Collect PostgreSQL rows in chunks (PQsetChunkedRowsMode) once libpq 17 is the minimum
+oruxe4 Run the PostgreSQL glue tests against every supported libpq line, not only the installed one
 
 ## Needs a decision
 
