@@ -36,7 +36,7 @@ const max_steps = 1000;
 
 // ---- the fake glue.c ----
 
-const Kind = enum(u8) { open, recv, refused, fail, free, ready, snapshot, done, expired, arrived, written };
+const Kind = enum(u8) { open, recv, refused, fail, free, ready, snapshot, done, expired, arrived, written, sent };
 
 const Event = extern struct {
     kind: Kind,
@@ -53,6 +53,10 @@ const Event = extern struct {
     slots: u32 = 0,
     /// recv: the first byte received; expired: the deadline's code.
     byte: u8 = 0,
+    /// sent: the bytes the completed send was asked to write (`n` is what
+    /// it wrote), and the response's bytes still unsent after it.
+    asked: u32 = 0,
+    left: u32 = 0,
 };
 
 /// Deadline codes as glue.c reports them (Transport.deadlineCode).
@@ -67,7 +71,8 @@ const write_code: u8 = 4;
 /// generation `gen + 1`, Conn.Phase.ahead).
 /// `held`: the next request's head is complete in Lean's buffer, so the
 /// fake no longer watches (Conn.State.watches needs an empty buffer).
-const FakeConn = struct { id: u32, loop: u8, dl: u8 = none_code, gen: u32 = 0, left: usize = 0, ahead: bool = false, held: bool = false };
+/// `asked`: the length of the send in flight.
+const FakeConn = struct { id: u32, loop: u8, dl: u8 = none_code, gen: u32 = 0, left: usize = 0, asked: usize = 0, ahead: bool = false, held: bool = false };
 
 /// The deadline a new connection runs under, and the one after each receive
 /// with bytes. Tests set them before a loop starts.
@@ -86,6 +91,15 @@ var ahead_complete = false;
 /// bytes (the fake speaks first), sent under the write deadline with the
 /// readiness poll beside it.
 var respond_on_open: usize = 0;
+/// When set, every send completion the fake hears of is a `sent` event.
+var report_sent = false;
+/// When set, the next send completion makes this connection's current
+/// deadline due (a test hook, as `dueNow`) before the fake answers it:
+/// after the poll's timer check, so the loop dispatches the completion with
+/// the expiry due and reports that expiry only at its next timer check.
+/// `due_injected` is the due time it set.
+var due_on_sent: ?*serve.Conn = null;
+var due_injected: ?@FieldType(ev.Timer, "deadline") = null;
 
 var events: [2]c.fd_t = .{ -1, -1 };
 var next_conn = std.atomic.Value(u32).init(0);
@@ -129,10 +143,11 @@ fn answerRecv(act: *serve.Action, fc: *const FakeConn, n: usize) void {
 /// Answers `kind` (send or none) while writing: the write deadline, the
 /// head budget beside it once a next request's byte arrived, and the watch
 /// until then (Conn.State.watches).
-fn answerWriting(act: *serve.Action, fc: *const FakeConn, kind: u8, out: [*]u8, cap: usize) void {
+fn answerWriting(act: *serve.Action, fc: *FakeConn, kind: u8, out: [*]u8, cap: usize) void {
     answer(act, kind, 0);
     if (kind == 1) {
         act.len = @min(cap, fc.left);
+        fc.asked = act.len;
         @memset(out[0..act.len], 'x');
     }
     act.deadline = fc.dl;
@@ -234,8 +249,15 @@ export fn ekk_arrived(state: *serve.State, out: [*]u8, cap: usize, act: *serve.A
 export fn ekk_sent(state: *serve.State, n: usize, out: [*]u8, cap: usize, act: *serve.Action) void {
     enter("ekk_sent");
     const fc = connOf(state.*);
-    if (fc.dl != write_code or n == 0 or n > fc.left) @panic("a send the fake did not ask for");
+    if (fc.dl != write_code or n == 0 or n > fc.asked) @panic("a send the fake did not ask for");
+    if (due_on_sent) |conn| {
+        due_on_sent = null;
+        const arm = conn.arm orelse @panic("a send completion with no write deadline armed");
+        conn.lp.loop.setTimer(&arm.timer, .{ .duration = .zero });
+        due_injected = arm.timer.deadline;
+    }
     fc.left -= n;
+    if (report_sent) emit(.{ .kind = .sent, .loop = fc.loop, .conn = fc.id, .n = @intCast(n), .asked = @intCast(fc.asked), .left = @intCast(fc.left) });
     if (fc.left > 0) return answerWriting(act, fc, 1, out, cap);
     emit(.{ .kind = .written, .loop = fc.loop, .conn = fc.id, .n = fc.gen });
     if (fc.ahead) {
@@ -438,6 +460,9 @@ const Single = struct {
         respond = 0;
         ahead_complete = false;
         respond_on_open = 0;
+        report_sent = false;
+        due_on_sent = null;
+        due_injected = null;
         serve.testing = .{};
         serve.budget_ms = .{ never, never, never, never };
         stops = 0;
@@ -959,6 +984,11 @@ test "a response whose write deadline ends before any next byte arrives closes o
     const conn = s.lp.head.?;
     try std.testing.expect(conn.watching and !conn.poll_stale);
     try std.testing.expect(conn.ahead_arm == null);
+    // The expiry asks to cancel the parked send, unless the kernel let it
+    // complete first (loopback may still free room in the send buffer
+    // after the send parked); its one completion reaches a closing
+    // connection and is not reported.
+    try spyOnSend(conn);
     dueNow(&s);
     try s.stepUntil(.free, 1);
     try expectLog(&s, &.{
@@ -967,6 +997,7 @@ test "a response whose write deadline ends before any next byte arrives closes o
         .{ .kind = .expired, .n = 1, .byte = write_code },
         .{ .kind = .free },
     });
+    try expectSendClosed();
     s.lp.stop.notify();
     try s.finish();
 }
@@ -1008,6 +1039,293 @@ test "a send that fails while the poll beside it is in flight closes only after 
     try std.testing.expect(conn.cur == null);
     try s.stepUntil(.free, 1);
     try expectLog(&s, &.{ .{ .kind = .open }, .{ .kind = .fail }, .{ .kind = .free } });
+    s.lp.stop.notify();
+    try s.finish();
+}
+
+// ---- a write deadline against a partial send ----
+
+/// The send in flight, which waits in the kernel (zio parked it: its
+/// buffer was full when it was submitted).
+fn expectParkedSend(conn: *serve.Conn) !void {
+    const op = conn.cur orelse return error.NoOperation;
+    try std.testing.expect(op.kind == .send);
+    try std.testing.expectEqual(ev.Completion.State.Phase.running, op.comp.send.c.loadState().phase);
+}
+
+/// The most client reads `drainUntilWritable` makes.
+const max_reads = 1000;
+
+/// Until the kernel reports the server's socket `fd` writable, reads what
+/// reaches the client and adds it to `got`; it waits for whichever comes
+/// first, as loopback delivers the bytes and their acknowledgements
+/// asynchronously. The socket becomes writable with less room than one
+/// send asks for (`out_cap`, more than its 4096-byte buffer), so the parked
+/// send can complete, partially. The loop does not poll meanwhile.
+fn drainUntilWritable(cl: c.fd_t, fd: c.fd_t, got: *usize) !void {
+    var buf: [65536]u8 = undefined;
+    var reads: usize = 0;
+    while (true) : (reads += 1) {
+        if (reads == max_reads) return error.NeverWritable;
+        var fds = [2]c.pollfd{
+            .{ .fd = fd, .events = c.POLL.OUT, .revents = 0 },
+            .{ .fd = cl, .events = c.POLL.IN, .revents = 0 },
+        };
+        if (c.poll(&fds, 2, -1) < 1) @panic("poll for writability or bytes failed");
+        if (fds[0].revents & c.POLL.OUT != 0) return;
+        const r = c.recv(cl, &buf, buf.len, c.MSG.DONTWAIT);
+        if (r <= 0) return error.ClientReadNothing;
+        got.* += @intCast(r);
+    }
+}
+
+/// The bytes the fake heard of as sent.
+fn reportedSent(s: *const Single) usize {
+    var total: usize = 0;
+    for (s.log[0..s.n]) |e| {
+        if (e.kind == .sent) total += e.n;
+    }
+    return total;
+}
+
+/// The first `sent` event at or after log index `from`.
+fn sentFrom(s: *const Single, from: usize) !Event {
+    for (s.log[from..s.n]) |e| {
+        if (e.kind == .sent) return e;
+    }
+    return error.NoSentEvent;
+}
+
+/// A response blocked behind the server's small send buffer, with one real
+/// partial send completed: the send that parked completes once the client reads,
+/// writing fewer bytes than it was asked to while bytes of the response
+/// remain. That completion keeps the write deadline's arm, with the due
+/// time it was armed with. Returns with the next send parked and its
+/// readiness poll beside it.
+const PartialSend = struct { cl: c.fd_t, arm: *serve.Arm, due: @FieldType(ev.Timer, "deadline"), got: usize };
+
+fn partialSend(s: *Single) !PartialSend {
+    report_sent = true;
+    const cl = try requestResponse(s, response_len);
+    errdefer _ = c.close(cl);
+    try stepUntilPolling(s);
+    const conn = s.lp.head.?;
+    try expectParkedSend(conn);
+    const arm = conn.arm.?;
+    try std.testing.expectEqual(write_code, arm.kind);
+    const due = arm.timer.deadline;
+    // A send writes at most the room in the server's send buffer, never
+    // more than the buffer holds: one smaller than the send asked for
+    // bounds every completion below `asked`, so the partial sends checked
+    // here are the kernel's, whatever room loopback frees meanwhile.
+    var sndbuf: c_int = 0;
+    var sndbuf_len: c.socklen_t = @sizeOf(c_int);
+    if (c.getsockopt(conn.fd, c.SOL.SOCKET, c.SO.SNDBUF, @ptrCast(&sndbuf), &sndbuf_len) != 0) return error.GetSockOpt;
+    // 8192: one send's most bytes (serve.zig's `out_cap`).
+    try std.testing.expect(@as(usize, @intCast(sndbuf)) < @min(response_len, 8192));
+    var got: usize = 0;
+    const from = s.n;
+    try drainUntilWritable(cl, conn.fd, &got);
+    try s.stepUntil(.sent, s.count(.sent) + 1);
+    const e = try sentFrom(s, from);
+    try std.testing.expect(e.n < e.asked);
+    try std.testing.expect(e.left > 0);
+    try std.testing.expect(conn.arm.? == arm);
+    try std.testing.expect(!arm.retired);
+    try std.testing.expectEqual(due, arm.timer.deadline);
+    try expectParkedSend(conn);
+    try std.testing.expect(conn.polling and conn.watching);
+    return .{ .cl = cl, .arm = arm, .due = due, .got = got };
+}
+
+/// The send in flight at the expiry, seen by two spies in front of
+/// serve.zig's callbacks: `timerSpy` around the write deadline's timer
+/// callback (whether the send was still in the kernel when the expiry ran,
+/// and whether the cancel was asked after it), `sendSpy` before the send's
+/// (what its one completion carried). zio's `Loop.cancel`
+/// (pinned 830564437b2c, src/ev/loop.zig) says "the completion's callback
+/// will still be invoked when the operation completes (either with
+/// error.Canceled or its natural result)", and a cancel of a completion
+/// already completed is a no-op (src/ev/completion.zig, `requestCancel`:
+/// "Completed/dead: too late, no-op"). serve.zig's `closing` reports
+/// neither result to Lean.
+/// Which of the two a send in flight at the expiry gets depends on whether
+/// the kernel let it complete before the expiry's poll, which the tests
+/// force only where they say so.
+const SpiedSend = struct {
+    /// `timerSpy`: calls; the send was running (parked) as the expiry
+    /// began; after it, a cancel was asked and the connection closes.
+    expiries: u32 = 0,
+    running_at_expiry: bool = false,
+    cancel_after_expiry: bool = false,
+    closing_after_expiry: bool = false,
+    /// `sendSpy`: calls; the connection closes; the result.
+    calls: u32 = 0,
+    closing: bool = false,
+    canceled: bool = false,
+    /// An error other than error.Canceled: neither outcome the tests allow.
+    failed: bool = false,
+    wrote: usize = 0,
+};
+var spied: SpiedSend = .{};
+var spied_callback: ?*const ev.Completion.CallbackFn = null;
+var spied_timer_callback: ?*const ev.Completion.CallbackFn = null;
+var spied_conn: ?*serve.Conn = null;
+var spied_send: ?*ev.Completion = null;
+
+/// The write deadline's timer callback, with the send's state read before
+/// and after it. The send's completion is queued, not run, inside it
+/// (`defer_callback`), so it is still the connection's afterwards.
+fn timerSpy(loop: *ev.Loop, comp: *ev.Completion) void {
+    const send_c = spied_send.?;
+    spied.expiries += 1;
+    spied.running_at_expiry = send_c.loadState().phase == .running;
+    spied_timer_callback.?(loop, comp);
+    spied.cancel_after_expiry = send_c.loadState().cancel_requested;
+    spied.closing_after_expiry = spied_conn.?.closing;
+}
+
+fn sendSpy(loop: *ev.Loop, comp: *ev.Completion) void {
+    const send_op: *ev.NetSend = @fieldParentPtr("c", comp);
+    spied.calls += 1;
+    spied.closing = spied_conn.?.closing;
+    if (send_op.getResult()) |n| {
+        spied.wrote = n;
+    } else |err| {
+        if (err == error.Canceled) spied.canceled = true else spied.failed = true;
+    }
+    spied_callback.?(loop, comp);
+}
+
+/// Puts `sendSpy` in front of the callback of the parked send in flight,
+/// and `timerSpy` in front of the write deadline's.
+fn spyOnSend(conn: *serve.Conn) !void {
+    try expectParkedSend(conn);
+    const comp = &conn.cur.?.comp.send.c;
+    spied = .{};
+    spied_conn = conn;
+    spied_send = comp;
+    spied_callback = comp.callback;
+    comp.callback = sendSpy;
+    const timer = &conn.arm.?.timer.c;
+    spied_timer_callback = timer.callback;
+    timer.callback = timerSpy;
+}
+
+/// The expiry ran once and closed; it asked to cancel the send if that
+/// send was still in the kernel (a cancel of a completed one is a no-op);
+/// the send then completed once, to the closing connection, canceled only
+/// if it was still in the kernel at the expiry.
+fn expectSendClosed() !void {
+    try std.testing.expectEqual(@as(u32, 1), spied.expiries);
+    try std.testing.expect(spied.closing_after_expiry);
+    if (spied.running_at_expiry) try std.testing.expect(spied.cancel_after_expiry);
+    try std.testing.expectEqual(@as(u32, 1), spied.calls);
+    try std.testing.expect(spied.closing);
+    try std.testing.expect(!spied.failed);
+    if (spied.canceled) {
+        try std.testing.expect(spied.running_at_expiry);
+        try std.testing.expectEqual(@as(usize, 0), spied.wrote);
+    }
+}
+
+/// Checks that the log is the request, the sends the fake heard of, the
+/// write deadline's expiry and one free, nothing after the expiry but that
+/// free; `expectSendClosed`; and that the client, reading to the end, gets
+/// exactly the bytes the fake heard of as sent and what that send's
+/// completion says it wrote, unreported.
+fn expectExpiredWhileSending(s: *Single, cl: c.fd_t, got: usize) !void {
+    var total = got;
+    var buf: [65536]u8 = undefined;
+    while (true) {
+        const r = c.read(cl, &buf, buf.len);
+        if (r < 0) return error.ClientRead;
+        if (r == 0) break;
+        total += @intCast(r);
+    }
+    const sends = s.count(.sent);
+    if (s.n != sends + 4 or sends == 0) {
+        s.dump();
+        return error.UnexpectedEvents;
+    }
+    try std.testing.expectEqual(Kind.open, s.log[0].kind);
+    try std.testing.expectEqual(Kind.recv, s.log[1].kind);
+    try std.testing.expectEqual(@as(u8, 'R'), s.log[1].byte);
+    for (s.log[2 .. 2 + sends]) |e| try std.testing.expectEqual(Kind.sent, e.kind);
+    const x = s.log[2 + sends];
+    try std.testing.expectEqual(Kind.expired, x.kind);
+    try std.testing.expectEqual(@as(u32, 1), x.n);
+    try std.testing.expectEqual(write_code, x.byte);
+    try std.testing.expectEqual(Kind.free, s.log[3 + sends].kind);
+    for (s.log[0..s.n]) |e| try std.testing.expectEqual(s.log[0].conn, e.conn);
+    try expectSendClosed();
+    try std.testing.expectEqual(reportedSent(s) + spied.wrote, total);
+}
+
+test "a write deadline the loop runs before a ready send's completion closes, and what that send wrote is not reported" {
+    var s: Single = undefined;
+    try s.init(64);
+    defer s.deinit();
+    var p = try partialSend(&s);
+    defer _ = c.close(p.cl);
+    const conn = s.lp.head.?;
+    const sends = s.count(.sent);
+    // The parked send can make progress and the write deadline is due
+    // before the loop polls again. In that poll zio checks the timers, then
+    // the backend completes the send with what it wrote, then the queued
+    // callbacks run, the timer's first (zio 830564437b2c, `Loop.poll`): the
+    // expiry closes and asks to cancel the send, too late, and the send's
+    // completion, with its natural result, only leads to the close.
+    try spyOnSend(conn);
+    try drainUntilWritable(p.cl, conn.fd, &p.got);
+    dueNow(&s);
+    try s.stepUntil(.free, 1);
+    try std.testing.expectEqual(sends, s.count(.sent));
+    try expectExpiredWhileSending(&s, p.cl, p.got);
+    // The send had completed in the backend before the timer's callback.
+    try std.testing.expect(!spied.running_at_expiry and !spied.canceled);
+    try std.testing.expect(spied.wrote > 0);
+    s.lp.stop.notify();
+    try s.finish();
+}
+
+test "a partial send's completion the loop runs before a due write deadline is reported, keeps the arm, and that arm's expiry closes" {
+    var s: Single = undefined;
+    try s.init(64);
+    defer s.deinit();
+    var p = try partialSend(&s);
+    defer _ = c.close(p.cl);
+    const conn = s.lp.head.?;
+    // The parked send can make progress; the write deadline becomes due
+    // inside its completion's report, after the poll's timer check. The
+    // completion is reported, partial, and the next send parks under the
+    // same arm with the injected due time; the expiry comes at the next
+    // poll's timer check, as that arm's, and closes.
+    const from = s.n;
+    try drainUntilWritable(p.cl, conn.fd, &p.got);
+    due_on_sent = conn;
+    try s.stepUntil(.sent, s.count(.sent) + 1);
+    try std.testing.expect(due_on_sent == null);
+    const e = try sentFrom(&s, from);
+    try std.testing.expect(e.n < e.asked);
+    try std.testing.expect(e.left > 0);
+    try std.testing.expectEqual(@as(usize, 0), s.count(.expired));
+    try std.testing.expect(conn.arm.? == p.arm);
+    try std.testing.expect(!p.arm.retired);
+    try std.testing.expectEqual(due_injected.?, p.arm.timer.deadline);
+    try std.testing.expect(p.due.value != p.arm.timer.deadline.value);
+    try spyOnSend(conn);
+    const sends = s.count(.sent);
+    try s.stepUntil(.free, 1);
+    try std.testing.expectEqual(sends, s.count(.sent));
+    try expectExpiredWhileSending(&s, p.cl, p.got);
+    // The next send's fate is the kernel's: the client's read left room
+    // that the server's send buffer may keep draining into, so by the
+    // expiry's poll that send may have become ready and completed with
+    // what it wrote (the cancel then too late, as in the test above), or
+    // still be parked, and the expiry then asked to cancel it. Either way
+    // it was not reported, and the client got exactly its bytes and the
+    // reported ones (both checked above).
     s.lp.stop.notify();
     try s.finish();
 }
