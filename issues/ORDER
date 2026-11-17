@@ -12,10 +12,9 @@ jqzv42 Decide whether to ask upstream for request-target count limits apart from
 7mzw77 Accept that stale-statement recognition relies on PostgreSQL's undocumented source-function field
 grjqox Move dusty-hello's zio pin to the server's (830564437b2c)
 u4moqo Move the toolchain to the first nightly with lean4 PR 16417 (Std.Http RFC fixes)
+ub3d5m Make a failed transport test leave no state that fails the tests after it
 
 ## Proposed
-
-ub3d5m Make a failed transport test leave no state that fails the tests after it
 
 ## Needs a decision
 
