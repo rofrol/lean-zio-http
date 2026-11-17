@@ -11,7 +11,9 @@
 //! response of that many bytes under the write deadline, watches for the
 //! next request's first byte while it is sent, and runs that request's head
 //! budget beside the send from its arrival, as Lean's Conn.step does for a
-//! pipelined request (item dv6ikn). Clients connect over TCP on 127.0.0.1. Before a single-loop test
+//! pipelined request (item dv6ikn). Clients connect over TCP on 127.0.0.1, and in
+//! one test over a Unix-domain stream socket, whose buffer gains room only
+//! when its peer reads. Before a single-loop test
 //! polls its loop for an event, it waits (`awaitReadable`) until the kernel
 //! has made that event ready: a connection queued on the listening socket, or
 //! bytes readable at the server's end. The loop's nonblocking polls then find
@@ -28,6 +30,7 @@ const serve = @import("serve.zig");
 
 const c = std.c;
 extern "c" fn socket(domain: c_uint, kind: c_uint, protocol: c_uint) c_int;
+extern "c" fn mkdtemp(template: [*:0]u8) ?[*:0]u8;
 
 /// The most nonblocking polls a single-loop test makes while it waits for an
 /// event that its last step has already made ready: running out means the
@@ -380,7 +383,13 @@ fn printEvent(e: Event) void {
 
 const Listener = struct {
     fd: c.fd_t,
-    addr: c.sockaddr.in,
+    addr: union(enum) {
+        tcp: c.sockaddr.in,
+        /// The socket's path, in a directory of its own (`dir`).
+        unix: struct { sa: c.sockaddr.un, dir: [dir_template.len:0]u8 },
+    },
+
+    const dir_template = "/tmp/lsrv-test.XXXXXX";
 
     /// The server's own nonblocking listening socket (serve.openListener) on
     /// 127.0.0.1 at a port the kernel picks.
@@ -390,18 +399,56 @@ const Listener = struct {
         sa.family = c.AF.INET;
         sa.port = std.mem.nativeToBig(u16, l.port);
         sa.addr = @bitCast([4]u8{ 127, 0, 0, 1 });
-        return .{ .fd = l.fd, .addr = sa };
+        return .{ .fd = l.fd, .addr = .{ .tcp = sa } };
+    }
+
+    /// A nonblocking Unix-domain stream listening socket, in a new private
+    /// directory under /tmp (short enough for `sun_path`). serve.zig's
+    /// accept and connection path take its connections as they take TCP
+    /// ones: it sets no socket option on them (TCP_NODELAY comes from
+    /// `openListener`, which this listener does not use).
+    fn openUnix() !Listener {
+        var dir: [dir_template.len:0]u8 = dir_template.*;
+        if (mkdtemp(&dir) == null) return error.MkdTemp;
+        errdefer _ = c.rmdir(&dir);
+        var sa = std.mem.zeroes(c.sockaddr.un);
+        sa.family = c.AF.UNIX;
+        const path = dir ++ "/s".*;
+        @memcpy(sa.path[0..path.len], &path);
+        const fd = socket(c.AF.UNIX, c.SOCK.STREAM, 0);
+        if (fd < 0) return error.Socket;
+        errdefer _ = c.close(fd);
+        if (c.fcntl(fd, c.F.SETFL, @as(c_int, @bitCast(c.O{ .NONBLOCK = true }))) != 0) return error.Fcntl;
+        if (c.bind(fd, @ptrCast(&sa), @sizeOf(c.sockaddr.un)) != 0) return error.Bind;
+        errdefer _ = c.unlink(@ptrCast(&sa.path));
+        if (c.listen(fd, 16) != 0) return error.Listen;
+        return .{ .fd = fd, .addr = .{ .unix = .{ .sa = sa, .dir = dir } } };
     }
 
     fn close(self: *Listener) void {
         _ = c.close(self.fd);
+        switch (self.addr) {
+            .tcp => {},
+            .unix => |*u| {
+                _ = c.unlink(@ptrCast(&u.sa.path));
+                _ = c.rmdir(&u.dir);
+            },
+        }
     }
 
     /// A blocking client connected to the listener.
     fn connect(self: *const Listener) !c.fd_t {
-        const fd = socket(c.AF.INET, c.SOCK.STREAM, 0);
+        const fd = switch (self.addr) {
+            .tcp => socket(c.AF.INET, c.SOCK.STREAM, 0),
+            .unix => socket(c.AF.UNIX, c.SOCK.STREAM, 0),
+        };
         if (fd < 0) return error.Socket;
-        if (c.connect(fd, @ptrCast(&self.addr), @sizeOf(c.sockaddr.in)) != 0) return error.Connect;
+        errdefer _ = c.close(fd);
+        const r = switch (self.addr) {
+            .tcp => |*sa| c.connect(fd, @ptrCast(sa), @sizeOf(c.sockaddr.in)),
+            .unix => |*u| c.connect(fd, @ptrCast(&u.sa), @sizeOf(c.sockaddr.un)),
+        };
+        if (r != 0) return error.Connect;
         return fd;
     }
 };
@@ -450,7 +497,12 @@ const Single = struct {
     log: [64]Event = undefined,
     n: usize = 0,
 
+    /// On a TCP listener on 127.0.0.1.
     fn init(self: *Single, recv_room: usize) !void {
+        return self.initOn(recv_room, .tcp);
+    }
+
+    fn initOn(self: *Single, recv_room: usize, family: enum { tcp, unix }) !void {
         try std.testing.expectEqual(@as(u32, 0), serve.slots_used.load(.monotonic));
         try openEvents();
         room = recv_room;
@@ -467,7 +519,10 @@ const Single = struct {
         serve.budget_ms = .{ never, never, never, never };
         stops = 0;
         serve.max_conns = 8;
-        self.listener = try Listener.open();
+        self.listener = switch (family) {
+            .tcp => try Listener.open(),
+            .unix => try Listener.openUnix(),
+        };
         self.n = 0;
         self.lp = .{ .lfd = self.listener.fd };
         if (!serve.startLoop(&self.lp)) return error.StartLoop;
@@ -808,9 +863,18 @@ test "a receive the loop runs before a due expiry wins: that expiry is stale and
 
 // ---- a pipelined request's head budget beside a blocked response ----
 
-/// A response much larger than the socket buffers the test sets: its send
-/// parks until the client reads.
+/// A response larger than the socket buffers seen in the runs so far on
+/// both ends: while the client does not read, its sends fill them and one
+/// parks. The TCP tests do not guarantee that the send stays parked:
+/// loopback may keep moving bytes into the client's receive buffer and
+/// freeing room in the server's send buffer after it, so a parked send may
+/// become ready with no read by the client.
 const response_len: usize = 1 << 20;
+/// The size the TCP tests ask for the server's send buffer and the client's
+/// receive buffer. The kernel need not grant it: on macOS getsockopt read
+/// 314352 for a client's SO_RCVBUF set to this before connect (item znioju),
+/// so the requested 4096 bytes were not the client's effective receive
+/// buffer there.
 const small_buffer: c_int = 4096;
 
 fn setBuffer(fd: c.fd_t, opt: u32) !void {
@@ -832,9 +896,10 @@ fn stepUntilPolling(s: *Single) !void {
     }
 }
 
-/// Connects a client with a small receive buffer, has it send a request
-/// ('R'), and steps the loop until the fake has started the response of
-/// `len` bytes, its send on a small send buffer.
+/// Connects a TCP client, asking for a `small_buffer` receive buffer (which
+/// the kernel may not grant), has it send a request ('R'), and steps the
+/// loop until the fake has started the response of `len` bytes, its send on
+/// a `small_buffer` send buffer.
 fn requestResponse(s: *Single, len: usize) !c.fd_t {
     respond = len;
     recv_keeps = true;
@@ -842,7 +907,7 @@ fn requestResponse(s: *Single, len: usize) !c.fd_t {
     if (cl < 0) return error.Socket;
     errdefer _ = c.close(cl);
     try setBuffer(cl, c.SO.RCVBUF);
-    if (c.connect(cl, @ptrCast(&s.listener.addr), @sizeOf(c.sockaddr.in)) != 0) return error.Connect;
+    if (c.connect(cl, @ptrCast(&s.listener.addr.tcp), @sizeOf(c.sockaddr.in)) != 0) return error.Connect;
     awaitReadable(s.listener.fd);
     try s.stepUntil(.open, 1);
     try setBuffer(s.lp.head.?.fd, c.SO.SNDBUF);
@@ -1044,7 +1109,7 @@ test "a send that fails while the poll beside it is in flight closes only after 
     if (cl < 0) return error.Socket;
     defer _ = c.close(cl);
     try setBuffer(cl, c.SO.RCVBUF);
-    if (c.connect(cl, @ptrCast(&s.listener.addr), @sizeOf(c.sockaddr.in)) != 0) return error.Connect;
+    if (c.connect(cl, @ptrCast(&s.listener.addr.tcp), @sizeOf(c.sockaddr.in)) != 0) return error.Connect;
     awaitReadable(s.listener.fd);
     try s.stepUntil(.open, 1);
     // The client reads nothing: the sends complete at once until the
@@ -1358,6 +1423,63 @@ test "a partial send's completion the loop runs before a due write deadline is r
     // still be parked, and the expiry then asked to cancel it. Either way
     // it was not reported, and the client got exactly its bytes and the
     // reported ones (both checked above).
+    s.lp.stop.notify();
+    try s.finish();
+}
+
+/// Whether the kernel reports `fd` writable now (a nonblocking snapshot).
+fn writableNow(fd: c.fd_t) bool {
+    var fds = [1]c.pollfd{.{ .fd = fd, .events = c.POLL.OUT, .revents = 0 }};
+    const r = c.poll(&fds, 1, 0);
+    if (r < 0) @panic("poll for writability failed");
+    return r == 1;
+}
+
+test "a write deadline that ends while its send waits in the kernel cancels that send, which completes canceled to the closing connection" {
+    // The TCP tests above do not guarantee that a send stays in the kernel:
+    // loopback may keep freeing room in the server's send buffer after a
+    // send parks, so they allow either outcome of the expiry. A Unix-domain stream socket
+    // gains room only when its peer reads (XNU and Linux move the bytes
+    // into the peer's receive buffer at the send and free the sender's
+    // room only at the peer's read, or its close), and this client never
+    // reads, so the parked send stays in the kernel until the expiry. The
+    // pair is the listener's accepted end and its client, not a
+    // socketpair(2): serve.zig takes connections only from its accept.
+    // Checked by runs on macOS (kqueue); Linux (epoll, io_uring) is not yet
+    // checked by a run there.
+    var s: Single = undefined;
+    try s.initOn(64, .unix);
+    defer s.deinit();
+    respond_on_open = response_len;
+    const cl = try s.listener.connect();
+    // Closed before `s.deinit` runs (defers run last first): should a check
+    // below fail with the send still parked, the close ends it.
+    defer _ = c.close(cl);
+    awaitReadable(s.listener.fd);
+    try s.stepUntil(.open, 1);
+    // The fake starts the response at the open. Its sends complete at once
+    // until the socket is full; the one whose syscall returns EAGAIN is
+    // parked, registered for writability, inside `loop.add` (zio
+    // 830564437b2c, src/ev/sockreg.zig `submitIo` and `park`), and serve.zig
+    // starts the readiness poll only beside a send so parked (`sendParked`).
+    // The poll in flight is the event that this send waits in the kernel.
+    try stepUntilPolling(&s);
+    const conn = s.lp.head.?;
+    try spyOnSend(conn);
+    try std.testing.expect(!writableNow(conn.fd));
+    dueNow(&s);
+    try s.stepUntil(.free, 1);
+    try expectLog(&s, &.{
+        .{ .kind = .open },
+        .{ .kind = .expired, .n = 0, .byte = write_code },
+        .{ .kind = .free },
+    });
+    try expectSendClosed();
+    // The send was still in the kernel at the expiry, which asked to cancel
+    // it; its one completion carried error.Canceled.
+    try std.testing.expect(spied.running_at_expiry);
+    try std.testing.expect(spied.cancel_after_expiry);
+    try std.testing.expect(spied.canceled);
     s.lp.stop.notify();
     try s.finish();
 }
