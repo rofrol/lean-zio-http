@@ -130,9 +130,9 @@ fn due(t: zio.Timestamp, at: zio.Timestamp) bool {
 /// checks that `startLoop` joins none). This is the runtime backstop behind
 /// that test: grouped loops complete each other's parked socket ops on the
 /// completing loop's thread, and zio passes that completing loop to the
-/// callback. It relies on zio's callback dispatch at the pin (830564437b2c):
+/// callback. It relies on zio's callback dispatch at the pin (53ed3c377317):
 /// `Completion.call(loop)` calls the callback with the loop whose state
-/// completes it (src/ev/completion.zig:479-483, src/ev/loop.zig:310-362);
+/// completes it (src/ev/completion.zig:491-495, src/ev/loop.zig:310-362);
 /// recheck at each update of zio. An explicit `@panic`, not
 /// `std.debug.assert`, which ReleaseFast compiles out.
 pub fn ownLoop(got: *const ev.Loop, own: *const ev.Loop) void {
@@ -183,6 +183,15 @@ pub const Slot = struct {
         return self.pool.loop;
     }
 
+    /// `recvReady` and `sendReady` re-arm their own completion through here,
+    /// and `closed` may re-add `closer` (through `connectStep`, `Pool.next`
+    /// and a failed send's `teardown`). zio documents that a callback may
+    /// reuse its completion's memory and `add` it again (pinned 53ed3c377317,
+    /// src/ev/completion.zig:294-305, `Completion.callback`,
+    /// https://github.com/lalinsky/zio/pull/929): "for a completion with
+    /// neither `rearm` nor a group or queue owner the loop does not touch it
+    /// after the callback returns". The pool sets no `rearm` and uses no zio
+    /// `Group` or `CompletionQueue`.
     fn arm(self: *Slot, comptime dir: ev.NetPoll.Event) void {
         if (dir == .recv) {
             if (self.rarmed) return;
@@ -630,6 +639,14 @@ pub const Pool = struct {
     /// Arms the deadline timer for the earliest deadline still running: a
     /// queued query's, a busy slot's query's, the connect's. A timer whose
     /// callback is already on its way is left to it: that callback re-arms.
+    /// From `timerCb` this sets the timer whose callback is running: zio's
+    /// `Completion.callback` (pinned 53ed3c377317, src/ev/completion.zig:294-305)
+    /// says the loop does not touch a completion without `rearm` or an owner
+    /// after its callback returns, and `Loop.setTimer` is documented to "Set
+    /// or reset a timer with a new timeout" (src/ev/loop.zig:673). That
+    /// `setTimer` accepts a timer from inside its own callback is said only by
+    /// a comment in its body ("rearm from the callback (or after it)",
+    /// src/ev/loop.zig:681-684), not by its documentation.
     fn rearm(self: *Pool) void {
         var next_due: ?zio.Timestamp = null;
         var it = self.head;

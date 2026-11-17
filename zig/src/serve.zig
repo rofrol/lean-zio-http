@@ -229,6 +229,21 @@ const OpKind = enum { recv, send, wrote, close, query };
 /// embedded in it; traced, each gets its own allocation, never freed, so a
 /// duplicate or stale completion arrives at an address and number that are
 /// not the current operation's and fails the check in `finish`.
+///
+/// The callbacks here reuse, re-add or free their own completion: `recvCb`,
+/// `sendCb`, `pollCb` and `closeCb` start the connection's next operation in
+/// the same `slot` (another type of operation, in a union) or free the
+/// connection that holds it (`closeCb` through `destroy`); `pollCb` re-adds
+/// `poll`; `acceptCb` re-initializes and re-adds `accept`; `Arm.timerCb`
+/// frees the `Arm` that holds its timer; `readyCb` may re-add `wake`. zio
+/// documents that this is allowed (pinned 53ed3c377317, src/ev/completion.zig:294-305,
+/// `Completion.callback`, https://github.com/lalinsky/zio/pull/929): "The
+/// completion is already dead when it runs, and for a completion with
+/// neither `rearm` nor a group or queue owner the loop does not touch it
+/// after the callback returns. The callback may therefore free it, or reuse
+/// its memory for the next operation, of the same or another type, and `add`
+/// it again." No completion of the transport sets `rearm` or joins a zio
+/// `Group` or `CompletionQueue`.
 const Op = struct {
     comp: Comp = undefined,
     kind: OpKind = .recv,
@@ -288,7 +303,7 @@ pub const Conn = struct {
     /// Retired arms whose callbacks are still to run: the connection is
     /// freed only after the last of them.
     ///
-    /// Under the pinned zio (830564437b2c) a close never completes before a
+    /// Under the pinned zio (53ed3c377317) a close never completes before a
     /// retired arm's callback, so `closeCb` always finds this at 0 and the
     /// `closed` branch in `Arm.timerCb` is not taken. From zio's source:
     /// every completion here keeps `defer_callback = true`
@@ -752,9 +767,10 @@ pub const LoopCtx = struct {
     /// the ready list as it was when the turn began. A connection that
     /// performs its next send meanwhile joins a new list, taken by the
     /// next turn, so one connection's response does not hold the loop.
-    /// zio documents what this relies on (830564437b2c, src/ev/completion.zig,
-    /// `Async.Pending`): a handle is out of the loop from when the loop
-    /// completes it until the next `add`, and a notify of a handle in the
+    /// zio documents what this relies on (53ed3c377317, src/ev/completion.zig,
+    /// `Async.Pending`, and `Completion.callback` as cited at `Op`): a handle
+    /// is out of the loop from when the loop completes it until the next
+    /// `add`, and a notify of a handle in the
     /// loop completes it at the loop's next check of its handles, so
     /// `ready` may add and notify it again from this callback; and a
     /// completion queued while the loop runs callbacks waits for the next
@@ -1001,7 +1017,7 @@ fn awaitReadyThenStop(ready: std.c.fd_t, threads: u32, stop_fd: c_int) void {
     }
     // zio's `Async.notify` is safe at any time while the `Async` itself is
     // alive, also against its loop ending and being deinitialized (zio
-    // 830564437b2c, https://github.com/lalinsky/zio/pull/928). Each `stop`
+    // 53ed3c377317, https://github.com/lalinsky/zio/pull/928). Each `stop`
     // lives in `loops`, which is never freed, so it outlives every notify
     // here, also one still running after `ekk_serve` has returned (this
     // thread is detached and never joined).
@@ -1123,7 +1139,7 @@ export fn ekk_serve(port: u16, threads: u32, maxc: u32, conninfo: *anyopaque, co
     loops = alloc.alloc(LoopCtx, threads) catch return 1;
     // Every loop accepts on the same `lfd`, yet each accept's callback runs
     // on the thread of the loop it was added to, because the loops share no
-    // zio LoopGroup (startLoop passes none). In the pinned zio (830564437b2c)
+    // zio LoopGroup (startLoop passes none). In the pinned zio (53ed3c377317)
     // a socket op parked on another loop's (fd, direction) registration is
     // completed by that loop, on its thread (src/ev/sockreg.zig:213-271,
     // `service` at 276-315 calling `markCompletedFromBackend`, which calls the
@@ -1134,7 +1150,10 @@ export fn ekk_serve(port: u16, threads: u32, maxc: u32, conninfo: *anyopaque, co
     // `internal_loop_group` (src/ev/loop.zig:516, 559-563), so it parks on
     // and services only its own table and poller. Passing a shared
     // `loop_group` to `loop.init` would let `acceptCb` run on another loop's
-    // thread against this loop's state. Checks keep this: serve_test.zig
+    // thread against this loop's state. zio's `Completion.callback`
+    // documentation (src/ev/completion.zig:294) says only "Called on the
+    // loop's thread", not which loop's when loops are grouped, so this rests
+    // on the code cited above. Checks keep this: serve_test.zig
     // checks that `startLoop` leaves its loop in the loop's own internal
     // group and that no identifier or string literal in the transport's Zig
     // sources is `loop_group` or `LoopGroup`; and every callback panics when

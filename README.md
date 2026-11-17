@@ -91,10 +91,14 @@ only `Server.Query` values.
   also keep a readiness poll while the send waits on the kernel, which
   carries no data (section "Deadlines"),
   and a close waits for that poll's completion. Reusing a
-  connection's completion from its own callback relies on zio's contract
-  (pinned 830564437b2c, `src/ev/loop.zig` `finishCompletion`): the completion is
-  marked dead before its callback runs, and for a completion without a group
-  owner the callback is the last thing the loop does with it. The loops run
+  connection's completion from its own callback relies on zio's documented
+  contract (pinned 53ed3c377317, `src/ev/completion.zig`, `Completion.callback`,
+  https://github.com/lalinsky/zio/pull/929): "The completion is already dead
+  when it runs, and for a completion with neither `rearm` nor a group or queue
+  owner the loop does not touch it after the callback returns. The callback
+  may therefore free it, or reuse its memory for the next operation, of the
+  same or another type, and `add` it again." The transport sets no `rearm`
+  and uses no zio group or queue (`zig/src/serve.zig`, `Op`). The loops run
   on kqueue on macOS and, on Linux, on the backend the build names: epoll
   (the default) or io_uring, chosen by `LSRV_LINUX_BACKEND` for `lake build`
   (`-Dlinux-backend` of `zig/build.zig`; item wi7efy, which superseded

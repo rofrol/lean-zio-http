@@ -30,13 +30,14 @@
 //! These tests and pg_test.zig's run on macOS (kqueue, `./check.sh`) and on
 //! Linux (epoll and io_uring, `./linux-check.sh`, README "Running"; rerun it
 //! at each zio update and update this record). Last Linux run, 2026-11-17
-//! (item wi7efy): OrbStack on the M1, aarch64, kernel
+//! (item uwrdc2): OrbStack on the M1, aarch64, kernel
 //! 7.2.12-orbstack-00394-gbecdd6130068, Debian 13.7, Zig 0.17.1, Lean
-//! nightly-2026-11-17, libpq 17.12, zio 830564437b2c. `./linux-check.sh`
-//! exit 0, on epoll and on io_uring each: serve_test 25/25, pg_test 31/31,
-//! pg_glue_test passed, and the rest of `./check.sh`, bench/dbcheck on the
-//! container's private cluster included. With serve.zig's `startSend` not
-//! trying the send itself (a mutation), 3 tests failed on io_uring, among
+//! nightly-2026-11-17, libpq 17.12, zio 53ed3c377317. `./linux-check.sh`
+//! exit 0, on epoll and on io_uring each: `zig build test` passed
+//! (serve_test's 25 tests, pg_test's 31), pg_glue_test passed, and the rest
+//! of `./check.sh`, bench/dbcheck on the container's private cluster
+//! included. In item wi7efy's run (zio 830564437b2c), with serve.zig's
+//! `startSend` not trying the send itself (a mutation), 3 tests failed on io_uring, among
 //! them "a response sent at once starts no poll ...". A diagnostic loop of
 //! 30 runs of the serve_test binary on each backend: 0 failures.
 const std = @import("std");
@@ -709,7 +710,7 @@ test "startLoop joins its loop to no LoopGroup: the loop alone services its sock
     // LoopGroup joins them (serve.zig, the comment above
     // `for (loops) |*lp| lp.* = .{ .lfd = lfd };` in `ekk_serve`). Checked
     // on the state `loop.init` left, not on how its options are spelled: in
-    // the pinned zio (830564437b2c) a loop given no `loop_group` uses its own
+    // the pinned zio (53ed3c377317) a loop given no `loop_group` uses its own
     // `internal_loop_group`, and every loop of a group counts in its `loops`
     // (src/ev/loop.zig:515-516, 559-563, 574); the registration table its
     // sockets park on is that group's (loop.zig:582). Recheck at each update
@@ -900,7 +901,7 @@ const due_at_once: u32 = 0;
 
 /// Moves the connection's current deadline to now (a test hook): its timer
 /// is due at the loop's next timer check, which comes before its I/O in
-/// every poll (zio 830564437b2c, `Loop.poll`: `checkTimers`, then the
+/// every poll (zio 53ed3c377317, `Loop.poll`: `checkTimers`, then the
 /// backend, then the queued completions).
 fn dueNow(s: *Single) void {
     const conn = s.lp.head.?;
@@ -1543,7 +1544,7 @@ fn partialSend(s: *Single) !PartialSend {
 /// callback (whether the send was still in the kernel when the expiry ran,
 /// and whether the cancel was asked after it), `sendSpy` before the send's
 /// (what its one completion carried). zio's `Loop.cancel`
-/// (pinned 830564437b2c, src/ev/loop.zig) says "the completion's callback
+/// (pinned 53ed3c377317, src/ev/loop.zig) says "the completion's callback
 /// will still be invoked when the operation completes (either with
 /// error.Canceled or its natural result)", and a cancel of a completion
 /// already completed is a no-op (src/ev/completion.zig, `requestCancel`:
@@ -1678,7 +1679,7 @@ test "a write deadline the loop runs before a ready send's completion closes, an
     // The parked send can make progress and the write deadline is due
     // before the loop polls again. In that poll zio checks the timers, then
     // the backend completes the send with what it wrote, then the queued
-    // callbacks run, the timer's first (zio 830564437b2c, `Loop.poll`): the
+    // callbacks run, the timer's first (zio 53ed3c377317, `Loop.poll`): the
     // expiry closes and asks to cancel the send, too late, and the send's
     // completion, with its natural result, only leads to the close.
     try spyOnSend(conn);
