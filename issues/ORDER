@@ -3,6 +3,7 @@
 dv6ikn Decide when a pipelined request's head budget starts
 znioju Test a write deadline expiring during a partial send, in both orders
 5lkloz Test a connection whose close completes before a retired timer's callback
+ub3d5m Make a failed transport test leave no state that fails the tests after it
 ycpzlt Should Server.Query carry a structured "outcome unknown" signal for a query the server abandoned?
 3jnkx5 Deadlines for PostgreSQL queries, connection attempts and shutdown in the Lean server
 lgxdi7 Prepare the upstream question for mxzlsx (Std.Http H1 reparses an unfinished field line)
@@ -12,7 +13,6 @@ jqzv42 Decide whether to ask upstream for request-target count limits apart from
 7mzw77 Accept that stale-statement recognition relies on PostgreSQL's undocumented source-function field
 grjqox Move dusty-hello's zio pin to the server's (830564437b2c)
 u4moqo Move the toolchain to the first nightly with lean4 PR 16417 (Std.Http RFC fixes)
-ub3d5m Make a failed transport test leave no state that fails the tests after it
 
 ## Proposed
 
