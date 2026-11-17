@@ -163,8 +163,15 @@ export fn ekk_pg_start(_: [*:0]const u8) ?*anyopaque {
     return s;
 }
 
+/// PQconnectPoll: reads what the peer sent (the server's part of the
+/// handshake), so a connected slot's peeking receive parks.
 export fn ekk_pg_connect_poll(p: *anyopaque) c_int {
-    fake.note(.connect_poll, sessionOf(p).id);
+    const s = sessionOf(p);
+    fake.note(.connect_poll, s.id);
+    if (s.fd >= 0) {
+        var buf: [256]u8 = undefined;
+        while (c.read(s.fd, &buf, buf.len) > 0) {}
+    }
     return fake.connect_poll.next("ekk_pg_connect_poll");
 }
 
@@ -739,5 +746,129 @@ test "d: a connect that fails after a readiness completion is delivered from the
     try std.testing.expectEqual(@as(usize, 0), w.during_submit);
     try std.testing.expectEqualSlices(u8, "08006", &w.got[0].sqlstate);
     try std.testing.expectEqual(.disconnected, slot0(&fx).state);
+    try fx.deinit();
+}
+
+// ---- (e) one connect in flight per pool ----
+
+fn slotIs(comptime i: usize, comptime state: anytype) fn (*Fixture) bool {
+    return struct {
+        fn f(fx: *Fixture) bool {
+            return fx.pool.slots[i].state == state;
+        }
+    }.f;
+}
+
+test "e: one connect serves every query waiting; its failure fails each of them once" {
+    var fx: Fixture = .{};
+    try fx.init(2);
+    const peer = try fx.pair();
+    fake.start.push(&.{1});
+    fake.connect_poll.push(&.{ 1, 0 }); // wait to read, then fail
+    var ws = [_]TestWaiter{ .{ .pool = &fx.pool }, .{ .pool = &fx.pool }, .{ .pool = &fx.pool } };
+    for (&ws) |*w| w.submit();
+    // Two slots, three queries: one connect, on slot 0.
+    try std.testing.expectEqual(@as(usize, 1), fake.count.get(.start));
+    try std.testing.expectEqual(.connecting, fx.pool.slots[0].state);
+    try std.testing.expectEqual(.disconnected, fx.pool.slots[1].state);
+    const mark = fake.calls;
+    try poke(peer);
+    try fx.until(&ws[2], delivered);
+    try expectKinds(mark, &.{ .connect_poll, .deliver, .deliver, .deliver, .finish });
+    for (&ws) |*w| {
+        try std.testing.expectEqual(@as(usize, 1), w.n);
+        try std.testing.expectEqualSlices(u8, "08006", &w.got[0].sqlstate);
+    }
+    try std.testing.expect(fx.allDisconnected());
+    try fx.idle();
+    try std.testing.expectEqual(@as(usize, 1), fake.count.get(.start)); // no reconnect
+    try fx.deinit();
+}
+
+test "e: a query submitted from a failed connect's delivery waits for the next connect" {
+    var fx: Fixture = .{};
+    try fx.init(1);
+    var order: std.ArrayList(u8) = .empty;
+    defer order.deinit(std.testing.allocator);
+    const peer = try fx.pair();
+    fake.start.push(&.{ 1, 1 });
+    // Connect 1 waits to read, then fails; connect 2 fails at once.
+    fake.connect_poll.push(&.{ 1, 0, 0 });
+    var a: TestWaiter = .{ .pool = &fx.pool, .again = 1, .order = &order, .tag = 'a' };
+    var b: TestWaiter = .{ .pool = &fx.pool, .order = &order, .tag = 'b' };
+    a.submit();
+    b.submit();
+    try poke(peer);
+    try fx.until(&a, struct {
+        fn f(x: *TestWaiter) bool {
+            return x.n == 2;
+        }
+    }.f);
+    // a's second query was not failed by connect 1: b, waiting for connect
+    // 1, got its answer first, and connect 2 answered a again.
+    try std.testing.expectEqualStrings("aba", order.items);
+    try std.testing.expectEqual(@as(usize, 2), fake.count.get(.start));
+    try std.testing.expectEqualSlices(u8, "08006", &a.got[1].sqlstate);
+    try std.testing.expectEqual(@as(u32, 1), max_depth);
+    try fx.deinit();
+}
+
+test "e: a connect that succeeds serves the queue; the next connect starts only after it" {
+    var fx: Fixture = .{};
+    try fx.init(2);
+    _ = try fx.pair(); // session 1
+    fake.start.push(&.{1});
+    fake.connect_poll.push(&.{1});
+    var a: TestWaiter = .{ .pool = &fx.pool };
+    var b: TestWaiter = .{ .pool = &fx.pool };
+    var d: TestWaiter = .{ .pool = &fx.pool };
+    a.submit();
+    b.submit();
+    d.submit();
+    try std.testing.expectEqual(@as(usize, 1), fake.count.get(.start));
+
+    // Session 1 connects and runs a, the queue's head; b and d still wait,
+    // so the pool starts connect 2 (session 2 waits to read).
+    _ = try fx.pair(); // session 2
+    fake.start.push(&.{1});
+    fake.connect_poll.push(&.{ 3, 1 });
+    fake.send.push(&.{0});
+    fake.flush.push(&.{0});
+    var mark = fake.calls;
+    try poke(fx.peers[0]);
+    try fx.until(&fx, slotIs(1, .connecting));
+    try expectKinds(mark, &.{ .connect_poll, .send, .flush, .start, .connect_poll });
+    try std.testing.expectEqual(.busy, fx.pool.slots[0].state);
+
+    // a's result: slot 0 goes idle and runs b; d waits for connect 2.
+    fake.consume.push(&.{1});
+    fake.collect.push(&.{1});
+    fake.send.push(&.{0});
+    fake.flush.push(&.{0});
+    mark = fake.calls;
+    try poke(fx.peers[0]);
+    try fx.until(&a, delivered);
+    try expectKinds(mark, &.{ .consume, .collect, .deliver, .send, .flush });
+    try std.testing.expectEqual(.rows, a.got[0].kind);
+    try std.testing.expectEqual(@as(usize, 0), d.n);
+
+    // Session 2 connects and runs d.
+    fake.connect_poll.push(&.{3});
+    fake.send.push(&.{0});
+    fake.flush.push(&.{0});
+    mark = fake.calls;
+    try poke(fx.peers[1]);
+    try fx.until(&fx, slotIs(1, .busy));
+    try expectKinds(mark, &.{ .connect_poll, .send, .flush });
+
+    fake.consume.push(&.{ 1, 1 });
+    fake.collect.push(&.{ 1, 1 });
+    try poke(fx.peers[0]);
+    try poke(fx.peers[1]);
+    try fx.until(&d, delivered);
+    try fx.until(&b, delivered);
+    try std.testing.expectEqual(.rows, b.got[0].kind);
+    try std.testing.expectEqual(.rows, d.got[0].kind);
+    try std.testing.expectEqual(@as(usize, 2), fake.count.get(.start));
     try fx.deinit();
 }

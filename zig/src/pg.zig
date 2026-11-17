@@ -11,11 +11,17 @@
 //   pool error (`08006` when the connection was lost or could not be made,
 //   `54000` for a query that cannot be sent). A query is never retried: once
 //   it may have reached the server, losing the connection fails it.
-// - Waiters wait in FIFO order when no slot is free (pool exhaustion); each
-//   waiter has at most one query (Conn.step_query), so the queue is bounded
-//   by the loop's connections.
-// - Connections open on demand, for the query that needs one; there are no
-//   timers, retries or backoff. A failed connect fails that query.
+// - Waiters wait in FIFO order when no connection is idle (pool exhaustion,
+//   or a connect in flight); each waiter has at most one query
+//   (Conn.step_query), so the queue is bounded by the loop's connections.
+// - Connections open on demand, when a query waits and no connection is
+//   idle, and at most one connect per pool is in flight (`Pool.attempt`): a
+//   connect is not tied to a query. When it succeeds, the new idle
+//   connection serves the queue like any other; when it fails, every query
+//   waiting at that moment fails once with `08006`, and a query submitted
+//   later (also from those deliveries) may start the next connect. There are
+//   no timers, retries or backoff: this bounds concurrent connects per loop,
+//   not the rate of connects while the database stays down.
 // - zio's socket registry keeps a registration per descriptor until a
 //   `NetClose` removes it (and asserts nothing is parked on it), while libpq
 //   closes and may replace its own socket (PQfinish, PQconnectPoll). So the
@@ -52,9 +58,10 @@ pub const Waiter = struct {
     deliver: *const fn (*Waiter, Lean) void,
 };
 
-/// A slot's lifecycle. `connecting` and `busy` run `waiter`'s query;
-/// `closing` waits for its polls to be retired and its duplicate to be closed
-/// before PQfinish.
+/// A slot's lifecycle. `connecting` is the pool's one connect in flight
+/// (`Pool.attempt`), for no query in particular; `busy` runs `waiter`'s
+/// query; `closing` waits for its polls to be retired and its duplicate to be
+/// closed before PQfinish.
 const SlotState = enum { disconnected, connecting, idle, busy, closing };
 
 pub const Slot = struct {
@@ -136,10 +143,10 @@ pub const Slot = struct {
 
     // ---- connecting ----
 
-    /// Opens a connection for `w`'s query.
-    fn connect(self: *Slot, w: *Waiter) void {
-        std.debug.assert(self.state == .disconnected);
-        self.waiter = w;
+    /// Opens a connection: the pool's attempt, for the queries waiting.
+    fn connect(self: *Slot) void {
+        std.debug.assert(self.state == .disconnected and self.pool.attempt == null);
+        self.pool.attempt = self;
         self.state = .connecting;
         self.pg = ekk_pg_start(self.pool.conninfo);
         self.connectStep();
@@ -155,24 +162,22 @@ pub const Slot = struct {
             },
             3 => {
                 if (!self.takeSocket()) return self.connectFailed();
-                self.state = .busy;
+                self.state = .idle;
+                self.pool.attempt = null;
                 self.arm(.recv); // armed for the connection's whole life
-                self.send();
+                self.pool.next(self);
             },
             else => self.connectFailed(),
         }
     }
 
+    /// The connect failed with no duplicate registered.
     fn connectFailed(self: *Slot) void {
-        const w = self.waiter.?;
-        const err = ekk_pg_lost(self.pg);
+        self.pool.failWaiting(self.pg);
         if (self.pg) |pg| ekk_pg_finish(pg);
         self.pg = null;
-        self.waiter = null;
         self.state = .disconnected;
-        ekk_query_drop(w.query);
-        w.query = null;
-        w.deliver(w, err);
+        self.pool.attempt = null;
         self.pool.next(self);
     }
 
@@ -314,19 +319,17 @@ pub const Slot = struct {
     }
 
     fn finished(self: *Slot) void {
+        // A connect step that ended in `closing` (connectFailedAfterPoll):
+        // its poll failed, so libpq has no message worth reporting.
+        const failed = self.pool.attempt == self;
+        if (failed) self.pool.failWaiting(null);
         if (self.pg) |pg| {
             ekk_pg_finish(pg);
             if (self.pool.trace) std.debug.print("pg closed\n", .{});
         }
         self.pg = null;
         self.state = .disconnected;
-        if (self.waiter) |w| {
-            // A connect step ended in `closing` (connectFailedAfterPoll).
-            self.waiter = null;
-            ekk_query_drop(w.query);
-            w.query = null;
-            w.deliver(w, ekk_pg_error("08006", "the connection to the server failed"));
-        }
+        if (failed) self.pool.attempt = null;
         self.pool.next(self);
     }
 
@@ -349,6 +352,10 @@ pub const Pool = struct {
     slots: []Slot,
     head: ?*Waiter = null,
     tail: ?*Waiter = null,
+    /// The slot whose connect is in flight: at most one per pool. It stays
+    /// set while that connect's failure is delivered, so a query submitted
+    /// from a delivery waits for the next connect instead of joining it.
+    attempt: ?*Slot = null,
     /// The loop is shutting down: idle connections close, and a slot that
     /// finds no waiter closes too.
     stopping: bool = false,
@@ -387,8 +394,8 @@ pub const Pool = struct {
         return w;
     }
 
-    /// Gives waiting queries to slots: idle connections first, then slots
-    /// that can open one.
+    /// Gives waiting queries to idle connections; when queries still wait,
+    /// starts a connect unless one is in flight.
     fn dispatch(self: *Pool) void {
         if (self.dispatching) return;
         self.dispatching = true;
@@ -404,19 +411,41 @@ pub const Pool = struct {
                 w.deliver(w, ekk_pg_error("08006", "no database is configured (--pg)"));
                 continue;
             }
-            const slot = self.free() orelse break;
-            const w = self.dequeue().?;
-            if (slot.state == .idle) slot.run(w) else slot.connect(w);
+            if (self.find(.idle)) |slot| {
+                slot.run(self.dequeue().?);
+                continue;
+            }
+            if (self.attempt != null) break;
+            // A connect that ends at once (success or failure) changes the
+            // queue or the slots, and the loop goes on from there.
+            const slot = self.find(.disconnected) orelse break;
+            slot.connect();
         }
         if (self.stopping and self.head == null) {
             for (self.slots) |*s| if (s.state == .idle) s.teardown();
         }
     }
 
-    fn free(self: *Pool) ?*Slot {
-        for (self.slots) |*s| if (s.state == .idle) return s;
-        for (self.slots) |*s| if (s.state == .disconnected) return s;
+    fn find(self: *Pool, state: SlotState) ?*Slot {
+        for (self.slots) |*s| if (s.state == state) return s;
         return null;
+    }
+
+    /// The connect in flight failed: every query waiting now fails once with
+    /// `08006` (`pg`'s message when given). A query submitted from one of
+    /// these deliveries joins a fresh queue, for the next connect.
+    fn failWaiting(self: *Pool, pg: ?*Session) void {
+        std.debug.assert(self.attempt != null);
+        var it = self.head;
+        self.head = null;
+        self.tail = null;
+        while (it) |w| {
+            it = w.next;
+            w.next = null;
+            ekk_query_drop(w.query);
+            w.query = null;
+            w.deliver(w, ekk_pg_lost(pg));
+        }
     }
 
     /// A slot became idle or disconnected.

@@ -243,9 +243,12 @@ else meanwhile; the loop serves its other connections (`Conn.step_query`,
 - **Pool.** Each loop has its own pool of at most `--pg-conns` libpq
   connections in non-blocking mode, registered with its own `zio.ev` loop
   only (no locks, no sharing between loops; one loop's busy pool does not
-  borrow another's idle connections). Connections open on demand, for the
-  query that needs one; a query that finds every slot busy waits in the
-  loop's FIFO queue, which holds at most one query per HTTP connection.
+  borrow another's idle connections). A query that finds no idle
+  connection waits in the loop's FIFO queue, which holds at most one query
+  per HTTP connection. Connections open on demand, while queries wait and a
+  slot is free, one at a time per loop: a connect is not tied to a query,
+  and the connection it opens serves the queue's head like any idle one.
+  So a burst on a cold pool opens its connections one after another.
   zio's socket registry keeps a registration per descriptor until a
   `NetClose`, while libpq closes and replaces its own socket, so the pool
   polls a duplicate of libpq's descriptor that it owns and closes with
@@ -273,9 +276,13 @@ else meanwhile; the loop serves its other connections (`Conn.step_query`,
   connection fails it, and its outcome is unknown (a write may have been
   committed); the next query opens a fresh connection. Likewise a process
   that ends after a query was sent leaves its outcome to PostgreSQL, as
-  for any client that disconnects. With the
-  database down every query fails at once with `08006` after its own
-  connection attempt; there are no timers, backoff or circuit breaker.
+  for any client that disconnects. A connect that fails fails every query
+  waiting at that moment, each once with `08006`, also when other
+  connections of the pool are busy; a query submitted later starts the
+  next connect. So with the database down a loop has at most one connect
+  in flight, and a flood of requests is answered from it rather than with
+  a connect each; there are no timers, backoff or circuit breaker, so this
+  bounds concurrent connects, not their rate while the database stays down.
   `App.Db` answers class 08 with 503 and other errors with 500.
 - **Liveness.** An idle connection keeps its receive armed, so a connection
   the server closed is ended when the loop handles its EOF. This is best
