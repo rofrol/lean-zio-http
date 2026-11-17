@@ -1,6 +1,5 @@
 ## Next, in order
 
-ycpzlt Should Server.Query carry a structured "outcome unknown" signal for a query the server abandoned?
 3jnkx5 Deadlines for PostgreSQL queries, connection attempts and shutdown in the Lean server
 lgxdi7 Prepare the upstream question for mxzlsx (Std.Http H1 reparses an unfinished field line)
 mxzlsx Decide how to handle Std.Http H1 parsing an unfinished line again from its start: ask upstream, or approve a supported-subset contract
@@ -14,6 +13,8 @@ znorfg Should the transport tests' cleanup and leak report get a committed check
 ogcdwm Should the transport tests run on Linux, so the Unix-domain parked-send test is checked on epoll and io_uring?
 
 ## Proposed
+
+q7lol5 Should a query whose connection is lost after it was sent be answered Query.Result.abandoned instead of error 08006?
 
 ## Needs a decision
 
