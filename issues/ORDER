@@ -1,6 +1,5 @@
 ## Next, in order
 
-7mzw77 Accept that stale-statement recognition relies on PostgreSQL's undocumented source-function field
 grjqox Move dusty-hello's zio pin to the server's (830564437b2c)
 u4moqo Move the toolchain to the first nightly with lean4 PR 16417 (Std.Http RFC fixes)
 3gvmy3 Should the transport check mechanically that every loop callback runs on its own loop?
