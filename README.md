@@ -964,16 +964,24 @@ to `Single.deinit`.
 
 `./linux-check.sh` is the Linux validation (item ogcdwm): it builds the
 Debian trixie image of `linux/Dockerfile` (Zig, the Lean toolchain of
-`lean-toolchain` and Go at pinned versions and checksums; PostgreSQL 17 and
-the base image as Debian's archive has them at the build)
+`lean-toolchain` and Go at pinned versions and checksums; the base image
+pinned by digest; PostgreSQL 17 as Debian's archive has it at the build)
 with this machine's `docker` (on the M1, OrbStack) and runs the whole
 `./check.sh` in it on a copy of the working tree: the transport's and the
 pool's tests (`zig build test`), once on epoll and once on io_uring
-(`LSRV_LINUX_BACKEND`; that run turns the container's seccomp filter off,
-as docker's default profile refuses `io_uring_setup`), which serve_test.zig
+(`LSRV_LINUX_BACKEND`; only that run turns the container's seccomp filter
+off, as docker's default profile refuses `io_uring_setup`: acceptable for
+this local developer container running the repository's own code, never
+for production or for untrusted code), which serve_test.zig
 checks is the backend in use, the database checks on the container's own private
 cluster, and every other check. It prints the architecture, kernel, Debian,
-Zig, Lean, Go, libpq, PostgreSQL and zio versions first. It needs network access and
+Zig, Lean, Go, libpq, PostgreSQL and zio versions first, and fails when
+libpq's or the server's major is not 17 or Zig is not on
+`zig/build.zig.zon`'s `minimum_zig_version` line (the same major.minor,
+and a patch at least the minimum's), so a rebuild that drifted fails instead of testing other
+versions silently. To move the base image, take the index digest that
+`docker buildx imagetools inspect debian:trixie` prints and note the date
+beside it in `linux/Dockerfile`. It needs network access and
 docker; `./check.sh` does not depend on it. Run it at each update of zio and
 record its result in the commit. It is development evidence on the host's
 architecture and the container runtime's kernel, not production

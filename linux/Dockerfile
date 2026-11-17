@@ -1,13 +1,21 @@
 # The Linux validation host (item ogcdwm): Debian trixie with the tools
 # ./check.sh needs. Pinned by version and SHA-256: Zig (the version the macOS
 # runs use), the Lean toolchain named by lean-toolchain and Go
-# (bench/*/go.mod). Not pinned: the debian:trixie image and PostgreSQL 17
-# (libpq and the server for the private cluster), which come from Debian's
-# archive as of the build. ../linux-check.sh builds it, prints those
-# versions and runs ./check.sh in it; it checks that lean-toolchain still
-# names LEAN_NIGHTLY. Update a version and its sums together. It builds for
-# arm64 and x86_64 hosts.
-FROM debian:trixie
+# (bench/*/go.mod). The base image is pinned by its digest (item zg4hrz).
+# PostgreSQL 17 (libpq and the server for the private cluster) comes from
+# Debian's archive as of the build, not pinned to a snapshot: a minor
+# release may differ between builds, and ../linux-check.sh fails the run when
+# libpq's or the server's major is not 17. ../linux-check.sh builds it,
+# prints the versions and runs ./check.sh in it; it checks that
+# lean-toolchain still names LEAN_NIGHTLY and that Zig is on
+# zig/build.zig.zon's minimum_zig_version line. Update a version and its
+# sums together. It builds for arm64 and x86_64 hosts.
+#
+# debian:trixie as of 2026-11-18 (the multi-architecture index; its
+# manifests' annotations say created 2026-11-04; Debian 13.7): to update,
+# take the index digest that `docker buildx imagetools inspect debian:trixie`
+# prints and the date.
+FROM debian:trixie@sha256:9c6e381421d0f48d1b8133e573f33c185ee16cbf505eda9c4a8a4791b25ea8a6
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates curl xz-utils zstd git \
