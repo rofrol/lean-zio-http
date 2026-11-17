@@ -1,9 +1,10 @@
 ## Next, in order
 
-sy3ims Decide whether to report upstream that Std.Http's H1 reparses an unfinished line from its start on every call
 u4moqo Move the toolchain to the first nightly with lean4 PR 16417 (Std.Http RFC fixes)
 
 ## Proposed
+
+mxzlsx Decide how to handle Std.Http H1 parsing an unfinished line again from its start: ask upstream, or approve a supported-subset contract
 
 ## Needs a decision
 
