@@ -146,7 +146,22 @@ only `Server.Query` values.
   and `--crash-after-recv N` and `--crash-after-send N` kill the process with
   SIGKILL right after the N-th successful receive or send, before Lean hears
   of it.
-- `dusty-hello/`: the same route on dusty, the HTTP library on zio.
+- `dusty-hello/`: the same route on dusty, the HTTP library on zio. Its
+  `build.zig` gives dusty's module the real zio in place of dusty's stub
+  `zio` import, the setup dusty 0.6.0 documents for applications on the zio
+  runtime, so dusty's deadlines use zio.AutoCancel instead of its portable
+  watchdog, a second task per connection (`src/deadline.zig`; decided
+  2026-11-17, item im7c5q). A Debug build shows the switch:
+  `deadline.Watch.wait` is gone and `AutoCancel.setClock` is linked. In one
+  `./bench.sh` run each on the M1, the stub before and the real zio after,
+  dusty's throughput changed by 2% or less at each concurrency, while Go,
+  unchanged, moved by up to 6% between the same two runs; one run each
+  establishes no repeatable effect either way:
+
+  | dusty | c=1 req/s | c=64 req/s | c=256 req/s | CPU µs/req (1/64/256) |
+  |---|---|---|---|---|
+  | stub (watchdog) | 21,132 | 80,748 | 84,493 | 18 / 40 / 36 |
+  | real zio (AutoCancel) | 21,545 | 79,414 | 83,883 | 16 / 39 / 34 |
 - `bench/`: Go's `net/http` with the same route (`goserver`) and with
   `App.Db`'s `/db` route over a pgx pool (`pgserver`), end-to-end checks over
   real sockets (`check`), the boundary tests (`boundary`, below), the
