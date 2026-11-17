@@ -9,6 +9,7 @@ ogcdwm Should the transport tests run on Linux, so the Unix-domain parked-send t
 ## Proposed
 
 q2g4am Act on leanprover/lean4's answers to the Std.Http questions 16522 and 16523
+ncvxfx Should a query whose deadline expires during the statement Close keep its known error?
 
 ## Needs a decision
 
