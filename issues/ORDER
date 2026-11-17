@@ -10,7 +10,6 @@ u4moqo Move the toolchain to the first nightly with lean4 PR 16417 (Std.Http RFC
 
 ## Proposed
 
-sxrhgm Bound or measure the worst case of the adapter state a connection retains
 kvnm3u Decide whether the type, not a comment, should keep the clock out of the adapter's kept state
 sy3ims Decide whether to report upstream that Std.Http's H1 reparses an unfinished line from its start on every call
 
