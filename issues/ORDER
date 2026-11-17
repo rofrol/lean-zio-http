@@ -1,6 +1,5 @@
 ## Next, in order
 
-grjqox Move dusty-hello's zio pin to the server's (830564437b2c)
 u4moqo Move the toolchain to the first nightly with lean4 PR 16417 (Std.Http RFC fixes)
 3gvmy3 Should the transport check mechanically that every loop callback runs on its own loop?
 znorfg Should the transport tests' cleanup and leak report get a committed check of their own?
@@ -10,6 +9,7 @@ ncvxfx Should a query whose deadline expires during the statement Close keep its
 ## Proposed
 
 q2g4am Act on leanprover/lean4's answers to the Std.Http questions 16522 and 16523
+im7c5q Should dusty-hello give dusty the real zio module instead of its stub?
 
 ## Needs a decision
 
