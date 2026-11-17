@@ -29,12 +29,12 @@ def rule (m : Name) : Option (Name → Bool) :=
   | `Server.H1Adapter => some (· ∈ contracts ++ [`Server.Response, `Std.Http.Protocol.H1])
   | `Server.HandParser => some (· ∈ contracts ++ [`Server.Response])
   -- Composition roots: one transport, one adapter, one application each.
-  | `Main | `Fixture | `MainDb => some fun i => i ∈ [`Server.Transport, `Server.H1Adapter] || under `App i
+  | `Main | `Fixture | `MainDb | `MainArena => some fun i => i ∈ [`Server.Transport, `Server.H1Adapter] || under `App i
   | `MainHand | `FixtureHand => some fun i => i ∈ [`Server.Transport, `Server.HandParser] || under `App i
   -- The applications see the handler interface (and through it the query
   -- values), never the transport or an adapter. Each one is named with the
   -- imports it has: a new application fails until it is placed here.
-  | `App.Hello => some (· == `Server.Handler)
+  | `App.Hello | `App.Arena => some (· == `Server.Handler)
   | `App.Fixture | `App.Db => some (· ∈ [`Server.Handler, `App.Hello])
   -- Tests and measurement tools may import anything.
   | `Test | `Bench | `Compare | `Corpus | `Arch => some fun _ => true

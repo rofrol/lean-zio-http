@@ -135,7 +135,7 @@ lean_lib ServerHttp where
 -- Example applications the tests and benchmarks run: import only
 -- Server.Handler and the applications Arch.lean names for each.
 lean_lib App where
-  roots := #[`App.Hello, `App.Fixture, `App.Db]
+  roots := #[`App.Hello, `App.Fixture, `App.Db, `App.Arena]
 
 -- Tests and measurements.
 lean_lib TestSupport where
@@ -153,6 +153,11 @@ lean_lib TestSupport where
 
 @[default_target] lean_exe «lsrv-hand» where
   root := `MainHand
+  moreLinkArgs := #["-lpq"]
+
+-- HttpArena's HTTP/1.1 entry (item 53rwgc; README, "HttpArena on the VPS").
+@[default_target] lean_exe «lsrv-arena» where
+  root := `MainArena
   moreLinkArgs := #["-lpq"]
 
 @[default_target] lean_exe «lsrv-fixture» where

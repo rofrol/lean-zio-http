@@ -1,0 +1,136 @@
+#!/bin/sh
+# inner.sh tests|bench DIR: run.sh runs this in the run's own network and PID
+# namespaces (item 53rwgc; README, "HttpArena on the VPS"). Results go to
+# DIR/out.
+#
+# tests: the transport's and the pool's test binaries (zig build test:
+#   pg_test and serve_test on epoll and on io_uring, and pg_glue_test).
+# bench: for each contender (lsrv-arena on epoll and on io_uring, HttpArena's
+#   go-stdlib and go-fasthttp), first the response checks (validate.log),
+#   then round 0 (warm-up, not reported) and rounds 1-5 of HttpArena's
+#   HTTP/1.1 profiles the server owns, with the generator on the same two
+#   CPUs. Each sample starts a fresh server, so its peak memory (VmHWM) is that
+#   sample's. The contenders' order rotates each round.
+set -eu
+phase=$1 d=$2
+out=$d/out
+mkdir -p "$out"
+ip link set lo up
+# This namespace's own socket limits: HttpArena's generator needs one local
+# port per connection and the servers a backlog for 4096 connections opened
+# at once.
+sysctl -q -w net.ipv4.ip_local_port_range="1024 65535" net.core.somaxconn=65535 net.ipv4.tcp_max_syn_backlog=65535
+ulimit -n 262144
+export LD_LIBRARY_PATH="$d/lib"
+# run.sh's watcher writes $d/stop when the site fails; its kill of the scope
+# fails while the scope is still starting, so every step checks the file.
+stopped() { [ ! -e "$d/stop" ] || exit 3; }
+stopped
+
+if [ "$phase" = tests ]; then
+  status=0
+  # pg_glue_test runs no event loop: one binary for both backends.
+  for t in pg_test-epoll serve_test-epoll pg_test-io_uring serve_test-io_uring pg_glue_test; do
+    stopped
+    s=0
+    "$d/$t" >"$out/test-$t.log" 2>&1 || s=$?
+    echo "$t: exit $s, $(tail -n 1 "$out/test-$t.log")" | tee -a "$out/tests.txt"
+    [ $s -eq 0 ] || status=1
+  done
+  exit $status
+fi
+
+port=8080
+url=http://127.0.0.1:$port
+req=$d/requests
+server_cmd() {
+  case $1 in
+    lsrv-epoll) echo "$d/lsrv-arena-epoll 2 --port $port --max-conns 16384" ;;
+    lsrv-io_uring) echo "$d/lsrv-arena-io_uring 2 --port $port --max-conns 16384" ;;
+    go-stdlib) echo "$d/go-stdlib" ;;
+    go-fasthttp) echo "$d/go-fasthttp" ;;
+  esac
+}
+pid=
+start() {
+  # $(server_cmd) is unquoted on purpose: fixed words without spaces.
+  $(server_cmd "$1") >"$out/server-$1.log" 2>&1 &
+  pid=$!
+  # Retries an idempotent request until the server answers, at most 5000
+  # times; the server's exit ends the wait too.
+  i=0
+  until curl -s -o /dev/null "$url/pipeline"; do
+    kill -0 "$pid" 2>/dev/null || { echo "$1 exited before answering"; exit 1; }
+    i=$((i + 1))
+    [ $i -lt 5000 ] || { echo "$1 did not answer"; exit 1; }
+  done
+}
+stop() {
+  kill -TERM "$pid"
+  wait "$pid" || true
+}
+# User plus system CPU ticks of the whole process.
+ticks() { awk '{ print $14 + $15 }' "/proc/$1/stat"; }
+
+servers="lsrv-epoll lsrv-io_uring go-stdlib go-fasthttp"
+profiles="baseline pipelined limited-conn latency-10k"
+
+# The response checks: validate.sh's baseline and pipelined checks
+# (scripts/validate.sh, "Baseline", "Pipelined"), with curl.
+check() { # NAME WANT CURL-ARGS...
+  name=$1 want=$2; shift 2
+  got=$(curl -s "$@") || got="curl failed"
+  if [ "$got" = "$want" ]; then echo "PASS $s $name"; else echo "FAIL $s $name: got '$got', want '$want'"; fi >>"$out/validate.log"
+}
+for s in $servers; do
+  stopped
+  start "$s"
+  check "GET /baseline11?a=13&b=42" 55 "$url/baseline11?a=13&b=42"
+  check "POST /baseline11?a=13&b=42 body=20" 75 -d 20 "$url/baseline11?a=13&b=42"
+  check "POST /baseline11?a=13&b=42 chunked body=20" 75 -H "Transfer-Encoding: chunked" -d 20 "$url/baseline11?a=13&b=42"
+  a=$(awk 'BEGIN { srand(); print int(rand() * 10000) }') b=$(awk 'BEGIN { srand(); print int(rand() * 777) + 1 }')
+  check "GET /baseline11?a=$a&b=$b (random)" $((a + b)) "$url/baseline11?a=$a&b=$b"
+  check "GET /baseline11 Content-Type" "text/plain" -o /dev/null -w '%{content_type}' "$url/baseline11?a=13&b=42"
+  check "GET /pipeline" ok "$url/pipeline"
+  check "GET /pipeline Content-Type" "text/plain" -o /dev/null -w '%{content_type}' "$url/pipeline"
+  # Sixteen requests pipelined on one connection, as gcannon -p 16 sends them.
+  got=$( (for i in $(seq 16); do cat "$req/pipeline.raw"; done) | curl -s --max-time 5 telnet://127.0.0.1:$port 2>/dev/null | grep -c '^ok' || true) # delay: external deadline: curl ends the raw connection after 5 s, since the server keeps it open
+  if [ "$got" = 16 ]; then echo "PASS $s 16 pipelined GET /pipeline"; else echo "FAIL $s 16 pipelined GET /pipeline: $got answers"; fi >>"$out/validate.log"
+  stop
+done
+# Every check must pass, except the chunked body on lsrv-arena, which answers
+# it 501 (README, "HttpArena on the VPS"); a run with another failure is void.
+if grep FAIL "$out/validate.log" | grep -v '^FAIL lsrv-[a-z_]* POST /baseline11?a=13&b=42 chunked body=20:' >&2; then
+  echo "a response check failed: no measurement" >&2
+  exit 1
+fi
+
+generate() { # PROFILE FILE
+  case $1 in
+    baseline) "$d/gcannon" "$url" --raw "$req/get.raw,$req/post_cl.raw" -c 4096 -t 2 -d 5s -p 1 ;;
+    pipelined) "$d/gcannon" "$url/pipeline" -c 4096 -t 2 -d 5s -p 16 ;;
+    limited-conn) "$d/gcannon" "$url" --raw "$req/get.raw,$req/post_cl.raw" -c 4096 -t 2 -d 5s -p 1 -r 10 ;;
+    latency-10k) "$d/zrk" -t 2 -c 1024 -d 20s -R 10000 --format json --plain "$url/baseline11?a=1&b=2" ;;
+  esac >"$2" 2>&1
+}
+
+echo "round profile server cpu_ticks vmhwm_kb start end" >"$out/samples.txt"
+for round in 0 1 2 3 4 5; do
+  # Rotate the contenders' order by the round.
+  set -- $servers
+  k=0
+  while [ $k -lt $((round % 4)) ]; do set -- "$@" "$1"; shift; k=$((k + 1)); done
+  order="$*"
+  for p in $profiles; do
+    for s in $order; do
+      stopped
+      start "$s"
+      t0=$(date +%s.%N) c0=$(ticks "$pid")
+      generate "$p" "$out/r$round-$p-$s.txt"
+      c1=$(ticks "$pid") t1=$(date +%s.%N)
+      hwm=$(awk '/^VmHWM/ { print $2 }' "/proc/$pid/status")
+      stop
+      echo "$round $p $s $((c1 - c0)) $hwm $t0 $t1" >>"$out/samples.txt"
+    done
+  done
+done

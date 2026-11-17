@@ -2,6 +2,7 @@ import Server.Conn
 import Server.H1Adapter
 import Server.HandParser
 import App.Hello
+import App.Arena
 import App.Fixture
 import App.Db
 import Corpus
@@ -575,6 +576,41 @@ def adapterCases (ad : Adapter) : Check Unit := do
   let r := responseOf (ad.handle {} App.Hello.app (bytes "HEAD / HTTP/1.1\r\nHost: a\r\n\r\n"))
   if !r.endsWith "\r\nContent-Length: 13\r\n\r\n" then fail s!"{ad.name} HEAD: {repr r}"
 
+/-! ## HttpArena's endpoints (`App.Arena`, item 53rwgc) -/
+
+/-- HttpArena's request templates (`requests/get.raw`, `post_cl.raw`,
+`pipeline.raw` at da3ded60952b) and its validation's other values, through
+H1: each answers 200 with go-stdlib's body and `text/plain`. Its chunked
+template (`post_chunked.raw`) gets 501, the server's contract while chunked
+request bodies are not decoded (README, "Not yet"); the runs leave it out. -/
+def arenaScenario : Check Unit := do
+  let h := "Host: localhost:8080\r\n"
+  let ok : List (String × String × String) := [
+    ("get.raw", s!"GET /baseline11?a=13&b=42 HTTP/1.1\r\n{h}\r\n", "55"),
+    ("post_cl.raw", s!"POST /baseline11?a=13&b=42 HTTP/1.1\r\n{h}Content-Length: 2\r\n\r\n20", "75"),
+    ("pipeline.raw", s!"GET /pipeline HTTP/1.1\r\n{h}\r\n", "ok"),
+    -- Go decodes `+` in a query to a space, which Atoi refuses; a body is not decoded.
+    ("negative and signed values", s!"POST /baseline11?a=-7&b=+3&c=4 HTTP/1.1\r\n{h}Content-Length: 2\r\n\r\n+5", "2"),
+    ("a value is everything after the first =", s!"GET /baseline11?a=1=2&b=3 HTTP/1.1\r\n{h}\r\n", "3"),
+    ("non-integers count nothing", s!"POST /baseline11?a=x&b=2&c HTTP/1.1\r\n{h}Content-Length: 3\r\n\r\n1.5", "2"),
+    ("body with whitespace", s!"POST /baseline11?a=1 HTTP/1.1\r\n{h}Content-Length: 4\r\n\r\n 9\r\n", "10"),
+    ("no query", s!"GET /baseline11 HTTP/1.1\r\n{h}\r\n", "0"),
+    -- Go's int on x86_64: the sum wraps, a value beyond 64 bits counts nothing.
+    ("the sum wraps at 64 bits", s!"GET /baseline11?a=9000000000000000000&b=9000000000000000000 HTTP/1.1\r\n{h}\r\n", "-446744073709551616"),
+    ("64-bit bounds", s!"GET /baseline11?a=-9223372036854775808&b=9223372036854775807&c=9223372036854775808 HTTP/1.1\r\n{h}\r\n", "-1")]
+  for (name, req, body) in ok do
+    let r := responseOf (ad1 req)
+    if !r.startsWith "HTTP/1.1 200 OK\r\n" || !r.contains "\r\nContent-Type: text/plain\r\n" || !r.endsWith s!"\r\n\r\n{body}" then
+      fail s!"arena {name}: {repr r}, want 200 text/plain {body}"
+  let chunked := s!"POST /baseline11?a=13&b=42 HTTP/1.1\r\n{h}Transfer-Encoding: chunked\r\n\r\n2\r\n20\r\n0\r\n\r\n"
+  for (name, req, status) in [("post_chunked.raw", chunked, "HTTP/1.1 501 Not Implemented"),
+      ("unknown path", s!"GET /baseline12 HTTP/1.1\r\n{h}\r\n", "HTTP/1.1 404 Not Found"),
+      ("PUT", s!"PUT /baseline11 HTTP/1.1\r\n{h}Content-Length: 0\r\n\r\n", "HTTP/1.1 404 Not Found")] do
+    let r := ad1 req
+    if statusOf r != status then fail s!"arena {name}: {statusOf r}, want {status}"
+where
+  ad1 (req : String) : Reply := h1.handle {} App.Arena.app (bytes req)
+
 /-! ## Header fields on the server's own responses (`Response.OwnFields`) -/
 
 /-- Two own fields, one name repeated in another spelling, kept in order. -/
@@ -831,6 +867,7 @@ def main : IO UInt32 := do
       connScenario ad
       limitScenario ad
       lawCases ad
+    arenaScenario
     continueScenario
     refusedScenario
     queryScenario

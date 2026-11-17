@@ -36,7 +36,11 @@
 //! exit 0, on epoll and on io_uring each: `zig build test` passed
 //! (serve_test's 25 tests, pg_test's 31), pg_glue_test passed, and the rest
 //! of `./check.sh`, bench/dbcheck on the container's private cluster
-//! included. In item wi7efy's run (zio 830564437b2c), with serve.zig's
+//! included. On the production host, 2026-11-17 (item 53rwgc, README
+//! "HttpArena on the VPS"): x86_64, 2 vCPU, kernel 6.12.74+deb13+1-amd64,
+//! Debian 13.4, the same versions, binaries cross-built by
+//! bench/arena/build.sh: serve_test's 25 tests and pg_test's 31 passed on
+//! epoll and on io_uring each, and pg_glue_test passed. In item wi7efy's run (zio 830564437b2c), with serve.zig's
 //! `startSend` not trying the send itself (a mutation), 3 tests failed on io_uring, among
 //! them "a response sent at once starts no poll ...". A diagnostic loop of
 //! 30 runs of the serve_test binary on each backend: 0 failures.
