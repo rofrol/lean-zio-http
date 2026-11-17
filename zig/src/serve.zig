@@ -893,6 +893,20 @@ export fn ekk_serve(port: u16, threads: u32, maxc: u32, conninfo: *anyopaque, co
     std.debug.print("listening on 127.0.0.1:{d} with {d} loops, at most {d} connections\n", .{ listener.port, threads, maxc });
 
     loops = alloc.alloc(LoopCtx, threads) catch return 1;
+    // Every loop accepts on the same `lfd`, yet each accept's callback runs
+    // on the thread of the loop it was added to, because the loops share no
+    // zio LoopGroup (startLoop passes none). In the pinned zio (830564437b2c)
+    // a socket op parked on another loop's (fd, direction) registration is
+    // completed by that loop, on its thread (src/ev/sockreg.zig:213-271,
+    // `service` at 276-315 calling `markCompletedFromBackend`, which calls the
+    // callback inline: src/ev/loop.zig:310-362). That registration table is
+    // "shared by every loop in a group" (src/ev/sockreg.zig:105), and
+    // "Grouped loops service and complete each other's operations"
+    // (src/ev/loop.zig:572); a loop given no `loop_group` uses its own
+    // `internal_loop_group` (src/ev/loop.zig:516, 559-563), so it parks on
+    // and services only its own table and poller. Passing a shared
+    // `loop_group` to `loop.init` would let `acceptCb` run on another loop's
+    // thread against this loop's state. Recheck at each update of zio.
     for (loops) |*lp| lp.* = .{ .lfd = lfd };
     var ready: [2]std.c.fd_t = undefined;
     var done: [2]std.c.fd_t = undefined;
