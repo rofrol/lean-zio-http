@@ -270,6 +270,29 @@ pub const Conn = struct {
     polls: u64 = 0,
     /// Retired arms whose callbacks are still to run: the connection is
     /// freed only after the last of them.
+    ///
+    /// Under the pinned zio (830564437b2c) a close never completes before a
+    /// retired arm's callback, so `closeCb` always finds this at 0 and the
+    /// `closed` branch in `Arm.timerCb` is not taken. From zio's source:
+    /// every completion here keeps `defer_callback = true`
+    /// (src/ev/completion.zig:275), so it is pushed on the loop's completion
+    /// queue (src/ev/loop.zig:326-331), which runs first in, first out from a
+    /// snapshot (loop.zig:1265-1269; queue.zig:43-57, 78-86); `checkTimers`
+    /// only queues fired timers and runs no callback (loop.zig:1108-1118);
+    /// `clearTimer` returns false only once the timer has completed or is
+    /// being queued (loop.zig:735-743); this file takes both arms off before
+    /// it submits a close (`apply` through `track` before `close`, `expire`
+    /// through `disarm` before the canceled operation's completion closes,
+    /// and `pollCb` submits a close only `close` deferred; `closeCb` panics
+    /// on an arm left); and the kqueue, epoll and io_uring backends queue a
+    /// close's completion only after it was submitted
+    /// (src/ev/backends/kqueue.zig:634-641, backends/linux/epoll.zig:609-616,
+    /// backends/linux/io_uring.zig:831-837). So a retired arm's callback is queued
+    /// before the close is submitted and runs before its completion, and no
+    /// test can force the other order through zio's API. zio documents none
+    /// of this ordering, so the deferred free stays as a guard that relies
+    /// on no order; a panic in its place would rely on undocumented behavior
+    /// (decided 2026-11-17, item 5lkloz).
     retired_arms: u32 = 0,
     /// The current deadline expired while a receive or a send was in flight:
     /// Lean has closed, the operation is canceled, and its completion,
