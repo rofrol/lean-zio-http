@@ -19,3 +19,5 @@ batch `checkTimers` is dispatching, so the retired callback may always run
 before any close completion. Options: (a) write the forced test if such an
 order can be built; (b) if it cannot, record the argument next to
 `retired_arms` in serve.zig and replace the deferred destroy by an assertion.
+
+Decided 2026-11-17 by the coordinating session with sol (consult round 20261117-101429-40ca), under the user's delegation: first establish, from the source across every close path and reentrant dispatch, whether a close can complete before a retired timer's callback. If it can, option (a): synchronize on retirement and close completion, hold the callback's dispatch explicitly, and check exactly one ekk_free after the last retired callback. If it cannot, write the source-backed ordering argument next to the code and file a Needs-a-decision item before anything like (b). One failed attempt to build the test does not justify removing deferred destruction or replacing it with an assertion.
