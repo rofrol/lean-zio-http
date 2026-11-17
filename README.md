@@ -907,6 +907,24 @@ compile error or any other failure fails it. It is opt-in, not part of
 `check.sh` (item znorfg): run it at each update of Zig and for every change
 to `Single.deinit`.
 
+`./linux-check.sh` is the Linux validation (item ogcdwm): it builds the
+Debian trixie image of `linux/Dockerfile` (Zig, the Lean toolchain of
+`lean-toolchain` and Go at pinned versions and checksums; PostgreSQL 17 and
+the base image as Debian's archive has them at the build)
+with this machine's `docker` (on the M1, OrbStack) and runs the whole
+`./check.sh` in it on a copy of the working tree: the transport's and the
+pool's tests (`zig build test`) on epoll, which serve_test.zig checks is the
+backend in use, the database checks on the container's own private
+cluster, and every other check. It prints the architecture, kernel, Debian,
+Zig, Lean, Go, libpq, PostgreSQL and zio versions first. It needs network access and
+docker; `./check.sh` does not depend on it. Run it at each update of zio and
+record its result in the commit. It is development evidence on the host's
+architecture and the container runtime's kernel, not production
+qualification: x86_64, kernel 6.12 and Debian 13's own kernel are not
+covered by an OrbStack run, and the deployed server's epoll suite runs on
+its own host (item 53rwgc). Its last recorded result is in
+`zig/src/serve_test.zig`'s header.
+
 `bench/boundary` starts the fixture server (`lsrv-fixture`, and
 `lsrv-fixture-hand` with `-no-continue`) with the test settings and checks:
 exact 60,001-byte responses through 7-byte operations, split and pipelined

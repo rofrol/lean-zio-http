@@ -18,6 +18,9 @@
 //! readiness must produce is observed, at most `max_steps` polls: running out
 //! means the expected callback never ran, and the test fails with the fake's
 //! call log.
+//!
+//! They run on macOS (kqueue) and on Linux (epoll, `./linux-check.sh`); the
+//! last Linux run is recorded in serve_test.zig's header.
 const std = @import("std");
 const zio = @import("zio");
 const ev = zio.ev;

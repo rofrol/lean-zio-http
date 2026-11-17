@@ -75,6 +75,13 @@ The PostgreSQL checkout it takes as PGSRC lives at
 libpq cache; `git -C` it `fetch --tags` before a run, and clone
 `https://git.postgresql.org/git/postgresql.git` there only when it is missing.
 
+`./linux-check.sh` (README, "Running") runs the whole `./check.sh` in a
+Debian container (`linux/Dockerfile`; on the M1, OrbStack's arm64 VM), so
+the transport's and the pool's tests run on epoll. Run it at each update of
+zio and update the record of its last run in `zig/src/serve_test.zig`'s
+header; `./check.sh` does not depend on it (decided 2026-11-17, item
+ogcdwm). It is development evidence, not production qualification.
+
 `./cleanup-controls.sh` (README, "Running") runs the negative controls of
 the transport tests' cleanup (`Single.deinit`, `zig/src/serve_test.zig`).
 Run it at each update of Zig and for every change to `Single.deinit`; it is

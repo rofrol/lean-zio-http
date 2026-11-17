@@ -954,8 +954,8 @@ pub fn openListener(port: u16) ?Listening {
     // drop the per-connection call, the warnings go away, and you save a syscall
     // per connection." The pinned zio's own listen does the same (src/net.zig,
     // `listen`: "Accepted sockets inherit TCP_NODELAY from the listener.").
-    // serve_test.zig checks the accepted connection's TCP_NODELAY on macOS;
-    // Linux is not yet checked by a run there.
+    // serve_test.zig checks the accepted connection's TCP_NODELAY, on macOS
+    // and, through ./linux-check.sh, on Linux.
     net.setNoDelay(lfd, true) catch |e| {
         std.debug.print("cannot set TCP_NODELAY on the listening socket: {s}\n", .{@errorName(e)});
         net.close(lfd);

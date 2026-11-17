@@ -26,6 +26,18 @@
 //! in one write, which is atomic up to PIPE_BUF. A test whose loops run on
 //! other threads therefore reads every loop's events in the order each loop
 //! made them.
+//!
+//! These tests and pg_test.zig's run on macOS (kqueue, `./check.sh`) and on
+//! Linux (epoll, `./linux-check.sh`, README "Running"; rerun it at each zio
+//! update and update this record). Last Linux run, 2026-11-17 (item ogcdwm):
+//! OrbStack on the M1, aarch64, kernel 7.2.12-orbstack-00394-gbecdd6130068,
+//! Debian 13.7, Zig 0.17.1, Lean nightly-2026-11-17, libpq 17.12, zio
+//! 830564437b2c, epoll. `./linux-check.sh` exit 0: serve_test 24/24,
+//! pg_test 31/31, pg_glue_test passed, and the rest of `./check.sh`,
+//! bench/dbcheck on the container's private cluster included. With
+//! serve.zig's `expire` not canceling a send (a mutation), 5 tests failed,
+//! among them "a write deadline that ends while its send waits in the
+//! kernel ...". A diagnostic loop of 30 `zig build test` runs: 0 failures.
 const std = @import("std");
 const zio = @import("zio");
 const ev = zio.ev;
@@ -780,10 +792,21 @@ test "the transport's Zig sources never name zio's loop grouping" {
     }
 }
 
+test "the loops run on the readiness backend pinned for the OS: kqueue on macOS, epoll on Linux" {
+    // The tests' premises (a send parks only on EAGAIN, `sendParked`) hold
+    // on these two (serve.zig; build.zig pins epoll on Linux, item mzqamr).
+    // A run of these tests on Linux (./linux-check.sh) is a run on epoll.
+    switch (@import("builtin").os.tag) {
+        .macos => try std.testing.expect(ev.backend == .kqueue),
+        .linux => try std.testing.expect(ev.backend == .epoll),
+        else => return error.UncheckedOs,
+    }
+}
+
 test "an accepted connection has TCP_NODELAY, inherited from the listening socket" {
     // serve.zig sets TCP_NODELAY only on the listener (openListener); the
-    // kernel copies it to each accepted socket. Checked on macOS; Linux is not
-    // yet checked by a run there.
+    // kernel copies it to each accepted socket. Checked on macOS and, through
+    // ./linux-check.sh, on Linux (item ogcdwm).
     var s: Single = undefined;
     try s.init(64);
     defer s.deinit();
@@ -1671,7 +1694,8 @@ test "a write deadline that ends while its send waits in the kernel cancels that
     // reads, so the parked send stays in the kernel until the expiry. The
     // pair is the listener's accepted end and its client, not a
     // socketpair(2): serve.zig takes connections only from its accept.
-    // Checked by runs on macOS (kqueue) and on Linux (epoll; item emb2ob).
+    // Checked by runs on macOS (kqueue) and on Linux (epoll; items emb2ob
+    // and ogcdwm, ./linux-check.sh).
     var s: Single = undefined;
     try s.initOn(64, .unix);
     defer s.deinit();
@@ -1685,7 +1709,12 @@ test "a write deadline that ends while its send waits in the kernel cancels that
     // The fake starts the response at the open. Its sends complete at once
     // until the socket is full; the one whose syscall returns EAGAIN is
     // parked, registered for writability, inside `loop.add` (zio
-    // 830564437b2c, src/ev/sockreg.zig `submitIo` and `park`), and serve.zig
+    // 830564437b2c, src/ev/sockreg.zig `submitIo` and `park`, which both
+    // readiness backends' `submit` call for a send: backends/kqueue.zig and
+    // backends/linux/epoll.zig, the ones it runs on, kqueue on macOS and
+    // epoll on Linux, as "the loops run on the readiness backend ..."
+    // checks; a send's `checkCompletion` asks to park only on
+    // error.WouldBlock, epoll.zig:904 and kqueue.zig's `.net_send`), and serve.zig
     // starts the readiness poll only beside a send so parked (`sendParked`).
     // The poll in flight is the event that this send waits in the kernel.
     try stepUntilPolling(&s);
