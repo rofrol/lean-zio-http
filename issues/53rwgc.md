@@ -13,3 +13,5 @@ Checked 2026-11-16: the handoff note forbids load tests on vps.frolow.dev withou
 Sol (consult round 20261116-145342-a8e2) on the MacBook: useful for Linux diagnostics, not for D2 acceptance, since two cores cannot give the server two CPUs and the load generator separate cores. Recommendation: a rented machine.
 
 Also run the PostgreSQL pool tests (`zig build test` in zig/, run by bench.sh) on epoll: they have run only on macOS (kqueue) so far (item jl63fo, 2026-11-16).
+
+Checked 2026-11-17 with sol (consult round 20261117-011832-74e7) under the user's delegation: stays with the user: renting costs money and load tests on vps.frolow.dev need consent. Acceptance needs two server CPUs plus separate generator cores; the 2010 MacBook can serve diagnostics and epoll pool tests, not acceptance.
