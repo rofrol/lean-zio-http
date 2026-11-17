@@ -160,7 +160,7 @@ below the application: the parser's rejections (`error`), the 501 for CONNECT
 and the 500 that replaces an invalid application response (`render`). Not
 the application's responses, nor the interim `100 Continue`. The composition
 root chooses them and passes them to the adapter, e.g.
-`server_exports (Server.H1Adapter.handle { fields := #[("X-Robots-Tag",
+`server_exports (Server.H1Adapter.adapter { fields := #[("X-Robots-Tag",
 "noindex, nofollow")] } app)`; `valid` is proved by the kernel when the root
 is built, so fields that break `ownFieldsValid` fail the build. -/
 structure OwnFields where
