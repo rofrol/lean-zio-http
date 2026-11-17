@@ -19,4 +19,3 @@ yvladm Decide whether per-loop PostgreSQL pools should share connections across 
 rtkla3 Whether a handler's synchronous PostgreSQL error chain needs a scheduling boundary
 kaslrv Run the worst-case memory scenario on Linux
 3pund6 Decide what follows from the classification of Linux pending-connection accept errnos (xihdtw)
-sa6jpb Decide whether the interim 100 Continue carries the own header fields
