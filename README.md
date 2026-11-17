@@ -343,101 +343,154 @@ the loops, and each loop's queries wait for that loop's slots only.
 
 ## Memory
 
-Retained per connection, bounded whatever the peer does (a waiting query
-adds its `Server.Query` and continuation, bounded by what the handler builds,
-and a result of at most `Query.maxResultBytes` of text while it is turned
-into the continuation's answer): the loop's
-connection (two 8,192-byte buffers and its fields, a little over 16 KiB), the Lean
-buffer of unconsumed bytes (at most `inCap` = 16,388 bytes,
-`Conn.step_inv`), and a response being sent (at most 65,536 bytes,
-`Conn.step_inv`): about 98 KiB at most, so `--max-conns` × 98 KiB in all
-(about 392 MiB at the default 4,096). `Conn.step_inv` bounds the lengths
-of the Lean byte arrays, not their capacities: an array grown by appending
-may hold more capacity than its length, so the bound on allocated memory is
-the stated one only up to that slack (at most about twice the lengths).
-Transient allocations during one
-parse are not in this bound; each loop runs one parse at a time, so they are
-bounded per loop, not per connection.
+Three kinds of statement, kept apart: lengths that `Conn.step_inv` proves,
+allocations derived from the code of the runtime and its allocators, and
+resident set growth that `bench/boundary` measures. No total per connection
+is established: the adapter's state has no bound, and connections holding
+H1's state for some requests grew the resident set by up to 302 KiB each
+(below), so the earlier statement of about
+98 KiB per connection (392 MiB at the default 4,096 connections) is
+withdrawn (issue es53kx). Whether to bound the adapter's state is an open
+question for the owner.
 
-The adapter's state (`Conn.State.parser`) is retained too, but only while a
-request is incomplete: `Conn` keeps it while reading and while sending the
-25-byte interim response, and resets it to `init` once a request is
-consumed, so it never coexists with a response. `Conn` is generic over the
-adapter and does not bound that state; for H1 it is the machine with the
-head parsed so far (at most `maxHeaders` fields within `maxHeadBytes`) and
-its unread input, and the body pulled so far, each holding bytes of the
-buffer. Neither a theorem nor a worst-case measurement bounds it: the
-98 KiB above leaves it about 64 KiB, and one measurement below, a held
-8,000-byte head, puts it near 10 KiB.
+**Lengths** (proved, `Conn.step_inv`): the Lean buffer of unconsumed bytes
+holds at most `inCap` = 16,388 bytes and a response being sent at most
+`maxResponseBytes` = 65,536.
+
+**Allocations** (derived; toolchain nightly-2026-11-14, its runtime at
+lean4 commit 62e0cf0, mimalloc 3.4.5; a block size is what the toolchain's
+`mi_good_size` returns for the object, on the M1):
+
+- The loop's connection: a 16,712-byte `Conn` (`@sizeOf`, Zig 0.17.1) from
+  `std.heap.c_allocator` (`zig/src/serve.zig`), a 20,480-byte malloc block
+  (`heap -s`).
+- A `ByteArray` is one mimalloc block holding a 24-byte header and its
+  capacity. `extract` copies with capacity equal to the length; appending
+  (`++`, `push`) to an array whose capacity is too small copies it with
+  twice the size needed (`lean_sarray_ensure_capacity`, `exact := false`);
+  a shared array is copied with its capacity
+  (`lean_sarray_ensure_exclusive`).
+- The buffer: allocated with capacity `inCap` (`Conn.initial`); once a
+  request is consumed, the `extract` of the rest; a receive is appended only
+  when the result fits `inCap`, so a growth gives at most 2 × `inCap` =
+  32,776: a block of at most 40,960 bytes. While a final response is sent
+  the buffer is the rest of the receive that completed the request, under
+  8,192 bytes (below), copied exactly: a block of at most 10,240.
+- A response: `Server.Response.write` allocates capacity 192 + body and
+  appends the head and the body; when the head is longer than 192 bytes, the
+  append that runs out of capacity doubles the size it needs. No append needs
+  more than the final size, and a response kept is at most 65,536 bytes
+  (`render` replaces a larger one), so its capacity is at most 131,072: a
+  block of at most 163,840 bytes, of which only the pages written need be
+  resident. The fixture's largest response (60,121 bytes, a 120-byte head)
+  does not grow: capacity 60,193, a 65,536-byte block.
+- The adapter's initial state is one object shared by every connection
+  (H1's is a closed term, `lean_obj_once` in the generated C), so a
+  connection whose adapter is at `init` holds none of its own; the interim
+  `100 Continue` is a shared constant too.
+
+So a connection holds, besides its small Lean objects (the state, phase and
+action constructors, tens of bytes each):
+
+- while reading, and while sending the interim response: at most 20,480 +
+  40,960 = 61,440 bytes, plus the adapter's state;
+- while sending a final response: at most 20,480 + 10,240 + 163,840 =
+  194,560 bytes (190 KiB), the adapter at `init`;
+- while waiting for a query: the connection and an exact buffer of under
+  8,192 bytes, plus the `Server.Query` and continuation the handler built
+  (bounded by what it builds), and while the continuation turns it into the
+  answer a result of at most `Query.maxResultBytes` of text.
+
+These count the arrays the connection's state holds; a copy of buffer bytes
+that the adapter keeps is the adapter's (below). Allocations made and
+dropped within one step are not counted; a loop runs one step at a time,
+so they are per loop, not per connection.
 
 The buffer and a full response are not both at their maximum at once: a
 connection receives only while it is not sending, and the loop receives at
 most 8,192 bytes at a time (`recv_cap`, `zig/src/serve.zig`), so while a
 response is sent the buffer holds less than the receive that completed its
-request, under 8,192 bytes; a buffer near `inCap` waits with at most the
-25-byte interim response. The stated bound adds both maxima and so stays
-above either state. `bench/boundary` measures both as resident set growth
-on the M1 (2026-11-16):
+request; a buffer near `inCap` waits with at most the interim response.
 
-- 1,000 connections each holding an 8,000-byte head while it waits for
-  its body after `100 Continue`: 52.0 KiB per connection (2026-11-17; 42.4
-  KiB before the adapter kept its state, so about 9.6 KiB is H1's retained
-  state for such a head);
-- connections whose client writes 8,192 bytes at once (100 pipelined GETs
-  of the fixture's largest response, 60,121 bytes, then an unfinished
-  request) and never reads: 90.6 to 90.9 KiB per added connection in
-  every run, with either parser, the growth from 50 to 100 such connections (from none to 100 it
-  also counts an apparent fixed component of about 500 KiB; more
-  connections made macOS deny network memory for the stalled responses
-  the kernel holds). The socket queues, read with lsof, show
-  before each measurement that the server has read all 8,192 bytes and
-  after it that it has not sent all the responses; from that, each
-  connection was sending a whole response with at least 7,400 bytes
-  buffered, unless its bytes arrived in two receives and Lean had not yet
-  been handed the second at the measurement, which the queues cannot
-  exclude (the scenario's comment). The parts named above add up to about
-  83 KiB in that state (16.6 + 7.8 + 58.7); the other 7.8 KiB is over the
-  2 KiB allowed for allocator and object headers. Matched snapshots of the
-  server's allocators at the scenario's two measurements
-  (`bench/boundary -memsnap DIR`: `vmmap -summary` and `heap -s`; nine
-  runs, five with H1 and four with the hand-written parser, 90.6 to
-  91.5 KiB per added connection with the snapshots taken) split the growth per added connection by region
-  category, within these ranges in every run:
-  - the malloc zone, which holds the loop's connections
-    (`std.heap.c_allocator`), 21.1 KiB resident: consistent with one
-    20,480-byte block for each 16,712-byte `Conn` (`@sizeOf`, Zig 0.17.1;
-    `heap -s` shows 50 more 20 KiB blocks per 50 connections, and no
-    other block size grew but 512 bytes), 13 more 512-byte blocks per 50
-    connections whose owner the snapshots do not show (0.1 KiB), and
-    1.0 KiB resident beyond the bytes allocated;
-  - the region vmmap names IOAccelerator, VM tag 100, which is the tag
-    the toolchain's mimalloc gives its mappings by default
-    (`mi_option_os_tag`), so most likely Lean's objects: 69.4 to
-    70.4 KiB, against about 66.5 KiB estimated for the buffer and the
-    response (7.8 + 58.7);
-  - no other region category more than 0.8 KiB.
+**The adapter's state** (`Conn.State.parser`) is retained only while a
+request is incomplete: `Conn` keeps it while reading and while sending the
+interim response, and resets it to `init` once a request is consumed, so it
+never coexists with a final response. `Conn` is generic over the adapter and
+does not bound it, and no derivation bounds H1's: the machine with the head
+parsed so far, including the request-target parsed into path segments and
+query parameters (H1 maps every URI limit but the host's, `maxPathSegments`
+and `maxQueryParams` included, to `maxUriLength`, here 8,192:
+`requestTargetConfig` in `Std/Http/Protocol/H1/Parser.lean`), its input
+(the buffer's unread bytes, copied, appended to as receives arrive), and the
+body pulled so far (appended chunk by chunk). The hand-written parser keeps
+no state.
 
-  So about 4.5 KiB of the 7.8 is the malloc zone beyond the 16.6 KiB
-  counted above for the loop's connection, mostly the block's size class,
-  and 2.9 to 3.9 KiB is a residual in the tagged region against those
-  estimates, not attributed further: a region total cannot tell which
-  objects are live, nor separate size-class rounding, still-resident
-  pages of freed blocks (such as the initial `inCap` buffer) and Lean's
-  small per-connection objects. The snapshots are taken one after the
-  other, just before the resident set sample, not at one instant, and the
-  inspection may perturb the process; the resident set per connection
-  with and without them overlaps (90.6 to 91.5 against 90.6 to 90.9).
-  macOS only: elsewhere the scenario is skipped.
+**Measured** (`bench/boundary`, resident set growth per connection with
+the H1 fixture, M1, 2026-11-17; from 1,000 connections against the idle
+server for the first, otherwise from half to all of the connections, which
+leaves out the fixed component). These are measurements, not bounds, and
+they check no bound except the last, against the 190 KiB derived above
+plus an allowance of 2 KiB for the small objects and the allocators'
+metadata, which is not derived (`sendingBound`):
 
-Capacities, from the toolchain's `ByteArray` (nightly-2026-11-14): `extract`
-copies exactly, so the buffer kept after a request is consumed, which is the
-one a send waits with, has capacity equal to its length; the initial buffer
-is allocated with capacity `inCap` (`Conn.initial`); `++` doubles the
-capacity when it must grow (`fastAppend` copies with `exact := false`), so a
-buffer that grows past its capacity while reading may hold up to about twice
-its length; a response is allocated with 192 bytes more than its body
-(`Server.Response.write`) and grows the same way only when its head is
-longer. Whether the bound should count capacities is issue es53kx.
+| each connection holds | connections | KiB per connection |
+|---|---:|---:|
+| an 8,000-byte head, after `100 Continue` | 1,000 | 52.0 to 52.1 |
+| a head of 100 short fields, after `100 Continue` | 400 | 49.7 to 49.8 |
+| all but one byte of an 8,192-byte body | 400 | 73.0 to 73.2 |
+| a head of 97 fields of 72-byte values and all but one body byte, received 7 bytes at a time (`--chunk 7`) | 100 | 76.2 to 77.4 |
+| an incomplete request after 50 pipelined ones | 400 | 31.4 to 32.1 |
+| a head whose request-target has 4,000 path segments | 400 | 207.8 to 208.0 |
+| a head whose request-target has 4,000 query parameters | 400 | 301.8 to 301.9 |
+| a 60,121-byte response being sent, with a pipelined tail buffered | 100 | 90.6 |
+
+(Four runs each, 2026-11-17; earlier runs of the first and last rows gave
+52.0 and 90.6 to 90.9.) The interim response shows that a connection
+holds its head; for a body, lsof shows that the server has taken every byte
+from its sockets, which does not exclude a receive not yet handed to Lean
+(`awaitRead`). At 4,096 connections, connections holding the request with 4,000
+query parameters would take about 1.2 GiB.
+
+The last scenario: connections whose client writes 8,192 bytes at once (100
+pipelined GETs of the fixture's largest response, then an unfinished
+request) and never reads, measured with either parser from 50 to 100 such
+connections (from none to 100 it also counts an apparent fixed component of
+about 500 KiB; more connections made macOS deny network memory for the
+stalled responses the kernel holds). The socket queues, read with lsof,
+show before each measurement that the server has read all 8,192 bytes and
+after it that it has not sent all the responses; from that, each connection
+was sending a whole response with at least 7,300 bytes buffered, unless its
+bytes arrived in two receives and Lean had not yet been handed the second at
+the measurement, which the queues cannot exclude (the scenario's comment).
+Matched snapshots of the server's allocators at its two measurements
+(`bench/boundary -memsnap DIR`: `vmmap -summary` and `heap -s`; nine runs,
+five with H1 and four with the hand-written parser, 90.6 to 91.5 KiB per
+added connection with the snapshots taken) split the growth per added
+connection by region category, within these ranges in every run:
+
+- the malloc zone, which holds the loop's connections, 21.1 KiB resident:
+  one 20,480-byte block per connection (`heap -s` shows 50 more 20 KiB
+  blocks per 50 connections, and no other block size grew but 512 bytes),
+  13 more 512-byte blocks per 50 connections whose owner the snapshots do
+  not show (0.1 KiB), and 1.0 KiB resident beyond the bytes allocated;
+- the region vmmap names IOAccelerator, VM tag 100, which is the tag the
+  toolchain's mimalloc gives its mappings by default (`mi_option_os_tag`),
+  so most likely Lean's objects: 69.4 to 70.4 KiB, against 72 to 74 KiB of
+  blocks allocated for the buffer (7,300 to 8,191 bytes: an 8,192 or
+  10,240-byte block) and the response (a 65,536-byte block whose last 5.2
+  KiB are never written);
+- no other region category more than 0.8 KiB.
+
+So the growth is consistent with the blocks allocated; it does not attribute
+it, since the snapshots are aggregates: a region total cannot tell
+which objects are live, nor separate untouched pages of a block,
+still-resident pages of freed blocks (such as the initial `inCap` buffer)
+and Lean's small per-connection objects. The snapshots are taken one after
+the other, just before the resident set sample, not at one instant, and the
+inspection may perturb the process; the resident set per connection with
+and without them overlaps (90.6 to 91.5 against 90.6 to 90.9). macOS only:
+elsewhere the scenario is skipped, as are those that read the socket
+queues.
 
 ## Fragmented requests (decision D1)
 
@@ -522,7 +575,9 @@ exact 60,001-byte responses through 7-byte operations, split and pipelined
 requests, injected failures, 2,000 connections closed or reset at different
 points, `100-continue` and a response over the bound, the graceful shutdown
 with a response in flight and an idle and a partial connection, admission at
-`--max-conns 2`, the two crash points, and the memory per connection; every
+`--max-conns 2`, the two crash points, and the memory per connection
+(measured; checked against a bound only while a response is sent, README
+"Memory"); every
 accepted connection must be freed exactly once and the server must stop
 with status 0.
 

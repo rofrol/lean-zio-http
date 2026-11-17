@@ -590,18 +590,25 @@ func rssKiB(pid int) (int, error) {
 	return strconv.Atoi(strings.TrimSpace(string(out)))
 }
 
+// sendingBound, in KiB: the blocks README "Memory" derives for a connection
+// sending a final response, the loop's connection (a 20,480-byte malloc
+// block), the buffer (an exact copy of under 8,192 bytes, at most a
+// 10,240-byte mimalloc block) and the response (capacity at most 131,072, a
+// 163,840-byte block), plus an allowance of 2 KiB, not derived, for the
+// state's small Lean objects and the allocators' metadata. The adapter is at
+// its shared `init` then. A measurement over it shows the accounting misses
+// something.
+const sendingBound = (20480 + 10240 + 163840 + 2048) / 1024
+
 // memory measures the retained memory of connections holding a request
 // head: 1000 connections each send an 8,000-byte head with
 // `Expect: 100-continue` and a body still to come; the interim response is
-// the event that shows the server buffered the head and waits. The growth
-// of the resident set per connection must stay within the bound the README
-// states per connection (perConnBound).
+// the event that shows the server buffered the head and waits. It reports
+// the growth of the resident set per connection and checks no bound: the
+// adapter's state, which such a connection holds, has none (README,
+// "Memory").
 func memory(path string) (string, error) {
 	const n = 1000
-	// README, "Memory": the loop's connection (two 8 KiB buffers and its
-	// fields), the Lean buffer of at most inCap bytes, and a response of at
-	// most 64 KiB, with 2 KiB for allocator and object headers.
-	const perConnBound = (16640 + 16388 + 65536 + 2048) / 1024
 	s, err := start(path, "1", "--max-conns", "1100")
 	if err != nil {
 		return "", err
@@ -642,10 +649,7 @@ func memory(path string) (string, error) {
 		return "", err
 	}
 	per := float64(held-base) / n
-	if per > perConnBound {
-		return "", fmt.Errorf("%.1f KiB per connection, over the stated bound of %d KiB", per, perConnBound)
-	}
-	return fmt.Sprintf("resident set %d KiB idle, %d KiB with %d heads held: %.1f KiB per connection (bound %d KiB)", base, held, n, per, perConnBound), nil
+	return fmt.Sprintf("resident set %d KiB idle, %d KiB with %d heads held: %.1f KiB per connection (a measurement; no bound)", base, held, n, per), nil
 }
 
 // tcpQueues maps each established TCP connection of processes `pids`, by
@@ -784,7 +788,6 @@ func memoryFull(path string) (string, error) {
 	// ("requests for memory denied" in netstat -m), 1,000 to a failed send.
 	const n = 100
 	const gets = 100
-	const perConnBound = (16640 + 16388 + 65536 + 2048) / 1024 // as in memory
 	if runtime.GOOS != "darwin" {
 		return "skipped: the socket queues are read with lsof's -T q, checked on macOS only", nil
 	}
@@ -925,11 +928,206 @@ func memoryFull(path string) (string, error) {
 	}
 	per := float64(held-half) / (n - n/2)
 	summary := fmt.Sprintf("resident set %d KiB idle, %d KiB with %d and %d KiB with %d connections, each with all its bytes read and not all responses sent (so sending a %d-byte response with at least %d bytes buffered, unless a receive had not reached Lean): %.1f KiB per added connection (bound %d KiB)",
-		base, half, n/2, held, n, respSize, least, per, perConnBound)
-	if per > perConnBound {
+		base, half, n/2, held, n, respSize, least, per, sendingBound)
+	if per > sendingBound {
 		return "", fmt.Errorf("%s: over the bound", summary)
 	}
 	return summary, nil
+}
+
+// expectHead is a request head asking for `100-continue` before a body of
+// `maxBodyBytes` (Server/Wire.lean), with `target` and the fields `extra`
+// ("Name: value\r\n" each) besides Host, Expect and Content-Length.
+func expectHead(target, extra string) string {
+	return "POST " + target + " HTTP/1.1\r\nHost: a\r\nExpect: 100-continue\r\nContent-Length: 8192\r\n" + extra + "\r\n"
+}
+
+// readInterim reads the interim response from r: the event that shows the
+// server has parsed a head and waits for its body.
+func readInterim(r io.Reader) error {
+	interim := make([]byte, len(continueBytes))
+	if _, err := io.ReadFull(r, interim); err != nil || string(interim) != continueBytes {
+		return fmt.Errorf("interim response %q, %v", interim, err)
+	}
+	return nil
+}
+
+// awaitRead waits until lsof shows, for every connection of conns, nothing
+// of the client's unacknowledged and nothing unread by the server: the
+// server has taken every byte the clients wrote from its sockets. The
+// producer is the server's loop receiving; after `tries` readings without
+// it, it reports what was still queued. That a byte left the socket does not show that Lean has been
+// handed it: a receive the loop has completed but not yet passed to
+// `Conn.step` at the measurement is not excluded (as in memoryFull).
+func awaitRead(pid int, conns []*net.TCPConn) error {
+	const tries = 200
+	queued := ""
+	for range tries {
+		qs, err := tcpQueues(pid, os.Getpid())
+		if err != nil {
+			return fmt.Errorf("lsof: %w", err)
+		}
+		queued = ""
+		for i, c := range conns {
+			cl, sv := c.LocalAddr().String(), c.RemoteAddr().String()
+			cq, ok1 := qs[cl+"->"+sv]
+			sq, ok2 := qs[sv+"->"+cl]
+			if !ok1 || !ok2 {
+				return fmt.Errorf("connection %d (%s): not among lsof's established connections", i, cl)
+			}
+			if cq[1] != 0 || sq[0] != 0 {
+				queued = fmt.Sprintf("connection %d: %d bytes of the client's unacknowledged, %d unread by the server", i, cq[1], sq[0])
+				break
+			}
+		}
+		if queued == "" {
+			return nil
+		}
+	}
+	return fmt.Errorf("after %d lsof readings, %s", tries, queued)
+}
+
+// held measures what n connections retain in a state each reaches through
+// hold (which sees its connection and ends at an event showing the server
+// holds that state, or, when lsofSettle, after which awaitRead must show the
+// server has read every byte). Two measurements, after n/2 and after n
+// connections, as in memoryFull: their difference per added connection,
+// without the fixed component. args go to the server.
+func held(path string, args []string, n int, lsofSettle bool, hold func(c *net.TCPConn) error) (string, error) {
+	if lsofSettle && runtime.GOOS != "darwin" {
+		return "skipped: the socket queues are read with lsof's -T q, checked on macOS only", nil
+	}
+	s, err := start(path, append(args, "--max-conns", strconv.Itoa(n+100))...)
+	if err != nil {
+		return "", err
+	}
+	defer s.stop()
+	conns := make([]*net.TCPConn, n)
+	defer func() {
+		for _, c := range conns {
+			if c != nil {
+				c.Close()
+			}
+		}
+	}()
+	fill := func(lo, hi int) (int, error) {
+		err := parallel(hi-lo, 32, func(k int) error {
+			c, err := dial(s.addr)
+			if err != nil {
+				return err
+			}
+			conns[lo+k] = c
+			return hold(c)
+		})
+		if err != nil {
+			return 0, err
+		}
+		if lsofSettle {
+			if err := awaitRead(s.cmd.Process.Pid, conns[:hi]); err != nil {
+				return 0, err
+			}
+		}
+		return rssKiB(s.cmd.Process.Pid)
+	}
+	half, err := fill(0, n/2)
+	if err != nil {
+		return "", err
+	}
+	all, err := fill(n/2, n)
+	if err != nil {
+		return "", err
+	}
+	per := float64(all-half) / float64(n-n/2)
+	return fmt.Sprintf("resident set %d KiB with %d and %d KiB with %d connections: %.1f KiB per added connection", half, n/2, all, n, per), nil
+}
+
+// adapterScenario is a scenario of held for a state in which a connection
+// holds the adapter's state for an incomplete request: the server's
+// arguments, the connections, whether awaitRead settles it, and hold. It
+// fails only when a connection does not reach that state; the memory it
+// reports is checked against no bound, since the adapter's state has none
+// (README, "Memory": these measurements falsified the earlier 98 KiB).
+func adapterScenario(args []string, n int, lsofSettle bool, hold func(c *net.TCPConn) error) func(path string) (string, error) {
+	return func(path string) (string, error) {
+		summary, err := held(path, args, n, lsofSettle, hold)
+		if err != nil || strings.HasPrefix(summary, "skipped: ") {
+			return summary, err
+		}
+		return summary + " (a measurement; no bound)", nil
+	}
+}
+
+// fieldsHead: the most fields H1 accepts (`maxHeaders`, 100), short ones.
+func fieldsHead() string {
+	var b strings.Builder
+	for i := range 97 {
+		fmt.Fprintf(&b, "a%d: b\r\n", i)
+	}
+	return expectHead("/echo", b.String())
+}
+
+// longFieldsHead: 97 fields of 72-byte values, a head of nearly
+// `maxHeadBytes` in lines short enough that 7-byte receives do not make H1's
+// reparsing of an unfinished line slow.
+func longFieldsHead() string {
+	var b strings.Builder
+	for i := range 97 {
+		fmt.Fprintf(&b, "a%02d: %s\r\n", i, strings.Repeat("v", 72))
+	}
+	return expectHead("/echo", b.String())
+}
+
+func holdHead(h string) func(c *net.TCPConn) error {
+	return func(c *net.TCPConn) error {
+		if _, err := io.WriteString(c, h); err != nil {
+			return err
+		}
+		return readInterim(c)
+	}
+}
+
+// holdBody sends head h, waits for the interim response, then sends all but
+// the last byte of the 8,192-byte body.
+func holdBody(h string) func(c *net.TCPConn) error {
+	return func(c *net.TCPConn) error {
+		if err := holdHead(h)(c); err != nil {
+			return err
+		}
+		_, err := io.WriteString(c, strings.Repeat("b", 8191))
+		return err
+	}
+}
+
+// holdAfterPipelined sends k pipelined requests with empty bodies, then an
+// incomplete one in the same write, and reads the k responses and the
+// interim response.
+func holdAfterPipelined(k int) func(c *net.TCPConn) error {
+	const echo = "POST /echo HTTP/1.1\r\nHost: a\r\nContent-Length: 0\r\n\r\n"
+	h := strings.Repeat(echo, k) + expectHead("/echo", "X: "+strings.Repeat("a", 4000)+"\r\n")
+	return func(c *net.TCPConn) error {
+		if _, err := io.WriteString(c, h); err != nil {
+			return err
+		}
+		r := bufio.NewReader(c)
+		for i := range k {
+			resp, err := http.ReadResponse(r, &http.Request{Method: "POST"})
+			if err != nil {
+				return fmt.Errorf("response %d: %w", i, err)
+			}
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+			if resp.StatusCode != 200 {
+				return fmt.Errorf("response %d: status %d", i, resp.StatusCode)
+			}
+		}
+		if err := readInterim(r); err != nil {
+			return err
+		}
+		if r.Buffered() != 0 {
+			return fmt.Errorf("%d bytes after the interim response", r.Buffered())
+		}
+		return nil
+	}
 }
 
 type scenario struct {
@@ -1040,6 +1238,7 @@ func main() {
 	fixture := flag.String("fixture", ".lake/build/bin/lsrv-fixture", "fixture server executable")
 	noContinue := flag.Bool("no-continue", false, "the fixture does not answer Expect: 100-continue (lsrv-fixture-hand); skip the scenarios that need it")
 	flag.StringVar(&memSnapDir, "memsnap", "", "directory for the server's allocator statistics (vmmap, heap) at the measurements of the scenario with 100 connections sending responses; macOS only")
+	only := flag.String("only", "", "run only the scenarios whose name contains this text")
 	flag.Parse()
 	scenarios := []scenario{
 		{"large responses, operations of at most 7 bytes", []string{"2", "--chunk", "7", "--trace"}, false, false, exchanges(8), nil, false},
@@ -1057,9 +1256,18 @@ func main() {
 		}, false},
 		{"memory of 1000 connections holding a head", nil, false, false, nil, memory, true},
 		{"memory of 100 connections each sending a response with a pipelined tail buffered", nil, false, false, nil, memoryFull, false},
+		{"memory of 400 connections holding a head of 100 short fields", nil, false, false, nil, adapterScenario([]string{"1"}, 400, false, holdHead(fieldsHead())), true},
+		{"memory of 400 connections holding all but one byte of a maximum body", nil, false, false, nil, adapterScenario([]string{"1"}, 400, true, holdBody(expectHead("/echo", ""))), true},
+		{"memory of 100 connections holding a nearly maximum head and all but one body byte, received 7 bytes at a time", nil, false, false, nil, adapterScenario([]string{"1", "--chunk", "7"}, 100, true, holdBody(longFieldsHead())), true},
+		{"memory of 400 connections holding an incomplete request after 50 pipelined ones", nil, false, false, nil, adapterScenario([]string{"1"}, 400, false, holdAfterPipelined(50)), true},
+		{"memory of 400 connections holding a head whose target has 4,000 path segments", nil, false, false, nil, adapterScenario([]string{"1"}, 400, false, holdHead(expectHead("/"+strings.Repeat("a/", 3999)+"a", ""))), true},
+		{"memory of 400 connections holding a head whose target has 4,000 query parameters", nil, false, false, nil, adapterScenario([]string{"1"}, 400, false, holdHead(expectHead("/echo?"+strings.Repeat("a&", 3999)+"a", ""))), true},
 	}
 	failed, ran := 0, 0
 	for _, sc := range scenarios {
+		if !strings.Contains(sc.name, *only) {
+			continue
+		}
 		if sc.continues && *noContinue {
 			fmt.Printf("skipped %s: the fixture does not answer Expect: 100-continue\n", sc.name)
 			continue

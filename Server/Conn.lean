@@ -148,8 +148,9 @@ def step (s : State σ) (e : Event) : State σ × Action :=
 
 /-! ## Guarantees -/
 
-/-- The memory bound: the buffer never exceeds `inCap`, and a response being
-sent never exceeds `maxResponseBytes`. -/
+/-- The length bound: the buffer never exceeds `inCap`, and a response being
+sent never exceeds `maxResponseBytes`. Lengths, not capacities: what the
+connection allocates is derived from these in README "Memory". -/
 def Inv (s : State σ) : Prop :=
   s.buf.size ≤ inCap ∧ ∀ out off next, s.phase = .writing out off next → out.size ≤ maxResponseBytes
 
