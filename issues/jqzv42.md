@@ -8,3 +8,6 @@ What a count limit would buy: each element costs at most 48 bytes of blocks, plu
 
 Question: Should the per-connection bound stay at what `maxUriLength` = 8,192 gives, or should the target's counts be limited?
 Options: accept the derived bound (698.5 KiB per connection, 2.73 GiB at 4,096) | ask upstream (leanprover/lean4) for `maxPathSegments`/`maxQueryParams` in `H1.Config`, with an answer for the 414/400 question (an outward action: needs the user's go) | lower the default connection cap so the total fits a memory budget the owner names
+
+Decided by the user 2026-11-17: ask upstream (leanprover/lean4) for maxPathSegments and maxQueryParams in H1.Config. No fork: upstream's comment at Parser.lean:268 states that tying them to maxUriLength is deliberate (the 414/400 reasoning), so under policy Rule 6 this is a feature request, not a bug. lgxdi7 drafts the text next to the mxzlsx question. This item posts it from the user's gh account and records the answer.
+Done by: the coordinating session
