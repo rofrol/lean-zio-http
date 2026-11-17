@@ -1,6 +1,5 @@
 ## Next, in order
 
-wxn5yg Check mechanically that pg.c's EKK_MAX_RESULT_BYTES equals Query.maxResultBytes
 oruxe4 Run the PostgreSQL glue tests against every supported libpq line, not only the installed one
 kvnm3u Decide whether the type, not a comment, should keep the clock out of the adapter's kept state
 sy3ims Decide whether to report upstream that Std.Http's H1 reparses an unfinished line from its start on every call
