@@ -1,9 +1,0 @@
-Should the transport check mechanically that every loop callback runs on its own loop?
-
-Seen 2026-11-17 while finishing qtvoaq. The shared listening socket is safe only because no zio LoopGroup joins the loops: in the pinned zio (830564437b2c) loops in one group complete each other's parked socket ops on the owner loop's thread (src/ev/sockreg.zig:213-315, src/ev/loop.zig:310-362, 572), and serve.zig's `startLoop` passes no `loop_group` (zig/src/serve.zig, the comment above `for (loops) |*lp| lp.* = .{ .lfd = lfd };` in `ekk_serve`). That rule lives only in a comment (policy Rule 2: a boundary only in documentation is incomplete). A future change that groups the loops (for example to share zio's in-flight accounting or migrate tasks) would make `acceptCb`, `recvCb` and `sendCb` touch one loop's state from another loop's thread without any test failing.
-Options: (a) assert in each callback that the `*ev.Loop` zio passes is the callback's own `LoopCtx.loop` (zio passes the completing loop: src/ev/loop.zig:362), panicking otherwise; (b) a check in `Arch.lean` or a test that `loop.init` in zig/src is never given `loop_group`; (c) leave the comment as the only guard and recheck at each zio update.
-
-Decided 2026-11-17 by the coordinating session with sol (consult round for call f2742387) under the user's delegation: (b) plus (a), not (c).
-- (b) The primary guard: a check (Arch.lean or a test) that the transport's one `loop.init` passes no `loop_group`. Check the call's structure, not a fragile substring.
-- (a) A runtime backstop: in `acceptCb`, `recvCb`, `sendCb` (and any other transport callback that touches loop state), compare the `*ev.Loop` zio passes with the context's own loop before touching mutable state, and panic explicitly on a mismatch. Not `std.debug.assert`, which ReleaseFast strips.
-Write next to the checks that they rely on zio's callback-dispatch contract at the pin, rechecked at each zio update.

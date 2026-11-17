@@ -1,6 +1,5 @@
 ## Next, in order
 
-3gvmy3 Should the transport check mechanically that every loop callback runs on its own loop?
 znorfg Should the transport tests' cleanup and leak report get a committed check of their own?
 ogcdwm Should the transport tests run on Linux, so the Unix-domain parked-send test is checked on epoll and io_uring?
 ncvxfx Should a query whose deadline expires during the statement Close keep its known error?
