@@ -1,6 +1,5 @@
 ## Next, in order
 
-uwrdc2 Move the zio pin to 53ed3c3 (zio PRs 929 and 930)
 53rwgc Linux acceptance runs for the Lean HTTP server
 ncvxfx Should a query whose deadline expires during the statement Close keep its known error?
 im7c5q Should dusty-hello give dusty the real zio module instead of its stub?
@@ -11,6 +10,7 @@ qgrnr3 Backend-independent tests of the transport's completion, cancel and expir
 ## Proposed
 
 q2g4am Act on leanprover/lean4's answers to the Std.Http questions 16522 and 16523
+faahn4 Decide how to settle zio's undocumented setTimer from a timer's own callback
 
 ## Needs a decision
 
