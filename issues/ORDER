@@ -4,6 +4,7 @@ wi7efy Make serve.zig correct and efficient under io_uring
 53rwgc Linux acceptance runs for the Lean HTTP server
 ncvxfx Should a query whose deadline expires during the statement Close keep its known error?
 im7c5q Should dusty-hello give dusty the real zio module instead of its stub?
+zg4hrz Pin the Linux validation container's base image and packages
 
 ## Proposed
 
