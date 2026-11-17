@@ -33,7 +33,23 @@ one deadline (`Phase.deadline`), and the state numbers the period it runs in
 it sees a new (deadline, generation) pair after a step, and reports the
 timer's end as `expired`, with the pair it armed. An `expired` event that
 names the current pair closes the connection, silently; any other changes
-nothing (`step_expired_current`, `step_expired_stale`). A step starts a new
+nothing (`step_expired_current`, `step_expired_stale`).
+
+A pipelined request's head budget starts at its first byte (item dv6ikn), so
+it may run beside the send of the response before it, as a second pair
+(`Phase.ahead`, generation `gen + 1`). The first byte is known to Lean in
+one of two ways: it was left over in the buffer when the response started
+(it arrived in the receive that completed the previous request, which is
+when the response starts, or, for a request that waited for a query, when
+the query answered: bytes are not read while a query runs), or the loop,
+which watches the socket for readability while a response is sent with
+nothing buffered (`State.watches`), reports `arrived` when it becomes
+readable, leaving the bytes in the kernel. When that budget ends during the
+send, the connection closes unless the buffer already holds the whole head
+(`step_expired_ahead_partial`, `step_expired_ahead_complete`); once the
+response is sent, the reading of that head keeps the same pair
+(`step_sent_handoff`), so finishing the response neither starts nor resets
+its budget. A step starts a new
 period, with a newer generation, unless it continues the current one
 (`continues`, `step_gen`): bytes received do not extend the head or the body
 deadline, and a partial send does not extend the write deadline. The loop
@@ -59,7 +75,7 @@ inductive Deadline where
   /-- Keep-alive: from the end of a response to the next request's first byte. -/
   | idle
   /-- A request's head: from accept for the first request, and for a later
-  one from when the connection starts to read it. -/
+  one from its first byte (`Phase.ahead`). -/
   | head
   /-- A request's body: from the acceptance of its head. -/
   | body
@@ -92,9 +108,13 @@ def Read.of (continued : Bool) : Need → Read
 /-- Where a connection goes once its current send is complete. -/
 inductive Next where
   | close
-  /-- Back to the buffered bytes; `continued` when the send was the interim
-  `100 Continue` for the request at the buffer's start. -/
-  | read (continued : Bool)
+  /-- Back to the buffered bytes, or, with none buffered, to reading as `r`
+  says: `.body true` after the interim `100 Continue` for the request at the
+  buffer's start; after a response, `.idle` while no byte of a next request
+  is known, and `.head` once one is (left over in the buffer when the
+  response started, or reported `arrived` while it is sent): that request's
+  head budget then runs beside the send (`Phase.ahead`). -/
+  | read (r : Read)
 
 inductive Phase where
   /-- Waiting for bytes from the peer, for what `r` says. -/
@@ -115,10 +135,20 @@ def Phase.deadline : Phase → Option Deadline
   | .reading .idle => some .idle
   | .reading .head => some .head
   | .reading (.body _) => some .body
-  | .writing _ _ (.read true) => some .body
+  | .writing _ _ (.read (.body _)) => some .body
   | .writing _ _ _ => some .write
   | .querying _ => none
   | .closed => none
+
+/-- The second deadline a phase runs under: the head budget of the request
+after the response being sent, once a byte of it is known (item dv6ikn). Its
+generation is the one after the phase's own (`State.gen + 1`), which is the
+generation `step` gives the reading of that head once the response is sent
+(`step_sent_handoff`), so finishing the response neither starts nor resets
+the head's budget. -/
+def Phase.ahead : Phase → Option Deadline
+  | .writing _ _ (.read .head) => some .head
+  | _ => none
 
 structure State (σ : Type) where
   /-- Received bytes not yet consumed by a response. -/
@@ -147,6 +177,10 @@ inductive Event where
   | answered (r : Query.Result)
   /-- The timer the loop armed for deadline `d` in generation `g` ended. -/
   | expired (d : Deadline) (g : Nat)
+  /-- Bytes became readable while a response was sent with nothing buffered
+  (the loop watches for them while `State.watches`); the loop leaves them in
+  the kernel. -/
+  | arrived
 
 /-- What the loop does next. -/
 inductive Action where
@@ -156,7 +190,8 @@ inductive Action where
   | send (data : ByteArray) (off : Nat)
   /-- Close the socket; the connection is finished. -/
   | close
-  /-- Nothing; the answer to any event after close. -/
+  /-- Nothing new: the operation in flight, if any, goes on. The answer to
+  any event after close, and to `arrived` and a stale or settled expiry. -/
   | none
   /-- Run query `q` and report its result as `answered`. -/
   | query (q : Query)
@@ -189,7 +224,7 @@ answered query come through here. -/
 def resume (now : Nat) (buf : ByteArray) : Await Dated → State σ × Action
   | .done f =>
     let r := f now
-    startSend ad ad.init buf r.1 (if r.2 then .close else .read false)
+    startSend ad ad.init buf r.1 (if r.2 then .close else .read (if 0 < buf.size then .head else .idle))
   | .query q k => ({ buf, parser := ad.init, phase := .querying k }, .query q)
 
 /-- Answers what is buffered at wall clock `now`, given the adapter's state
@@ -199,7 +234,7 @@ def serve (now : Nat) (continued : Bool) (p : σ) (buf : ByteArray) : State σ �
   match (ad.handle p buf).2 with
   | .needMore need => wait ad (Read.of continued need) (ad.handle p buf).1 buf
   | .continue interim =>
-    if continued then wait ad (.body true) (ad.handle p buf).1 buf else startSend ad (ad.handle p buf).1 buf interim (.read true)
+    if continued then wait ad (.body true) (ad.handle p buf).1 buf else startSend ad (ad.handle p buf).1 buf interim (.read (.body true))
   | .respond consumed response =>
     if 0 < consumed ∧ consumed ≤ buf.size then resume ad now (buf.extract consumed buf.size) (.done response)
     else closeNow ad
@@ -223,9 +258,9 @@ def advance (now : Nat) (s : State σ) (e : Event) : State σ × Action :=
     else if off + n < out.size then ({ s with phase := .writing out (off + n) next }, .send out (off + n))
     else match next with
       | .close => closeNow ad
-      | .read continued =>
-        if 0 < s.buf.size then serve ad now continued s.parser s.buf
-        else ({ s with phase := .reading (if continued then .body true else .idle) }, .recv inCap)
+      | .read r =>
+        if 0 < s.buf.size then serve ad now r.continued s.parser s.buf
+        else ({ s with phase := .reading r }, .recv inCap)
   | .querying k, .answered r => resume ad now s.buf (k r)
   | _, _ => closeNow ad
 
@@ -240,9 +275,9 @@ body's deadline too. Anything else starts a new period. -/
 def continues : Phase → Event → Phase → Bool
   | .reading .head, .received _, .reading .head => true
   | .reading (.body _), .received _, .reading (.body _) => true
-  | .reading (.body _), .received _, .writing _ _ (.read true) => true
+  | .reading (.body _), .received _, .writing _ _ (.read (.body _)) => true
   | .writing _ _ _, .sent _, .writing _ off _ => off != 0
-  | .writing _ _ (.read true), .sent _, .reading (.body _) => true
+  | .writing _ _ (.read (.body _)), .sent _, .reading (.body _) => true
   | _, _, _ => false
 
 /-- Sets the generation of `r`, the answer to `e` in state `s`: kept while the
@@ -252,14 +287,52 @@ def stamp (s : State σ) (e : Event) (r : State σ × Action) : State σ × Acti
   | .closed => r
   | p => ({ r.1 with gen := if continues s.phase e p then s.gen else s.gen + 1 }, r.2)
 
+/-- Whether the loop is to watch for bytes of a next request while it
+sends: a response is sent, nothing is buffered, and no byte of a next
+request is known yet. -/
+def State.watches (s : State σ) : Bool :=
+  match s.phase with
+  | .writing _ _ (.read .idle) => s.buf.size == 0
+  | _ => false
+
+/-- The answer to `arrived`: a watched send learns that a next request has
+begun, and its head budget starts beside the send (`Phase.ahead`), in the
+same generation; any other phase ignores it. -/
+def arrive (s : State σ) : State σ × Action :=
+  match s.phase with
+  | .writing out off (.read .idle) =>
+    if s.buf.size = 0 then ({ s with phase := .writing out off (.read .head) }, .none) else (s, .none)
+  | _ => (s, .none)
+
+/-- The answer to the expiry of deadline `d` in generation `g`. The current
+period's deadline closes. The head budget running beside a send
+(`Phase.ahead`, generation `gen + 1`) closes when that head is not complete
+in the buffer: its bytes may still be in the kernel (none buffered), or the
+adapter still lacks part of it. When the buffered bytes hold the whole head
+(the adapter, asked as `serve` will ask it once the send ends, answers
+anything but `needMore .head`), the head kept its budget: the send goes on
+and that request has no head deadline left. Any other expiry is stale and
+changes nothing. -/
+def expire (s : State σ) (d : Deadline) (g : Nat) : State σ × Action :=
+  if s.phase.deadline = some d ∧ s.gen = g then closeNow ad
+  else match s.phase with
+    | .writing out off (.read .head) =>
+      if d = .head ∧ s.gen + 1 = g then
+        if s.buf.size = 0 then closeNow ad
+        else match (ad.handle s.parser s.buf).2 with
+          | .needMore .head => closeNow ad
+          | _ => ({ s with phase := .writing out off (.read .idle) }, .none)
+      else (s, .none)
+    | _ => (s, .none)
+
 /-- The connection's answer to event `e`, reported at wall clock `now` (Unix
 seconds), which only a response sent in answer to it sees (`Dated`). An
-expiry of the current deadline period closes the connection, and any other
-expiry changes nothing. -/
+expiry is answered by `expire`, an arrival by `arrive`. -/
 def step (now : Nat) (s : State σ) (e : Event) : State σ × Action :=
   match s.phase, e with
   | .closed, _ => (s, .none)
-  | p, .expired d g => if p.deadline = some d ∧ s.gen = g then closeNow ad else (s, .none)
+  | _, .expired d g => expire ad s d g
+  | _, .arrived => arrive s
   | _, _ => stamp s e (advance ad now s e)
 
 /-! ## Guarantees
@@ -569,7 +642,7 @@ theorem advance_query (s : State σ) (e : Event) (q : Query) :
 /-- The interim response is sent at most once per request: serving a request
 for which `100 Continue` was already sent never starts another interim send. -/
 theorem serve_continued (p : σ) (buf : ByteArray) (out : ByteArray) (off : Nat)
-    (h : (serve ad now true p buf).1.phase = .writing out off (.read true)) : False := by
+    (h : (serve ad now true p buf).1.phase = .writing out off (.read (.body true))) : False := by
   revert h
   unfold serve
   split
@@ -579,7 +652,7 @@ theorem serve_continued (p : σ) (buf : ByteArray) (out : ByteArray) (off : Nat)
     · intro h
       simp only [resume, startSend] at h
       split at h
-      · simp at h; split at h <;> simp at h
+      · simp at h; (repeat' split at h) <;> simp_all
       · simp [closeNow] at h
     · simp [closeNow]
   · split
@@ -659,42 +732,93 @@ theorem advance_fed (s : State σ) (e : Event) (hs : FedInv ad s) : FedInv ad (a
 
 /-! ## From `advance` to `step`
 
-`step` answers every event other than an expiry as `advance` does, apart from
-the generation (`step_obs`); an expiry either closes the connection or changes
-nothing (`step_expiry`). So each guarantee proved above for `advance` holds
-for `step` as stated below. -/
+`step` answers every event other than the loop's own reports (an expiry, an
+arrival) as `advance` does, apart from the generation (`step_obs`); a report
+of the loop either closes the connection or asks for nothing and keeps the
+buffer, the adapter's state, the generation and the response being sent
+(`step_loop`). So each guarantee proved above for `advance` holds for `step`
+as stated below. -/
 
 /-- What a step decides, apart from the generation. -/
 def obs (r : State σ × Action) : ByteArray × σ × Phase × Action := (r.1.buf, r.1.parser, r.1.phase, r.2)
 
-/-- Whether an event is an expiry. -/
-def Event.isExpiry : Event → Bool
-  | .expired .. => true
+/-- Whether an event is the loop's own report (an expiry or an arrival)
+rather than the outcome of an operation. -/
+def Event.isLoop : Event → Bool
+  | .expired .. | .arrived => true
   | _ => false
 
 theorem stamp_obs (s : State σ) (e : Event) (r : State σ × Action) : obs (stamp s e r) = obs r := by
   unfold stamp; split <;> rfl
 
-/-- An event other than an expiry is answered as `advance` answers it, apart
-from the generation. -/
-theorem step_obs (s : State σ) (e : Event) (he : e.isExpiry = false) :
+/-- An event other than the loop's own report is answered as `advance`
+answers it, apart from the generation. -/
+theorem step_obs (s : State σ) (e : Event) (he : e.isLoop = false) :
     obs (step ad now s e) = obs (advance ad now s e) := by
   unfold step
   split
   · rename_i h; simp [advance, h]
-  · simp [Event.isExpiry] at he
+  · simp [Event.isLoop] at he
+  · simp [Event.isLoop] at he
   · exact stamp_obs _ _ _
 
-/-- An expiry closes the connection or changes nothing. -/
-theorem step_expiry (s : State σ) (d : Deadline) (g : Nat) :
-    step ad now s (.expired d g) = (s, .none) ∨ step ad now s (.expired d g) = closeNow ad := by
-  unfold step
+/-- What a report of the loop may do: close, or ask for nothing while keeping
+the buffer, the adapter's state and the generation, and leaving the phase
+open, writing only the response it was writing. -/
+def Quiet (s : State σ) (r : State σ × Action) : Prop :=
+  r = closeNow ad ∨
+    (r.2 = .none ∧ r.1.buf = s.buf ∧ r.1.parser = s.parser ∧ r.1.gen = s.gen ∧
+      (r.1.phase = .closed → s.phase = .closed) ∧
+      ∀ out off next, r.1.phase = .writing out off next → ∃ next', s.phase = .writing out off next')
+
+theorem quiet_same (s : State σ) : Quiet ad s (s, .none) :=
+  .inr ⟨rfl, rfl, rfl, rfl, id, fun _ _ _ h => ⟨_, h⟩⟩
+
+theorem expire_quiet (s : State σ) (d : Deadline) (g : Nat) : Quiet ad s (expire ad s d g) := by
+  unfold expire
   split
   · exact .inl rfl
   · split
-    · exact .inr rfl
-    · exact .inl rfl
-  · rename_i h; exact absurd rfl (h _ _)
+    · rename_i out off h
+      split
+      · split
+        · exact .inl rfl
+        · split
+          · exact .inl rfl
+          · refine .inr ⟨rfl, rfl, rfl, rfl, by simp, ?_⟩
+            intro o f n hw; simp only [Phase.writing.injEq] at hw
+            obtain ⟨rfl, rfl, -⟩ := hw; exact ⟨_, h⟩
+      · exact quiet_same ad s
+    · exact quiet_same ad s
+
+theorem arrive_quiet (s : State σ) : Quiet ad s (arrive s) := by
+  unfold arrive
+  split
+  · rename_i out off h
+    split
+    · refine .inr ⟨rfl, rfl, rfl, rfl, by simp, ?_⟩
+      intro o f n hw; simp only [Phase.writing.injEq] at hw
+      obtain ⟨rfl, rfl, -⟩ := hw; exact ⟨_, h⟩
+    · exact quiet_same ad s
+  · exact quiet_same ad s
+
+/-- A report of the loop closes the connection or asks for nothing, keeping
+the buffer, the adapter's state, the generation and the response being
+sent. -/
+theorem step_expired (s : State σ) (d : Deadline) (g : Nat) (h : s.phase ≠ .closed) :
+    step ad now s (.expired d g) = expire ad s d g := by
+  unfold step; split <;> simp_all
+
+theorem step_arrive (s : State σ) (h : s.phase ≠ .closed) : step ad now s .arrived = arrive s := by
+  unfold step; split <;> simp_all
+
+theorem step_loop (s : State σ) (e : Event) (he : e.isLoop = true) : Quiet ad s (step ad now s e) := by
+  by_cases hc : s.phase = .closed
+  · have : step ad now s e = (s, .none) := by unfold step; split <;> simp_all
+    rw [this]; exact quiet_same ad s
+  cases e <;> simp [Event.isLoop] at he
+  · rw [step_expired ad now s _ _ hc]; exact expire_quiet ad s _ _
+  · rw [step_arrive ad now s hc]; exact arrive_quiet ad s
 
 /-- `advance` reads of the state only its buffer, the adapter's state and
 the phase. -/
@@ -707,22 +831,25 @@ theorem advance_congr (s s' : State σ) (e : Event) (hb : s.buf = s'.buf) (hp : 
   cases ph <;> cases e <;> simp only [advance] <;> (repeat' split) <;> simp_all [obs]
 
 theorem step_inv (s : State σ) (e : Event) (hs : Inv s) : Inv (step ad now s e).1 := by
-  cases he : e.isExpiry
+  cases he : e.isLoop
   · have h := step_obs ad now s e he
     simp only [obs, Prod.mk.injEq] at h
     obtain ⟨hb, -, hph, -⟩ := h
     have := advance_inv ad now s e hs
     unfold Inv at this ⊢; rw [hb, hph]; exact this
-  · cases e <;> simp [Event.isExpiry] at he
-    rcases step_expiry ad now s _ _ with h | h <;> rw [h]
-    · exact hs
-    · exact closeNow_inv ad
+  · rcases step_loop ad now s e he with h | ⟨-, hb, -, -, -, hw⟩
+    · rw [h]; exact closeNow_inv ad
+    · refine ⟨hb ▸ hs.1, ?_⟩
+      intro out off next hp
+      obtain ⟨next', h'⟩ := hw out off next hp
+      exact hs.2 _ _ _ h'
 
 /-- A closed connection stays closed and asks for nothing. -/
 theorem step_closed (s : State σ) (e : Event) (h : s.phase = .closed) :
     step ad now s e = (s, .none) := by
   unfold step; split
   · rfl
+  · rename_i h'; simp [h] at h'
   · rename_i h'; simp [h] at h'
   · rename_i h'; simp [h] at h'
 
@@ -732,79 +859,75 @@ theorem step_refused (s : State σ) (h : s.phase ≠ .closed) :
   unfold step; split
   · contradiction
   · contradiction
+  · contradiction
   · rw [advance_refused ad now s h]; rfl
 
 /-- The close action always leaves the connection closed, so nothing follows it. -/
 theorem step_close (s : State σ) (e : Event) :
     (step ad now s e).2 = .close → (step ad now s e).1.phase = .closed := by
-  cases he : e.isExpiry
+  cases he : e.isLoop
   · have h := step_obs ad now s e he
     simp only [obs, Prod.mk.injEq] at h
     obtain ⟨-, -, hph, ha⟩ := h
     rw [hph, ha]; exact advance_close ad now s e
-  · cases e <;> simp [Event.isExpiry] at he
-    rcases step_expiry ad now s _ _ with h | h <;> rw [h]
-    · simp
-    · simp [closeNow]
+  · rcases step_loop ad now s e he with h | ⟨ha, -⟩
+    · rw [h]; simp [closeNow]
+    · rw [ha]; simp
 
 /-- A receive always has room, and never more than the buffer can take. -/
 theorem step_recv (s : State σ) (e : Event) (room : Nat) :
     (step ad now s e).2 = .recv room →
       0 < room ∧ (step ad now s e).1.buf.size + room = inCap := by
-  cases he : e.isExpiry
+  cases he : e.isLoop
   · have h := step_obs ad now s e he
     simp only [obs, Prod.mk.injEq] at h
     obtain ⟨hb, -, -, ha⟩ := h
     rw [hb, ha]; exact advance_recv ad now s e room
-  · cases e <;> simp [Event.isExpiry] at he
-    rcases step_expiry ad now s _ _ with h | h <;> rw [h]
-    · simp
-    · simp [closeNow]
+  · rcases step_loop ad now s e he with h | ⟨ha, -⟩
+    · rw [h]; simp [closeNow]
+    · rw [ha]; simp
 
 /-- Every send starts inside its data, so it has at least one byte to write. -/
 theorem step_send (s : State σ) (e : Event) (data : ByteArray) (off : Nat) :
     (step ad now s e).2 = .send data off → off < data.size := by
-  cases he : e.isExpiry
+  cases he : e.isLoop
   · have h := step_obs ad now s e he
     simp only [obs, Prod.mk.injEq] at h
     obtain ⟨-, -, -, ha⟩ := h
     rw [ha]; exact advance_send ad now s e data off
-  · cases e <;> simp [Event.isExpiry] at he
-    rcases step_expiry ad now s _ _ with h | h <;> rw [h]
-    · simp
-    · simp [closeNow]
+  · rcases step_loop ad now s e he with h | ⟨ha, -⟩
+    · rw [h]; simp [closeNow]
+    · rw [ha]; simp
 
 /-- A query is asked for only together with the phase that waits for its
 result. So, provided the loop answers each `query` action with exactly one
 `answered` event and reports nothing else meanwhile (the assumption in this
 file's header, which the loop checks at run time, `serve.zig` `answered`; a
 `querying` phase has no deadline, so every expiry reported meanwhile is stale
-and changes nothing), a connection has at most one query outstanding and
+and changes nothing, and so does an arrival), a connection has at most one query outstanding and
 that event finds its continuation. -/
 theorem step_query (s : State σ) (e : Event) (q : Query) :
     (step ad now s e).2 = .query q → ∃ k, (step ad now s e).1.phase = .querying k := by
-  cases he : e.isExpiry
+  cases he : e.isLoop
   · have h := step_obs ad now s e he
     simp only [obs, Prod.mk.injEq] at h
     obtain ⟨-, -, hph, ha⟩ := h
     rw [hph, ha]; exact advance_query ad now s e q
-  · cases e <;> simp [Event.isExpiry] at he
-    rcases step_expiry ad now s _ _ with h | h <;> rw [h]
-    · simp
-    · simp [closeNow]
+  · rcases step_loop ad now s e he with h | ⟨ha, -⟩
+    · rw [h]; simp [closeNow]
+    · rw [ha]; simp
 
 /-- Every step keeps the adapter's state fed for the buffer. -/
 theorem step_fed (s : State σ) (e : Event) (hs : FedInv ad s) : FedInv ad (step ad now s e).1 := by
-  cases he : e.isExpiry
+  cases he : e.isLoop
   · have h := step_obs ad now s e he
     simp only [obs, Prod.mk.injEq] at h
     obtain ⟨hb, hp, -, -⟩ := h
     have := advance_fed ad now s e hs
     unfold FedInv at this ⊢; rw [hb, hp]; exact this
-  · cases e <;> simp [Event.isExpiry] at he
-    rcases step_expiry ad now s _ _ with h | h <;> rw [h]
-    · exact hs
-    · exact closeNow_fed ad
+  · rcases step_loop ad now s e he with h | ⟨-, hb, hp, -⟩
+    · rw [h]; exact closeNow_fed ad
+    · unfold FedInv; rw [hb, hp]; exact hs
 
 /-- The state after the events `es`, each reported at its own wall clock. -/
 def run (s : State σ) : List (Nat × Event) → State σ
@@ -1004,22 +1127,73 @@ once. A step that does not continue the period gives it a newer generation,
 and generations never decrease while the connection is open, so an expiry
 the loop armed for an earlier period never closes it. -/
 
-/-- An expiry that names another deadline or generation than the current one
-changes nothing and asks for nothing. -/
+/-- An expiry that names neither the current period nor the head budget
+running beside a send changes nothing and asks for nothing. -/
 theorem step_expired_stale (s : State σ) (d : Deadline) (g : Nat)
-    (h : ¬ (s.phase.deadline = some d ∧ s.gen = g)) : step ad now s (.expired d g) = (s, .none) := by
-  unfold step; split
+    (h : ¬ (s.phase.deadline = some d ∧ s.gen = g)) (ha : ¬ (s.phase.ahead = some d ∧ s.gen + 1 = g)) :
+    step ad now s (.expired d g) = (s, .none) := by
+  by_cases hc : s.phase = .closed
+  · exact step_closed ad now s _ hc
+  rw [step_expired ad now s d g hc]
+  unfold expire
+  simp only [h, ite_false]
+  split
+  · rename_i out off hp
+    rw [hp] at ha; simp only [Phase.ahead, Option.some.injEq] at ha
+    split
+    · rename_i hd; exact absurd ⟨hd.1.symm, hd.2⟩ ha
+    · rfl
   · rfl
-  · next heq _ => cases heq; simp [h]
-  · rename_i h'; exact absurd rfl (h' _ _)
 
 /-- An expiry of the current deadline period closes the connection. -/
 theorem step_expired_current (s : State σ) (d : Deadline) (g : Nat)
     (h : s.phase.deadline = some d) (hg : s.gen = g) : step ad now s (.expired d g) = closeNow ad := by
-  unfold step; split
-  · rename_i hc; rw [hc] at h; simp [Phase.deadline] at h
-  · next heq _ => cases heq; simp [h, hg]
-  · rename_i h'; exact absurd rfl (h' _ _)
+  have hc : s.phase ≠ .closed := by intro hc; rw [hc] at h; simp [Phase.deadline] at h
+  rw [step_expired ad now s d g hc]
+  unfold expire
+  simp [h, hg]
+
+/-- The head budget of a pipelined request, running beside the send of the
+response before it, closes the connection when it ends while that head is
+not complete in the buffer: none of it buffered (its bytes are in the
+kernel), or the adapter still lacking part of it. -/
+theorem step_expired_ahead_partial (s : State σ) (out : ByteArray) (off : Nat)
+    (hw : s.phase = .writing out off (.read .head))
+    (hp : s.buf.size = 0 ∨ (ad.handle s.parser s.buf).2 = .needMore .head) :
+    step ad now s (.expired .head (s.gen + 1)) = closeNow ad := by
+  rw [step_expired ad now s _ _ (by rw [hw]; simp)]
+  unfold expire
+  rw [hw]
+  simp only [Phase.deadline, Option.some.injEq, reduceCtorEq, false_and, ite_false, and_self, ite_true]
+  split
+  · rfl
+  · rename_i h0
+    rcases hp with hp | hp
+    · exact absurd hp h0
+    · rw [hp]
+
+/-- When the head budget running beside a send ends and the buffer already
+holds that whole head, the head kept its budget: the send goes on, nothing is
+asked for, and that request has no head deadline left (`Phase.ahead` is
+none, and the loop watches no more: the buffer is not empty). -/
+theorem step_expired_ahead_complete (s : State σ) (out : ByteArray) (off : Nat)
+    (hw : s.phase = .writing out off (.read .head)) (hb : 0 < s.buf.size)
+    (hp : (ad.handle s.parser s.buf).2 ≠ .needMore .head) :
+    step ad now s (.expired .head (s.gen + 1)) = ({ s with phase := .writing out off (.read .idle) }, .none) := by
+  rw [step_expired ad now s _ _ (by rw [hw]; simp)]
+  unfold expire
+  rw [hw]
+  simp only [Phase.deadline, Option.some.injEq, reduceCtorEq, false_and, ite_false, and_self, ite_true]
+  simp only [show ¬ s.buf.size = 0 by omega, ite_false]
+  all_goals (split <;> simp_all)
+
+/-- The first byte of a next request, reported while a response is sent with
+nothing buffered, starts that request's head budget beside the send, in the
+send's generation, and asks for nothing. -/
+theorem step_arrived (s : State σ) (out : ByteArray) (off : Nat)
+    (hw : s.phase = .writing out off (.read .idle)) (hb : s.buf.size = 0) :
+    step ad now s .arrived = ({ s with phase := .writing out off (.read .head) }, .none) := by
+  rw [step_arrive ad now s (by rw [hw]; simp)]; unfold arrive; rw [hw]; simp [hb]
 
 /-- The actions answered to the events `es`, in order. -/
 def actions (s : State σ) : List (Nat × Event) → List Action
@@ -1077,14 +1251,15 @@ theorem close_once (s : State σ) (es : List (Nat × Event)) :
 /-- The generation after an event other than an expiry, while the connection
 stays open: kept when the event continues the deadline period, the next one
 otherwise. -/
-theorem step_gen (s : State σ) (e : Event) (he : e.isExpiry = false)
+theorem step_gen (s : State σ) (e : Event) (he : e.isLoop = false)
     (hc : (step ad now s e).1.phase ≠ .closed) :
     (step ad now s e).1.gen = if continues s.phase e (step ad now s e).1.phase then s.gen else s.gen + 1 := by
   revert hc
   unfold step
   split
   · rename_i h; intro hc; exact absurd h hc
-  · simp [Event.isExpiry] at he
+  · simp [Event.isLoop] at he
+  · simp [Event.isLoop] at he
   · unfold stamp
     split
     · rename_i h; intro hc; exact absurd h hc
@@ -1093,12 +1268,11 @@ theorem step_gen (s : State σ) (e : Event) (he : e.isExpiry = false)
 /-- Generations never decrease while the connection is open. -/
 theorem step_gen_le (s : State σ) (e : Event) (hc : (step ad now s e).1.phase ≠ .closed) :
     s.gen ≤ (step ad now s e).1.gen := by
-  cases he : e.isExpiry
+  cases he : e.isLoop
   · rw [step_gen ad now s e he hc]; split <;> omega
-  · cases e <;> simp [Event.isExpiry] at he
-    rcases step_expiry ad now s _ _ with h | h <;> rw [h] at hc ⊢
-    · exact Nat.le_refl _
-    · exact absurd rfl hc
+  · rcases step_loop ad now s e he with h | ⟨-, -, -, hg, -⟩
+    · rw [h] at hc; exact absurd rfl hc
+    · exact Nat.le_of_eq hg.symm
 
 theorem run_gen_le (es : List (Nat × Event)) :
     ∀ (s : State σ), (run ad s es).phase ≠ .closed → s.gen ≤ (run ad s es).gen := by
@@ -1119,10 +1293,10 @@ theorem expired_old_stale (s : State σ) (d : Deadline) (g : Nat) (hg : g < s.ge
     step ad now (run ad s es) (.expired d g) = (run ad s es, .none) := by
   by_cases hc : (run ad s es).phase = .closed
   · exact step_closed ad now _ _ hc
-  · apply step_expired_stale
-    intro ⟨_, h⟩
-    have := run_gen_le ad es s hc
-    omega
+  · have := run_gen_le ad es s hc
+    apply step_expired_stale
+    · intro ⟨_, h⟩; omega
+    · intro ⟨_, h⟩; omega
 
 /-- Bytes received do not extend the head or the body deadline: a receive
 that leaves the connection reading the same part of the request keeps the
@@ -1181,5 +1355,17 @@ theorem step_sent_partial (s : State σ) (out : ByteArray) (off : Nat) (next : N
       · split
         · intro h; exact absurd (serve_writing ad now _ _ _ _ _ _ h) h0
         · simp
+
+/-- Finishing a response neither starts nor resets the head budget running
+beside it: when the send that ends it leaves the connection reading that
+head, the reading's deadline and generation are the pair the head budget ran
+under beside the send (`Phase.ahead`, `gen + 1`), so the loop keeps that
+timer. -/
+theorem step_sent_handoff (s : State σ) (out : ByteArray) (off n : Nat)
+    (hw : s.phase = .writing out off (.read .head)) (hr : (step ad now s (.sent n)).1.phase = .reading .head) :
+    (step ad now s (.sent n)).1.phase.deadline = s.phase.ahead ∧ (step ad now s (.sent n)).1.gen = s.gen + 1 := by
+  refine ⟨by rw [hr, hw]; rfl, ?_⟩
+  rw [step_gen ad now s _ rfl (by rw [hr]; simp), hr, hw]
+  simp [continues]
 
 end Server.Conn

@@ -6,7 +6,12 @@
 //! to receive again; at end of input, on a refusal, on a failure and on an
 //! expiry it asks to close. When a test sets `open_dl` and `recv_dl`, its
 //! states run under those deadlines, each receive with bytes starting a new
-//! generation, as Lean's do (Conn.step). Clients connect over TCP on 127.0.0.1. Before a single-loop test
+//! generation, as Lean's do (Conn.step). When a test sets `respond`, a
+//! receive whose first byte is 'R' is a request: the fake answers it with a
+//! response of that many bytes under the write deadline, watches for the
+//! next request's first byte while it is sent, and runs that request's head
+//! budget beside the send from its arrival, as Lean's Conn.step does for a
+//! pipelined request (item dv6ikn). Clients connect over TCP on 127.0.0.1. Before a single-loop test
 //! polls its loop for an event, it waits (`awaitReadable`) until the kernel
 //! has made that event ready: a connection queued on the listening socket, or
 //! bytes readable at the server's end. The loop's nonblocking polls then find
@@ -31,7 +36,7 @@ const max_steps = 1000;
 
 // ---- the fake glue.c ----
 
-const Kind = enum(u8) { open, recv, refused, fail, free, ready, snapshot, done, expired };
+const Kind = enum(u8) { open, recv, refused, fail, free, ready, snapshot, done, expired, arrived, written };
 
 const Event = extern struct {
     kind: Kind,
@@ -54,10 +59,15 @@ const Event = extern struct {
 const none_code: u8 = 0;
 const idle_code: u8 = 1;
 const head_code: u8 = 2;
+const write_code: u8 = 4;
 
 /// The Lean state of one fake connection: the deadline it runs under and
-/// its generation.
-const FakeConn = struct { id: u32, loop: u8, dl: u8 = none_code, gen: u32 = 0 };
+/// its generation; while it writes a response, the bytes still to send and
+/// whether a next request's head budget runs beside the send (in
+/// generation `gen + 1`, Conn.Phase.ahead).
+/// `held`: the next request's head is complete in Lean's buffer, so the
+/// fake no longer watches (Conn.State.watches needs an empty buffer).
+const FakeConn = struct { id: u32, loop: u8, dl: u8 = none_code, gen: u32 = 0, left: usize = 0, ahead: bool = false, held: bool = false };
 
 /// The deadline a new connection runs under, and the one after each receive
 /// with bytes. Tests set them before a loop starts.
@@ -66,6 +76,16 @@ var recv_dl: u8 = none_code;
 /// When set, a receive with bytes keeps the connection's deadline and
 /// generation (a fragment within one period, as Lean's head fragments).
 var recv_keeps = false;
+/// When nonzero, the size of the response to a request ('R').
+var respond: usize = 0;
+/// When set, the head behind a response counts as complete in Lean's
+/// buffer: its budget's expiry during the write ends it without a close
+/// (Conn.step_expired_ahead_complete).
+var ahead_complete = false;
+/// When nonzero, a new connection starts with a response of that many
+/// bytes (the fake speaks first), sent under the write deadline with the
+/// readiness poll beside it.
+var respond_on_open: usize = 0;
 
 var events: [2]c.fd_t = .{ -1, -1 };
 var next_conn = std.atomic.Value(u32).init(0);
@@ -91,7 +111,7 @@ fn connOf(state: serve.State) *FakeConn {
 }
 
 fn answer(act: *serve.Action, kind: u8, n: usize) void {
-    act.* = .{ .kind = kind, .room = n, .len = 0, .query = null, .deadline = none_code, .gen = null };
+    act.* = .{ .kind = kind, .room = n, .len = 0, .query = null, .deadline = none_code, .gen = null, .ahead = none_code, .ahead_gen = null, .watch = 0 };
 }
 
 /// A generation as the loop holds it: never null.
@@ -106,22 +126,52 @@ fn answerRecv(act: *serve.Action, fc: *const FakeConn, n: usize) void {
     if (fc.dl != none_code) act.gen = genPtr(fc.gen);
 }
 
-export fn ekk_open(state: *serve.State, _: [*]u8, _: usize, act: *serve.Action) void {
+/// Answers `kind` (send or none) while writing: the write deadline, the
+/// head budget beside it once a next request's byte arrived, and the watch
+/// until then (Conn.State.watches).
+fn answerWriting(act: *serve.Action, fc: *const FakeConn, kind: u8, out: [*]u8, cap: usize) void {
+    answer(act, kind, 0);
+    if (kind == 1) {
+        act.len = @min(cap, fc.left);
+        @memset(out[0..act.len], 'x');
+    }
+    act.deadline = fc.dl;
+    act.gen = genPtr(fc.gen);
+    if (fc.ahead) {
+        act.ahead = head_code;
+        act.ahead_gen = genPtr(fc.gen + 1);
+    } else if (!fc.held) act.watch = 1;
+}
+
+export fn ekk_open(state: *serve.State, out: [*]u8, cap: usize, act: *serve.Action) void {
     enter("ekk_open");
     const fc = std.heap.c_allocator.create(FakeConn) catch @panic("out of memory");
     fc.* = .{ .id = next_conn.fetchAdd(1, .monotonic), .loop = loop_index, .dl = open_dl };
     state.* = fc;
     emit(.{ .kind = .open, .loop = fc.loop, .conn = fc.id });
+    if (respond_on_open != 0) {
+        fc.dl = write_code;
+        fc.left = respond_on_open;
+        return answerWriting(act, fc, 1, out, cap);
+    }
     answerRecv(act, fc, room);
 }
 
-export fn ekk_recv(state: *serve.State, data: [*]const u8, n: usize, _: [*]u8, _: usize, act: *serve.Action) void {
+export fn ekk_recv(state: *serve.State, data: [*]const u8, n: usize, out: [*]u8, cap: usize, act: *serve.Action) void {
     enter("ekk_recv");
     const fc = connOf(state.*);
     emit(.{ .kind = .recv, .loop = fc.loop, .conn = fc.id, .n = @intCast(n), .byte = if (n > 0) data[0] else 0 });
     if (n == 0) {
         fc.dl = none_code;
         return answer(act, 2, 0);
+    }
+    if (respond != 0 and data[0] == 'R') {
+        fc.dl = write_code;
+        fc.gen += 1;
+        fc.left = respond;
+        fc.ahead = false;
+        fc.held = false;
+        return answerWriting(act, fc, 1, out, cap);
     }
     if (!recv_keeps) {
         fc.dl = recv_dl;
@@ -146,16 +196,54 @@ export fn ekk_fail(state: *serve.State, _: [*]u8, _: usize, act: *serve.Action) 
     answer(act, 2, 0);
 }
 
-/// The loop reports only its current arm (a retired one's callback calls
-/// nothing): an expiry of any other deadline or generation is a stale one
-/// the loop should not have reported.
-export fn ekk_expired(state: *serve.State, kind: u8, gen: serve.Gen, _: [*]u8, _: usize, act: *serve.Action) void {
+/// The loop reports only its live arms (a retired one's callback calls
+/// nothing): an expiry of any deadline and generation other than the
+/// state's own pair or the head budget beside its send is a stale one the
+/// loop should not have reported. The head beside a send closes when it is
+/// incomplete; with `ahead_complete` its budget ends and the send goes on.
+export fn ekk_expired(state: *serve.State, kind: u8, gen: serve.Gen, out: [*]u8, cap: usize, act: *serve.Action) void {
     enter("ekk_expired");
     const fc = connOf(state.*);
-    if (fc.dl == none_code or kind != fc.dl or gen != genPtr(fc.gen)) @panic("the loop reported a stale expiry");
-    emit(.{ .kind = .expired, .loop = fc.loop, .conn = fc.id, .n = fc.gen, .byte = kind });
+    const ahead = fc.ahead and kind == head_code and gen == genPtr(fc.gen + 1);
+    if (!ahead and (fc.dl == none_code or kind != fc.dl or gen != genPtr(fc.gen))) @panic("the loop reported a stale expiry");
+    emit(.{ .kind = .expired, .loop = fc.loop, .conn = fc.id, .n = if (ahead) fc.gen + 1 else fc.gen, .byte = kind });
+    if (ahead and ahead_complete) {
+        fc.ahead = false;
+        fc.held = true;
+        return answerWriting(act, fc, 3, out, cap);
+    }
     fc.dl = none_code;
+    fc.ahead = false;
     answer(act, 2, 0);
+}
+
+/// The loop reports readability only while the fake watches: while it
+/// writes and no next request's byte has arrived yet.
+export fn ekk_arrived(state: *serve.State, out: [*]u8, cap: usize, act: *serve.Action) void {
+    enter("ekk_arrived");
+    const fc = connOf(state.*);
+    if (fc.dl != write_code or fc.ahead or fc.held) @panic("the loop reported readability the fake did not watch for");
+    emit(.{ .kind = .arrived, .loop = fc.loop, .conn = fc.id, .n = fc.gen + 1 });
+    fc.ahead = true;
+    answerWriting(act, fc, 3, out, cap);
+}
+
+/// The send of `n` bytes of the response completed. At its end the
+/// connection reads the next request, under the head budget that ran beside
+/// the send when its byte arrived (the same pair: Conn.step_sent_handoff).
+export fn ekk_sent(state: *serve.State, n: usize, out: [*]u8, cap: usize, act: *serve.Action) void {
+    enter("ekk_sent");
+    const fc = connOf(state.*);
+    if (fc.dl != write_code or n == 0 or n > fc.left) @panic("a send the fake did not ask for");
+    fc.left -= n;
+    if (fc.left > 0) return answerWriting(act, fc, 1, out, cap);
+    emit(.{ .kind = .written, .loop = fc.loop, .conn = fc.id, .n = fc.gen });
+    if (fc.ahead) {
+        fc.dl = head_code;
+        fc.gen += 1;
+        fc.ahead = false;
+    } else fc.dl = none_code;
+    answerRecv(act, fc, room);
 }
 
 export fn ekk_gen_eq(a: serve.Gen, b: serve.Gen) u8 {
@@ -171,10 +259,7 @@ export fn ekk_free(state: serve.State) void {
     std.heap.c_allocator.destroy(fc);
 }
 
-// The fake never asks to send or to query, and these tests never call ekk_serve.
-export fn ekk_sent(_: *serve.State, _: usize, _: [*]u8, _: usize, _: *serve.Action) void {
-    @panic("ekk_sent: the fake never asks to send");
-}
+// The fake never asks to query, and these tests never call ekk_serve.
 export fn ekk_answer(_: *serve.State, _: ?*anyopaque, _: [*]u8, _: usize, _: *serve.Action) void {
     @panic("ekk_answer: the fake never asks to query");
 }
@@ -350,6 +435,10 @@ const Single = struct {
         open_dl = none_code;
         recv_dl = none_code;
         recv_keeps = false;
+        respond = 0;
+        ahead_complete = false;
+        respond_on_open = 0;
+        serve.testing = .{};
         serve.budget_ms = .{ never, never, never, never };
         stops = 0;
         serve.max_conns = 8;
@@ -380,16 +469,21 @@ const Single = struct {
         std.debug.print("\n", .{});
     }
 
+    /// Takes the events written so far into the log.
+    fn collect(self: *Single) void {
+        while (pendingEvent()) |e| {
+            if (self.n == self.log.len) @panic("the event log is full");
+            self.log[self.n] = e;
+            self.n += 1;
+        }
+    }
+
     /// Polls the loop without blocking until `want` events of `kind` have
     /// arrived in all, at most `max_steps` polls.
     fn stepUntil(self: *Single, kind: Kind, want: usize) !void {
         var step: usize = 0;
         while (true) : (step += 1) {
-            while (pendingEvent()) |e| {
-                if (self.n == self.log.len) @panic("the event log is full");
-                self.log[self.n] = e;
-                self.n += 1;
-            }
+            self.collect();
             if (self.count(kind) >= want) return;
             if (step == max_steps) {
                 std.debug.print("waited for {d} {s} events\n", .{ want, @tagName(kind) });
@@ -651,6 +745,236 @@ test "a receive the loop runs before a due expiry wins: that expiry is stale and
         .{ .kind = .expired, .n = 2, .byte = idle_code },
         .{ .kind = .free },
     });
+    s.lp.stop.notify();
+    try s.finish();
+}
+
+// ---- a pipelined request's head budget beside a blocked response ----
+
+/// A response much larger than the socket buffers the test sets: its send
+/// parks until the client reads.
+const response_len: usize = 1 << 20;
+const small_buffer: c_int = 4096;
+
+fn setBuffer(fd: c.fd_t, opt: u32) !void {
+    if (c.setsockopt(fd, c.SOL.SOCKET, opt, std.mem.asBytes(&small_buffer), @sizeOf(c_int)) != 0) return error.SetSockOpt;
+}
+
+/// Connects a client with a small receive buffer, has it send a request
+/// ('R'), and steps the loop until the fake has started the response of
+/// `len` bytes, its send on a small send buffer, with the readiness poll
+/// beside it.
+fn requestResponse(s: *Single, len: usize) !c.fd_t {
+    respond = len;
+    recv_keeps = true;
+    const cl = socket(c.AF.INET, c.SOCK.STREAM, 0);
+    if (cl < 0) return error.Socket;
+    errdefer _ = c.close(cl);
+    try setBuffer(cl, c.SO.RCVBUF);
+    if (c.connect(cl, @ptrCast(&s.listener.addr), @sizeOf(c.sockaddr.in)) != 0) return error.Connect;
+    awaitReadable(s.listener.fd);
+    try s.stepUntil(.open, 1);
+    try setBuffer(s.lp.head.?.fd, c.SO.SNDBUF);
+    try send(cl, "R");
+    try s.stepUntil(.recv, 1);
+    return cl;
+}
+
+/// `requestResponse` with a blocked response; then the client sends part of
+/// a next request's head ("G"), which the readiness poll beside the send
+/// reports.
+fn pipelinedBehindResponse(s: *Single) !c.fd_t {
+    const cl = try requestResponse(s, response_len);
+    errdefer _ = c.close(cl);
+    try send(cl, "G");
+    try s.stepUntil(.arrived, 1);
+    return cl;
+}
+
+/// The most rounds of draining the client and polling the loop until the
+/// response's last send completed.
+const max_drain = 100_000;
+
+/// Reads whatever the client has, without blocking, and polls the loop,
+/// until the fake has seen the response's last send.
+fn drainUntilWritten(s: *Single, cl: c.fd_t) !void {
+    var buf: [65536]u8 = undefined;
+    var round: usize = 0;
+    while (s.count(.written) == 0) : (round += 1) {
+        if (round == max_drain) {
+            s.dump();
+            return error.ResponseNeverWritten;
+        }
+        _ = c.recv(cl, &buf, buf.len, c.MSG.DONTWAIT);
+        try s.lp.loop.poll(.zero);
+        s.collect();
+    }
+}
+
+test "a partial pipelined head behind a blocked response: finishing the response neither starts nor resets its budget" {
+    var s: Single = undefined;
+    try s.init(64);
+    defer s.deinit();
+    const cl = try pipelinedBehindResponse(&s);
+    defer _ = c.close(cl);
+    const conn = s.lp.head.?;
+    // The head budget runs beside the send from the byte's arrival, in the
+    // generation after the response's (Conn.Phase.ahead); the poll is done.
+    const write_arm = conn.arm.?;
+    try std.testing.expectEqual(write_code, write_arm.kind);
+    try std.testing.expect(write_arm.gen == genPtr(1));
+    const head_arm = conn.ahead_arm.?;
+    try std.testing.expectEqual(head_code, head_arm.kind);
+    try std.testing.expect(head_arm.gen == genPtr(2));
+    try std.testing.expect(!conn.polling);
+    const due = head_arm.timer.deadline;
+    try drainUntilWritten(&s, cl);
+    // The response is sent whole: the same arm, with the same due time, is
+    // now the reading phase's own deadline; the write deadline is gone.
+    try std.testing.expect(conn.arm.? == head_arm);
+    try std.testing.expect(!head_arm.retired);
+    try std.testing.expectEqual(due, head_arm.timer.deadline);
+    try std.testing.expect(conn.ahead_arm == null);
+    // The receive after the response returns "G", within that period.
+    try s.stepUntil(.recv, 2);
+    try std.testing.expect(conn.arm.? == head_arm);
+    try std.testing.expectEqual(due, head_arm.timer.deadline);
+    dueNow(&s);
+    try s.stepUntil(.free, 1);
+    try expectLog(&s, &.{
+        .{ .kind = .open },
+        .{ .kind = .recv, .n = 1, .byte = 'R' },
+        .{ .kind = .arrived },
+        .{ .kind = .written },
+        .{ .kind = .recv, .n = 1, .byte = 'G' },
+        .{ .kind = .expired, .n = 2, .byte = head_code },
+        .{ .kind = .free },
+    });
+    s.lp.stop.notify();
+    try s.finish();
+}
+
+test "a partial pipelined head whose budget ends while its response is still blocked closes, and the send is not reported" {
+    var s: Single = undefined;
+    try s.init(64);
+    defer s.deinit();
+    const cl = try pipelinedBehindResponse(&s);
+    defer _ = c.close(cl);
+    const conn = s.lp.head.?;
+    s.lp.loop.setTimer(&conn.ahead_arm.?.timer, .{ .duration = .zero });
+    try s.stepUntil(.free, 1);
+    try expectLog(&s, &.{
+        .{ .kind = .open },
+        .{ .kind = .recv, .n = 1, .byte = 'R' },
+        .{ .kind = .arrived },
+        .{ .kind = .expired, .n = 2, .byte = head_code },
+        .{ .kind = .free },
+    });
+    s.lp.stop.notify();
+    try s.finish();
+}
+
+test "a complete pipelined head whose budget ends while its response is still blocked: the budget ends and the send goes on" {
+    var s: Single = undefined;
+    try s.init(64);
+    defer s.deinit();
+    ahead_complete = true;
+    const cl = try pipelinedBehindResponse(&s);
+    defer _ = c.close(cl);
+    const conn = s.lp.head.?;
+    const write_arm = conn.arm.?;
+    s.lp.loop.setTimer(&conn.ahead_arm.?.timer, .{ .duration = .zero });
+    try s.stepUntil(.expired, 1);
+    // Only the head budget's arm is gone; the write deadline's arm stays,
+    // the send is still in flight, and nothing watches any more.
+    try std.testing.expect(conn.ahead_arm == null);
+    try std.testing.expect(conn.arm.? == write_arm);
+    try std.testing.expect(!write_arm.retired);
+    try std.testing.expect(conn.cur.?.kind == .send);
+    try std.testing.expect(!conn.polling and !conn.watching);
+    try drainUntilWritten(&s, cl);
+    try s.stepUntil(.recv, 2);
+    _ = c.shutdown(cl, c.SHUT.WR);
+    try s.stepUntil(.free, 1);
+    try expectLog(&s, &.{
+        .{ .kind = .open },
+        .{ .kind = .recv, .n = 1, .byte = 'R' },
+        .{ .kind = .arrived },
+        .{ .kind = .expired, .n = 2, .byte = head_code },
+        .{ .kind = .written },
+        .{ .kind = .recv, .n = 1, .byte = 'G' },
+        .{ .kind = .recv, .n = 0, .byte = 0 },
+        .{ .kind = .free },
+    });
+    s.lp.stop.notify();
+    try s.finish();
+}
+
+test "a response written before any next byte arrives: the poll beside it is canceled and reports nothing" {
+    var s: Single = undefined;
+    try s.init(64);
+    defer s.deinit();
+    // Small enough for the socket buffers: the send completes at once.
+    const cl = try requestResponse(&s, 16);
+    defer _ = c.close(cl);
+    const conn = s.lp.head.?;
+    try s.stepUntil(.written, 1);
+    try std.testing.expect(!conn.watching);
+    // The client's end of input: the receive reports it, and the close
+    // comes only after the canceled poll's completion.
+    _ = c.shutdown(cl, c.SHUT.WR);
+    try s.stepUntil(.free, 1);
+    try expectLog(&s, &.{
+        .{ .kind = .open },
+        .{ .kind = .recv, .n = 1, .byte = 'R' },
+        .{ .kind = .written },
+        .{ .kind = .recv, .n = 0, .byte = 0 },
+        .{ .kind = .free },
+    });
+    s.lp.stop.notify();
+    try s.finish();
+}
+
+test "a response whose write deadline ends before any next byte arrives closes once the canceled poll completed" {
+    var s: Single = undefined;
+    try s.init(64);
+    defer s.deinit();
+    const cl = try requestResponse(&s, response_len);
+    defer _ = c.close(cl);
+    const conn = s.lp.head.?;
+    try std.testing.expect(conn.polling and conn.watching);
+    try std.testing.expect(conn.ahead_arm == null);
+    dueNow(&s);
+    try s.stepUntil(.free, 1);
+    try expectLog(&s, &.{
+        .{ .kind = .open },
+        .{ .kind = .recv, .n = 1, .byte = 'R' },
+        .{ .kind = .expired, .n = 1, .byte = write_code },
+        .{ .kind = .free },
+    });
+    s.lp.stop.notify();
+    try s.finish();
+}
+
+test "a send that fails while the poll beside it is in flight closes only after the poll's completion" {
+    var s: Single = undefined;
+    try s.init(64);
+    defer s.deinit();
+    defer serve.testing = .{};
+    respond_on_open = 64;
+    // Every completed send is reported as failed: the first one's failure
+    // closes in the same callback that cancels the poll, so the close must
+    // wait for that poll's completion (`close_pending`).
+    serve.testing.fail_every = 1;
+    const cl = try s.listener.connect();
+    defer _ = c.close(cl);
+    awaitReadable(s.listener.fd);
+    try s.stepUntil(.fail, 1);
+    const conn = s.lp.head.?;
+    try std.testing.expect(conn.close_pending and conn.polling and conn.poll_stale);
+    try std.testing.expect(conn.cur == null);
+    try s.stepUntil(.free, 1);
+    try expectLog(&s, &.{ .{ .kind = .open }, .{ .kind = .fail }, .{ .kind = .free } });
     s.lp.stop.notify();
     try s.finish();
 }

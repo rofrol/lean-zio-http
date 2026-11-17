@@ -7,8 +7,10 @@ executable (the composition root: `Main.lean`, `Fixture.lean` and their
 hand-written-parser twins) picks a protocol adapter and an application and
 exports the loop's entry points (`ekk_conn_open`, `ekk_conn_on_recv`,
 `ekk_conn_on_sent`, `ekk_conn_on_fail`, `ekk_conn_on_refused`,
-`ekk_conn_on_answer`, `ekk_conn_on_expired`, and the deadline a state runs
-under, `ekk_conn_deadline` and `ekk_conn_gen`) through the functions below;
+`ekk_conn_on_answer`, `ekk_conn_on_expired`, `ekk_conn_on_arrived`, the
+deadline a state runs under, `ekk_conn_deadline` and `ekk_conn_gen`, the head
+budget beside a send, `ekk_conn_ahead` and `ekk_conn_ahead_gen`, and whether
+the loop watches for a next request, `ekk_conn_watch`) through the functions below;
 the command `server_exports` writes them. -/
 
 namespace Server.Transport
@@ -19,8 +21,8 @@ variable {σ : Type}
 and passes each event's wall clock (Unix seconds, from the loop) to
 `Conn.step`, which hands it only to the response it sends (`Server.Dated`);
 so `Conn`'s theorems, stated for one adapter at any clock, describe the
-transport. A failure, a declined receive and an expiry send nothing, so those
-events pass 0. -/
+transport. A failure, a declined receive, an expiry and an arrival send
+nothing, so those events pass 0. -/
 
 /-- The connection state of `adapter`'s connections, for the exports' types. -/
 abbrev ConnState {σ : Type} (_ : Server.Adapter σ) : Type := Conn.State σ
@@ -43,6 +45,9 @@ def onRefused (adapter : Server.Adapter σ) (s : Conn.State σ) : Conn.State σ 
 def onAnswer (adapter : Server.Adapter σ) (now : UInt64) (s : Conn.State σ) (r : Query.Result) : Conn.State σ × Conn.Action :=
   Conn.step adapter now.toNat s (.answered r)
 
+def onArrived (adapter : Server.Adapter σ) (s : Conn.State σ) : Conn.State σ × Conn.Action :=
+  Conn.step adapter 0 s .arrived
+
 /-- A deadline as the loop names it: 1 idle, 2 head, 3 body, 4 write. -/
 def deadlineCode : Conn.Deadline → UInt8
   | .idle => 1
@@ -64,6 +69,14 @@ theorem deadlineOfCode_code (d : Conn.Deadline) : deadlineOfCode (deadlineCode d
 def stateDeadline (s : Conn.State σ) : UInt8 := match s.phase.deadline with
   | some d => deadlineCode d
   | none => 0
+
+/-- The head budget running beside a send (`Conn.Phase.ahead`), as the loop
+names it, 0 for none; its generation is `aheadGen`. -/
+def stateAhead (s : Conn.State σ) : UInt8 := match s.phase.ahead with
+  | some d => deadlineCode d
+  | none => 0
+
+def aheadGen (s : Conn.State σ) : Nat := s.gen + 1
 
 /-- The timer the loop armed for deadline `kind` (as `stateDeadline` named it)
 in generation `gen` ended. The loop passes back only a pair it was given, so
@@ -95,7 +108,15 @@ macro "server_exports " adapter:term : command => `(
       Server.Transport.ConnState $adapter × Server.Conn.Action := Server.Transport.onExpired $adapter s kind gen
   @[export ekk_conn_deadline] def deadline (s : Server.Transport.ConnState $adapter) : UInt8 :=
     Server.Transport.stateDeadline s
-  @[export ekk_conn_gen] def gen (s : Server.Transport.ConnState $adapter) : Nat := s.gen)
+  @[export ekk_conn_gen] def gen (s : Server.Transport.ConnState $adapter) : Nat := s.gen
+  @[export ekk_conn_on_arrived] def onArrived (s : Server.Transport.ConnState $adapter) :
+      Server.Transport.ConnState $adapter × Server.Conn.Action := Server.Transport.onArrived $adapter s
+  @[export ekk_conn_ahead] def ahead (s : Server.Transport.ConnState $adapter) : UInt8 :=
+    Server.Transport.stateAhead s
+  @[export ekk_conn_ahead_gen] def aheadGen (s : Server.Transport.ConnState $adapter) : Nat :=
+    Server.Transport.aheadGen s
+  @[export ekk_conn_watch] def watch (s : Server.Transport.ConnState $adapter) : UInt8 :=
+    if s.watches then 1 else 0)
 
 /-- The loop's settings, passed to `ekk_serve` (zig/src/serve.zig). -/
 structure Options where
@@ -120,8 +141,9 @@ structure Options where
   H2O's 10 s header budget (decided 2026-11-17, item ytzycm). Keep-alive
   idle: 60 s from the end of a response to the next request's first byte. -/
   idleMs : Nat := 60000
-  /-- A request's head: 10 s, from accept for the first request and from when
-  the connection starts to read it for a later one; bytes do not extend it. -/
+  /-- A request's head: 10 s, from accept for the first request and from its
+  first byte for a later one, also while the response before it is sent
+  (`Conn.Phase.ahead`); bytes do not extend it. -/
   headMs : Nat := 10000
   /-- A request's body: 30 s from the acceptance of its head. -/
   bodyMs : Nat := 30000

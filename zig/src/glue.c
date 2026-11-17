@@ -22,8 +22,12 @@ extern lean_object *ekk_conn_on_fail(lean_object *state);
 extern lean_object *ekk_conn_on_refused(lean_object *state);
 extern lean_object *ekk_conn_on_answer(uint64_t now, lean_object *state, lean_object *result);
 extern lean_object *ekk_conn_on_expired(lean_object *state, uint8_t kind, lean_object *gen);
+extern lean_object *ekk_conn_on_arrived(lean_object *state);
 extern uint8_t ekk_conn_deadline(lean_object *state);
 extern lean_object *ekk_conn_gen(lean_object *state);
+extern uint8_t ekk_conn_ahead(lean_object *state);
+extern lean_object *ekk_conn_ahead_gen(lean_object *state);
+extern uint8_t ekk_conn_watch(lean_object *state);
 
 void ekk_thread_init(void) { lean_initialize_thread(); }
 void ekk_thread_fini(void) { lean_finalize_thread(); }
@@ -31,7 +35,9 @@ void ekk_thread_fini(void) { lean_finalize_thread(); }
 /* Conn.Action decoded for the loop. Constructor order in Conn.lean:
    recv (room) = 0, send (data, off) = 1, close = 2, none = 3, query (q) = 4.
    With it, the deadline the new state runs under (Transport.stateDeadline)
-   and its generation. */
+   and its generation, the head budget running beside a send
+   (Transport.stateAhead) and its generation, and whether the loop watches
+   the socket for a next request's first byte (Conn.State.watches). */
 typedef struct {
     uint8_t kind;  /* 0 recv, 1 send, 2 close, 3 none, 4 query */
     size_t room;   /* recv: most bytes to receive */
@@ -39,6 +45,9 @@ typedef struct {
     lean_object *query; /* query: the Server.Query, owned by the receiver */
     uint8_t deadline; /* 0 none, 1 idle, 2 head, 3 body, 4 write */
     lean_object *gen; /* with a deadline: its generation (a Nat), owned by the receiver; else NULL */
+    uint8_t ahead; /* 0 none, 2 head */
+    lean_object *ahead_gen; /* with ahead: its generation, owned by the receiver; else NULL */
+    uint8_t watch; /* 1: watch for readability while the send goes on */
 } ekk_action;
 
 /* Splits the (State × Action) pair: stores the new state in *state and decodes
@@ -77,6 +86,15 @@ static void take(lean_object *pair, lean_object **state, uint8_t *out, size_t ca
         lean_inc(s);
         act->gen = ekk_conn_gen(s);
     }
+    lean_inc(s);
+    act->ahead = ekk_conn_ahead(s);
+    act->ahead_gen = NULL;
+    if (act->ahead != 0) {
+        lean_inc(s);
+        act->ahead_gen = ekk_conn_ahead_gen(s);
+    }
+    lean_inc(s);
+    act->watch = ekk_conn_watch(s);
 }
 
 void ekk_open(lean_object **state, uint8_t *out, size_t cap, ekk_action *act) {
@@ -111,6 +129,11 @@ void ekk_free(lean_object *state) { lean_dec(state); }
 void ekk_expired(lean_object **state, uint8_t kind, lean_object *gen, uint8_t *out, size_t cap, ekk_action *act) {
     lean_inc(gen);
     take(ekk_conn_on_expired(*state, kind, gen), state, out, cap, act);
+}
+
+/* The socket became readable while the loop watched it during a send. */
+void ekk_arrived(lean_object **state, uint8_t *out, size_t cap, ekk_action *act) {
+    take(ekk_conn_on_arrived(*state), state, out, cap, act);
 }
 
 /* Generations compare as natural numbers, whatever their size. */

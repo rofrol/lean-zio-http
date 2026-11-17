@@ -8,7 +8,12 @@
 // classification of accept errors, and the graceful shutdown on SIGTERM or
 // SIGINT (README, "Production contract"), and the per-connection deadlines'
 // timers: it arms one for the deadline and generation Lean's state names
-// after each event, and reports its end back (Conn.Event.expired).
+// after each event, and one more for the head budget a pipelined request
+// runs while a response is written (Conn.Phase.ahead), and reports their
+// end back (Conn.Event.expired). While Lean's state watches for a next
+// request's first byte (Conn.State.watches), the loop keeps a readiness
+// poll on the socket beside the send and reports it (Conn.Event.arrived);
+// the poll reads nothing, so the send stays the only data operation.
 const std = @import("std");
 const zio = @import("zio");
 const ev = zio.ev;
@@ -24,6 +29,9 @@ pub const Action = extern struct {
     query: ?*anyopaque, // query: the Server.Query, owned
     deadline: u8, // the deadline of Lean's new state: 0 none, 1 idle, 2 head, 3 body, 4 write
     gen: Gen, // with a deadline: its generation, owned; null without
+    ahead: u8, // the head budget beside a send (Conn.Phase.ahead): 0 none, 2 head
+    ahead_gen: Gen, // with ahead: its generation, owned; null without
+    watch: u8, // 1: watch the socket for readability (Conn.State.watches)
 };
 
 pub const State = ?*anyopaque; // a Lean Conn.State, owned by the connection
@@ -37,6 +45,7 @@ extern fn ekk_fail(state: *State, out: [*]u8, cap: usize, act: *Action) void;
 extern fn ekk_refused(state: *State, out: [*]u8, cap: usize, act: *Action) void;
 extern fn ekk_answer(state: *State, result: ?*anyopaque, out: [*]u8, cap: usize, act: *Action) void;
 extern fn ekk_expired(state: *State, kind: u8, gen: Gen, out: [*]u8, cap: usize, act: *Action) void;
+extern fn ekk_arrived(state: *State, out: [*]u8, cap: usize, act: *Action) void;
 extern fn ekk_gen_eq(a: Gen, b: Gen) u8;
 extern fn ekk_gen_free(g: Gen) void;
 extern fn ekk_free(state: State) void;
@@ -57,7 +66,8 @@ const out_cap = 8192;
 // pipes, each loop's poller and wake handle, stdio.
 const fd_reserve = 64;
 
-/// Test settings, set by ekk_serve before any loop starts and read-only after.
+/// Test settings, set by ekk_serve before any loop starts and read-only after
+/// (the transport's tests, serve_test.zig, set them before their loop polls).
 /// All zero in normal runs, where they cost one predictable branch per operation.
 const Testing = struct {
     /// Most bytes per receive and per send when nonzero: forces short
@@ -80,7 +90,7 @@ const Testing = struct {
     crash_after_recv: u32 = 0,
     crash_after_send: u32 = 0,
 };
-var testing: Testing = .{};
+pub var testing: Testing = .{};
 var recv_count = std.atomic.Value(u32).init(0);
 var send_count = std.atomic.Value(u32).init(0);
 var recv_ok = std.atomic.Value(u32).init(0);
@@ -156,10 +166,13 @@ pub const Arm = struct {
     }
 
     /// The timer ended. A retired arm only releases itself (and frees its
-    /// closed connection when it was the last); the current arm reports its
-    /// expiry to Lean, which closes the connection (Conn.step_expired_current:
-    /// the loop's arm always names the deadline and generation of Lean's
-    /// state, so it is current).
+    /// closed connection when it was the last); a live arm reports its
+    /// expiry to Lean (each arm names a pair of Lean's state, so it is
+    /// current). The phase's own deadline closes
+    /// (Conn.step_expired_current); the head budget beside a send closes
+    /// when that head is incomplete and otherwise ends with nothing new
+    /// (Conn.step_expired_ahead_partial, step_expired_ahead_complete), and
+    /// the send goes on.
     fn timerCb(_: *ev.Loop, c: *ev.Completion) void {
         const self: *Arm = @ptrCast(@alignCast(c.userdata.?));
         const conn = self.conn;
@@ -169,17 +182,31 @@ pub const Arm = struct {
             if (conn.retired_arms == 0 and conn.closed) conn.destroy();
             return;
         }
-        if (conn.arm != self) @panic("a timer that is neither current nor retired ended");
-        conn.arm = null;
+        const main = conn.arm == self;
+        if (main) conn.arm = null else if (conn.ahead_arm == self) conn.ahead_arm = null else @panic("a timer that is neither current nor retired ended");
         var act: Action = undefined;
         ekk_expired(&conn.state, self.kind, self.gen, &conn.out, out_cap, &act);
         self.release();
-        if (act.kind != 2 or act.deadline != 0) @panic("Lean did not answer the current deadline's expiry with close");
-        conn.expire();
+        switch (act.kind) {
+            2 => {
+                if (act.deadline != 0 or act.ahead != 0) @panic("Lean closed with a deadline left");
+                conn.expire();
+            },
+            3 => {
+                if (main) @panic("Lean did not answer the current deadline's expiry with close");
+                conn.apply(act);
+            },
+            else => @panic("Lean answered an expiry with neither close nor none"),
+        }
     }
 };
 
 const Comp = union { recv: ev.NetRecv, send: ev.NetSend, close: ev.NetClose };
+
+/// Whether the pair `kind`, `gen` is the one `a` was armed for.
+fn same(a: *const Arm, kind: u8, gen: Gen) bool {
+    return kind != 0 and kind == a.kind and ekk_gen_eq(a.gen, gen) != 0;
+}
 /// A query has no completion of its own: it is the connection's operation in
 /// flight until the pool delivers its result.
 const OpKind = enum { recv, send, close, query };
@@ -226,6 +253,18 @@ pub const Conn = struct {
     waiter: pg.Waiter = .{ .deliver = answered },
     /// The timer of the deadline Lean's state runs under, if any.
     arm: ?*Arm = null,
+    /// The timer of the head budget beside a send (Conn.Phase.ahead), if any.
+    ahead_arm: ?*Arm = null,
+    /// The readiness poll beside a send: in flight while `polling`. Lean's
+    /// state wants it while `watching`; one canceled because Lean stopped
+    /// watching is `poll_stale` until its completion, which then reports
+    /// nothing. A close waits for the poll's completion (`close_pending`),
+    /// so that no completion outlives the connection.
+    poll: ev.NetPoll = undefined,
+    polling: bool = false,
+    watching: bool = false,
+    poll_stale: bool = false,
+    close_pending: bool = false,
     /// Retired arms whose callbacks are still to run: the connection is
     /// freed only after the last of them.
     retired_arms: u32 = 0,
@@ -256,33 +295,43 @@ pub const Conn = struct {
         self.cur = null;
     }
 
-    /// Keeps the timer on the deadline and generation of Lean's state (taking
-    /// ownership of `gen`): the same pair keeps its arm, so a period's due
-    /// time is fixed when it starts; another pair retires the arm and arms
-    /// the new one for its full budget from now; none disarms.
-    fn track(self: *Conn, kind: u8, gen: Gen) void {
-        if (self.arm) |a| {
-            if (kind == a.kind and ekk_gen_eq(a.gen, gen) != 0) {
-                ekk_gen_free(gen);
-                return;
-            }
-            self.disarm();
+    /// Keeps the timers on the two pairs of Lean's state, the phase's
+    /// deadline and the head budget beside a send (taking ownership of both
+    /// generations): an arm whose pair is still wanted, in either slot, is
+    /// kept, so a period's due time is fixed when it starts, also when the
+    /// head budget beside a send becomes the reading phase's own deadline
+    /// (Conn.step_sent_handoff); arms of pairs no longer wanted are retired;
+    /// a new pair is armed for its full budget from now.
+    fn track(self: *Conn, kind: u8, gen: Gen, akind: u8, agen: Gen) void {
+        var main: ?*Arm = null;
+        var ahead: ?*Arm = null;
+        for ([2]?*Arm{ self.arm, self.ahead_arm }) |slot| {
+            const a = slot orelse continue;
+            if (main == null and same(a, kind, gen)) {
+                main = a;
+            } else if (ahead == null and same(a, akind, agen)) {
+                ahead = a;
+            } else self.retire(a);
         }
-        if (kind == 0) return;
+        if (main != null) ekk_gen_free(gen) else if (kind != 0) main = self.newArm(kind, gen);
+        if (ahead != null) ekk_gen_free(agen) else if (akind != 0) ahead = self.newArm(akind, agen);
+        self.arm = main;
+        self.ahead_arm = ahead;
+    }
+
+    fn newArm(self: *Conn, kind: u8, gen: Gen) *Arm {
         if (kind > budget_ms.len) @panic("Lean named an unknown deadline");
         const a = alloc.create(Arm) catch fatal("no memory for a deadline timer", .{});
         a.* = .{ .timer = ev.Timer.init(.none), .conn = self, .kind = kind, .gen = gen };
         a.timer.c.callback = Arm.timerCb;
         a.timer.c.userdata = a;
-        self.arm = a;
         self.lp.loop.setTimer(&a.timer, .fromMilliseconds(budget_ms[kind - 1]));
+        return a;
     }
 
-    /// Takes the current arm off; one whose callback is already on its way
-    /// is retired and released by that callback.
-    pub fn disarm(self: *Conn) void {
-        const a = self.arm orelse return;
-        self.arm = null;
+    /// Takes an arm off; one whose callback is already on its way is
+    /// retired and released by that callback.
+    fn retire(self: *Conn, a: *Arm) void {
         if (self.lp.loop.clearTimer(&a.timer)) {
             a.release();
         } else {
@@ -291,11 +340,71 @@ pub const Conn = struct {
         }
     }
 
-    /// Lean closed on an expiry: the receive or send in flight is canceled,
-    /// and its completion closes. A query has no deadline
-    /// (Conn.Phase.deadline), and a close is preceded by disarming.
+    /// Takes both arms off.
+    pub fn disarm(self: *Conn) void {
+        if (self.arm) |a| self.retire(a);
+        if (self.ahead_arm) |a| self.retire(a);
+        self.arm = null;
+        self.ahead_arm = null;
+    }
+
+    /// Keeps the readiness poll in flight exactly while Lean's state
+    /// watches. A poll canceled here completes later and reports nothing;
+    /// until then no other can start, and its completion starts the next
+    /// one if Lean watches again.
+    fn watch(self: *Conn, want: bool) void {
+        self.watching = want;
+        if (want) {
+            if (!self.polling) self.startPoll();
+        } else if (self.polling and !self.poll_stale) {
+            self.poll_stale = true;
+            self.lp.loop.cancel(&self.poll.c);
+        }
+    }
+
+    fn startPoll(self: *Conn) void {
+        self.polling = true;
+        self.poll_stale = false;
+        self.poll = ev.NetPoll.init(self.fd, .recv);
+        self.poll.c.callback = pollCb;
+        self.poll.c.userdata = self;
+        self.lp.loop.add(&self.poll.c);
+    }
+
+    /// The readiness poll completed. Readable (bytes, or the peer's end of
+    /// input or an error, which the next receive then reports) while Lean
+    /// still watches: reported as `arrived`, which starts the next request's
+    /// head budget; the bytes stay in the kernel for that receive.
+    fn pollCb(_: *ev.Loop, c: *ev.Completion) void {
+        const self: *Conn = @ptrCast(@alignCast(c.userdata.?));
+        if (self.freed or !self.polling) @panic("a poll completion with no poll in flight");
+        self.polling = false;
+        const stale = self.poll_stale;
+        self.poll_stale = false;
+        if (self.close_pending) {
+            self.close_pending = false;
+            return self.startClose();
+        }
+        const canceled = if (self.poll.getResult()) |_| false else |err| err == error.Canceled;
+        if (stale) {
+            if (self.watching) self.startPoll();
+            return;
+        }
+        if (canceled) @panic("a poll canceled by no one");
+        if (!self.watching) @panic("a live poll Lean no longer watches");
+        var act: Action = undefined;
+        ekk_arrived(&self.state, &self.out, out_cap, &act);
+        self.apply(act);
+    }
+
+    /// Lean closed on an expiry: the other timer and the readiness poll are
+    /// taken off, the receive or send in flight is canceled, and its
+    /// completion closes. A query has no deadline (Conn.Phase.deadline), and
+    /// a close is preceded by disarming.
     fn expire(self: *Conn) void {
         const op = self.cur orelse @panic("an expiry with no operation in flight");
+        self.disarm();
+        self.watch(false);
         self.closing = true;
         switch (op.kind) {
             .recv => self.lp.loop.cancel(&op.comp.recv.c),
@@ -304,11 +413,13 @@ pub const Conn = struct {
         }
     }
 
-    /// Performs the action Lean answered, after setting the timer to the
-    /// deadline of Lean's new state; during shutdown a receive is declined
-    /// and reported as `refused` instead.
+    /// Performs the action Lean answered, after setting the timers to the
+    /// deadlines of Lean's new state and the readiness poll to its
+    /// watching; during shutdown a receive is declined and reported as
+    /// `refused` instead.
     fn apply(self: *Conn, act: Action) void {
-        self.track(act.deadline, act.gen);
+        self.track(act.deadline, act.gen, act.ahead, act.ahead_gen);
+        self.watch(act.watch != 0);
         switch (act.kind) {
             0 => {
                 if (act.room == 0) return self.fail(); // excluded by Conn.step_recv
@@ -328,8 +439,11 @@ pub const Conn = struct {
                 if (testing.trace) std.debug.print("query {d}\n", .{self.id});
                 self.lp.pool.submit(&self.waiter, act.query);
             },
-            // `none` answers only events after close, and none are reported then (Conn.step_close).
-            else => @panic("Lean answered none for a live connection"),
+            // `none`: nothing new, the operation in flight goes on (an
+            // arrival, or a head budget beside a send that ended on a
+            // complete head). No event after close is reported (Conn.step_close).
+            3 => if (self.cur == null) @panic("Lean answered none with no operation in flight"),
+            else => @panic("Lean answered an unknown action"),
         }
     }
 
@@ -417,7 +531,18 @@ pub const Conn = struct {
         self.apply(act);
     }
 
+    /// Closes once the readiness poll, if one is in flight, has completed:
+    /// its completion refers to the connection.
     fn close(self: *Conn) void {
+        if (self.polling) {
+            if (!self.poll_stale) @panic("a close with a poll Lean still watches");
+            self.close_pending = true;
+            return;
+        }
+        self.startClose();
+    }
+
+    fn startClose(self: *Conn) void {
         const op = self.begin(.close);
         op.comp = .{ .close = ev.NetClose.init(self.fd) };
         op.comp.close.c.callback = closeCb;
@@ -429,7 +554,8 @@ pub const Conn = struct {
         const op: *Op = @ptrCast(@alignCast(c.userdata.?));
         const self = op.conn;
         self.finish(op, c, .close);
-        if (self.arm != null) @panic("a connection closed with its deadline armed");
+        if (self.arm != null or self.ahead_arm != null) @panic("a connection closed with a deadline armed");
+        if (self.polling) @panic("a connection closed with its poll in flight");
         ekk_free(self.state);
         self.state = null;
         const lp = self.lp;

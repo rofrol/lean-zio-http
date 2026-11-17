@@ -284,7 +284,12 @@ def expectStale (what : String) (h : Server.Adapter σ) (s : Conn.State σ) (d :
 each phase runs under, that a phase change starts a new generation and a
 fragment of the same head, body or response keeps it, that an expiry of an
 older generation or of another deadline changes nothing, and that the
-current one closes, after which nothing is acted on. -/
+current one closes, after which nothing is acted on. A pipelined request's
+head budget runs from its first byte (item dv6ikn): beside the response's
+write, as the next generation (`Phase.ahead`), from the receive that brought
+it or from its arrival in the kernel (`Event.arrived`); the end of the
+response keeps that pair, and its expiry during the write closes on a
+partial head and ends the budget on a complete one. -/
 def deadlineScenario : Check Unit := do
   let h := H1Adapter.adapter {} App.Fixture.app
   let s0 := Conn.initial h
@@ -319,13 +324,26 @@ def deadlineScenario : Check Unit := do
   -- The next request's first byte ends keep-alive and starts its head.
   let (s8, _) := Conn.step h 0 s6 (.received (bytes "GET"))
   expectDeadline "deadlines: the next head" s8 (some .head) 4
-  -- Pipelined: the second response is a new write, the reading after it a new head.
+  -- Pipelined: the head left over from the request's receive runs its budget
+  -- beside the response, as generation 2; the reading after the response
+  -- keeps that pair, so finishing the response neither starts nor resets it.
   let two := "GET / HTTP/1.1\r\nHost: a\r\n\r\nGET / HTTP/1.1\r\nHo"
   let (p1, pa1) := Conn.step h 0 s0 (.received (bytes two))
   let some (r1, _) ← expectSend "deadlines: pipelined" pa1 | return
   expectDeadline "deadlines: the first pipelined response" p1 (some .write) 1
+  if p1.phase.ahead != some .head then fail "deadlines: no head budget beside the response"
+  if p1.watches then fail "deadlines: watching with the next head's bytes in the buffer"
   let (p2, _) := Conn.step h 0 p1 (.sent r1.size)
   expectDeadline "deadlines: the pipelined head" p2 (some .head) 2
+  -- Its expiry during the write closes: the head is partial.
+  expectClose "deadlines: a partial pipelined head expires behind its response" (Conn.step h 0 p1 (.expired .head 2)).2
+  expectStale "deadlines: an earlier head generation beside the response" h p1 .head 1
+  expectStale "deadlines: a later head generation beside the response" h p1 .head 3
+  match Conn.step h 0 p1 .arrived with
+  | (p1', .none) =>
+    if p1'.phase.ahead != some .head || p1'.gen != 1 || p1'.buf != p1.buf then
+      fail "deadlines: an arrival with a head under way changed the state"
+  | _ => fail "deadlines: an arrival with a head under way was acted on"
   -- Two complete requests: the second response is a new write period.
   let (w1, wa1) := Conn.step h 0 s0 (.received (bytes "GET / HTTP/1.1\r\nHost: a\r\n\r\nGET / HTTP/1.1\r\nHost: a\r\n\r\n"))
   let some (q, _) ← expectSend "deadlines: two pipelined requests" wa1 | return
@@ -335,6 +353,34 @@ def deadlineScenario : Check Unit := do
   if off != 0 then fail s!"deadlines: the second response starts at {off}"
   expectDeadline "deadlines: the second response" w2 (some .write) 2
   expectStale "deadlines: the first response's expiry after it" h w2 .write 1
+  -- A complete pipelined head whose budget ends behind a slow response: the
+  -- budget ends without a close, and the response goes on.
+  if w1.phase.ahead != some .head then fail "deadlines: no head budget beside the first of two responses"
+  match Conn.step h 0 w1 (.expired .head 2) with
+  | (w1', .none) =>
+    expectDeadline "deadlines: a complete head's budget ended" w1' (some .write) 1
+    if w1'.phase.ahead != none then fail "deadlines: a complete head's budget still runs"
+    if w1'.buf != w1.buf then fail "deadlines: a complete head's expiry changed the buffer"
+    let (_, wa3) := Conn.step h 0 w1' (.sent q.size)
+    let some _ ← expectSend "deadlines: the second response after its head's budget" wa3 | return
+  | _ => fail "deadlines: a complete pipelined head's expiry was acted on"
+  -- A next request's byte that arrives in the kernel during the write starts
+  -- its head budget then (no byte in the buffer: the loop watches).
+  if !s4.watches then fail "deadlines: not watching for the next request during the response"
+  if s4.phase.ahead != none then fail "deadlines: a head budget before any byte"
+  let (k1, ka1) := Conn.step h 0 s4 .arrived
+  match ka1 with
+  | .none => pure ()
+  | _ => fail "deadlines: an arrival was acted on"
+  expectDeadline "deadlines: the response after an arrival" k1 (some .write) 2
+  if k1.phase.ahead != some .head || k1.watches then fail "deadlines: an arrival did not start the head budget"
+  let (k2, ka2) := Conn.step h 0 k1 (.sent resp.size)
+  expectRecv "deadlines: after the response with an arrival" ka2 inCap
+  expectDeadline "deadlines: the arrived head after the response" k2 (some .head) 3
+  expectClose "deadlines: the arrived head expires behind its response" (Conn.step h 0 k1 (.expired .head 3)).2
+  match Conn.step h 0 s6 .arrived with
+  | (s6', .none) => expectDeadline "deadlines: an arrival while reading" s6' (some .idle) 3
+  | _ => fail "deadlines: an arrival while reading was acted on"
   -- Expect continue: the interim response runs under the body's deadline,
   -- which the body keeps.
   let (c1, ca1) := Conn.step h 0 s0 (.received (bytes "POST /echo HTTP/1.1\r\nHost: a\r\nExpect: 100-continue\r\nContent-Length: 5\r\n\r\n"))
