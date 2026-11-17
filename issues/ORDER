@@ -1,6 +1,5 @@
 ## Next, in order
 
-5645nv Link pg_glue_test with libdl on Linux hosts with glibc older than 2.34, or state that they are unsupported for zig build test
 ardv3m Fix the stale server_exports example in OwnFields' docstring
 sy3ims Decide whether to report upstream that Std.Http's H1 reparses an unfinished line from its start on every call
 u4moqo Move the toolchain to the first nightly with lean4 PR 16417 (Std.Http RFC fixes)
