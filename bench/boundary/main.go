@@ -605,8 +605,9 @@ const sendingBound = (20480 + 10240 + 163840 + 2048) / 1024
 // `Expect: 100-continue` and a body still to come; the interim response is
 // the event that shows the server buffered the head and waits. It reports
 // the growth of the resident set per connection and checks no bound: the
-// adapter's state, which such a connection holds, has none (README,
-// "Memory").
+// bound of the adapter's state, which such a connection holds, is on live
+// blocks and checked in lsrv-test; how many of the freed ones stay resident
+// is not derived (README, "Memory").
 func memory(path string) (string, error) {
 	const n = 1000
 	s, err := start(path, "1", "--max-conns", "1100")
@@ -1045,8 +1046,9 @@ func held(path string, args []string, n int, lsofSettle bool, hold func(c *net.T
 // holds the adapter's state for an incomplete request: the server's
 // arguments, the connections, whether awaitRead settles it, and hold. It
 // fails only when a connection does not reach that state; the memory it
-// reports is checked against no bound, since the adapter's state has none
-// (README, "Memory": these measurements falsified the earlier 98 KiB).
+// reports is checked against no bound, since the adapter's is on live blocks,
+// checked in lsrv-test, not on the resident set (README, "Memory": these
+// measurements falsified the earlier 98 KiB).
 func adapterScenario(args []string, n int, lsofSettle bool, hold func(c *net.TCPConn) error) func(path string) (string, error) {
 	return func(path string) (string, error) {
 		summary, err := held(path, args, n, lsofSettle, hold)
@@ -1083,6 +1085,29 @@ func holdHead(h string) func(c *net.TCPConn) error {
 			return err
 		}
 		return readInterim(c)
+	}
+}
+
+// holdLine sends a complete request and reads its response, the event that
+// shows the server accepted the connection (lsof sees no connection still in
+// the listen queue), then the start of a request, l, and nothing more; that
+// the server read l is lsof's to show (lsofSettle).
+func holdLine(l string) func(c *net.TCPConn) error {
+	return func(c *net.TCPConn) error {
+		if _, err := io.WriteString(c, "POST /echo HTTP/1.1\r\nHost: a\r\nContent-Length: 0\r\n\r\n"); err != nil {
+			return err
+		}
+		resp, err := http.ReadResponse(bufio.NewReader(c), &http.Request{Method: "POST"})
+		if err != nil {
+			return err
+		}
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != 200 {
+			return fmt.Errorf("status %d", resp.StatusCode)
+		}
+		_, err = io.WriteString(c, l)
+		return err
 	}
 }
 
@@ -1262,6 +1287,10 @@ func main() {
 		{"memory of 400 connections holding an incomplete request after 50 pipelined ones", nil, false, false, nil, adapterScenario([]string{"1"}, 400, false, holdAfterPipelined(50)), true},
 		{"memory of 400 connections holding a head whose target has 4,000 path segments", nil, false, false, nil, adapterScenario([]string{"1"}, 400, false, holdHead(expectHead("/"+strings.Repeat("a/", 3999)+"a", ""))), true},
 		{"memory of 400 connections holding a head whose target has 4,000 query parameters", nil, false, false, nil, adapterScenario([]string{"1"}, 400, false, holdHead(expectHead("/echo?"+strings.Repeat("a&", 3999)+"a", ""))), true},
+		// The target with the most elements per byte, as long as the request
+		// line allows (8,192 bytes): its live blocks are the largest lsrv-test
+		// finds. H1 keeps it from the end of the line.
+		{"memory of 400 connections holding a request line whose target has 8,176 empty query parameters", nil, false, false, nil, adapterScenario([]string{"1"}, 400, true, holdLine("GET /?"+strings.Repeat("&", 8175)+" HTTP/1.1\r\n")), false},
 	}
 	failed, ran := 0, 0
 	for _, sc := range scenarios {

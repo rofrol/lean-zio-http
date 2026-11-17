@@ -484,8 +484,94 @@ def ownFieldRule : Check Unit := do
 example : Response.ownFieldsValid #[("X", "a\r\nY: b")] = false := by decide +kernel
 example : Response.ownFieldsValid #[("Content-Type", "text/html")] = false := by decide +kernel
 
+/-! ## The H1 adapter's retained state
+
+The bound README "Memory" derives for what `H1Adapter.Parser` holds while a
+request is incomplete, by part, in bytes of allocator blocks (toolchain
+nightly-2026-11-14, mimalloc 3.4.5 `mi_good_size`), and the check that the
+blocks the state actually holds stay within each part on requests that drive
+each part to its largest. -/
+
+/-- The bytes of the allocator blocks `x` holds, each block once, persistent
+(shared, initialization-time) objects left out: `test/retained.c`. -/
+@[extern "lsrv_retained_bytes"] opaque retainedBytes {α : Type} (x : @& α) : Nat
+
+/-- The machine's input: at most `inCap` bytes, with capacity at most twice
+that (an append that runs out doubles the size it needs), a 40,960-byte block,
+and the iterator's 24-byte constructor. -/
+def inputBound : Nat := 40960 + 24
+/-- The body pulled so far: under `maxBodyBytes`, capacity at most twice. -/
+def bodyBound : Nat := 20480
+/-- The parsed request-target: every element (a path segment, a query
+parameter, a part of an absolute-form target) takes at least one byte of the
+target and at most 48 bytes of blocks per byte it takes (an empty query
+parameter `&`: a 24-byte pair and a 24-byte empty `ByteArray`); the arrays of
+segments and parameters, at most `maxUriLength` elements together with
+capacity at most twice their size, take at most 163,880 bytes; 128 for the
+target's own constructors. -/
+def targetBound : Nat := 48 * H1Adapter.config.maxUriLength + 163880 + 128
+/-- The header fields: at most `maxHeaders` pairs (24 bytes each) in an array
+of capacity 126 (1,280 bytes), a 16-byte wrapper, and a name and a value
+string each, whose bytes total at most `maxHeadBytes`; a string is a 32-byte
+header and its bytes and NUL, with capacity at most twice that, and a block
+of `x` bytes is at most `x + x/4 + 7`. -/
+def headersBound : Nat :=
+  let strings := 2 * maxHeaders
+  24 * maxHeaders + 1280 + 16 + (5 * (strings * 34 + 2 * maxHeadBytes)) / 4 + 7 * strings
+/-- The constructors of the parser, machine, reader and its state, writer and
+message head. -/
+def fixedBound : Nat := 1024
+def adapterBound : Nat := inputBound + bodyBound + targetBound + headersBound + fixedBound
+
+/-- `s` repeated `n` times. -/
+def rep (s : String) (n : Nat) : String := String.join (List.replicate n s)
+
+/-- Requests whose incomplete states drive a part of the adapter's state to
+its largest; each ends incomplete. A target is kept from the end of its
+request line, so the longest the line allows (8,192 bytes with CRLF) is
+followed by nothing; fields and a body follow a short line. -/
+def retainedRequests : List (String × String) :=
+  let line (target : String) := s!"GET {target} HTTP/1.1\r\n"
+  let longValue := rep "v" 64
+  let longFields := String.join ((List.range 96).map fun i => s!"x{i}: {longValue}\r\n")
+  [("8,176 empty query parameters", line s!"/?{rep "&" 8175}"),
+   ("8,177 empty path segments", line s!"/{rep "/" 8176}"),
+   ("4,088 parameters with empty values", line s!"/?{rep "=&" 4087}="),
+   ("segments and parameters", line s!"{rep "/" 4088}?{rep "&" 4087}"),
+   ("an absolute-form target", line s!"http://a/?{rep "&" 8167}"),
+   ("100 fields", s!"POST / HTTP/1.1\r\nHost: a\r\nExpect: 100-continue\r\nContent-Length: 10\r\n{String.join ((List.range 97).map fun i => s!"x{i}:\r\n")}\r\n"),
+   ("all but one byte of a maximum body after 96 long fields",
+     s!"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 8192\r\n{longFields}\r\n{rep "b" 8191}")]
+
+/-- Feeds each request whole and in pieces of 7 and 1,460 bytes, keeping the
+state as the connection does, and checks every state kept while the request
+waits against each part's bound and the whole. -/
+def retainedScenario : Check Unit := do
+  for (name, req) in retainedRequests do
+    let b := bytes req
+    for k in [b.size, 7, 1460] do
+      let mut p : H1Adapter.Parser := {}
+      let mut n := 0
+      let mut largest := 0
+      let mut last : H1Adapter.Parsed := .needMore
+      while n < b.size do
+        n := min b.size (n + k)
+        (p, last) := p.parse (b.extract 0 n)
+        match last with
+        | .needMore | .awaitingBody =>
+          let head := p.machine.reader.messageHead
+          let parts := [("input", retainedBytes p.machine.reader.input, inputBound),
+            ("body", retainedBytes p.body, bodyBound), ("target", retainedBytes head.uri, targetBound),
+            ("headers", retainedBytes head.headers, headersBound), ("whole", retainedBytes p, adapterBound)]
+          for (part, got, bound) in parts do
+            if got > bound then fail s!"retained state, {name}, pieces of {k}, {n} bytes: {part} {got} > {bound}"
+          largest := max largest (retainedBytes p)
+        | _ => fail s!"retained state, {name}, pieces of {k}: answered at {n} of {b.size} bytes"
+      if k == b.size then IO.println s!"retained state, {name} ({b.size} bytes): at most {largest} of {adapterBound} bytes"
+
 def main : IO UInt32 := do
   let ((), failures) ← (do
+    retainedScenario
     ownFieldRule
     for ad in [h1, hand] do
       adapterCases ad

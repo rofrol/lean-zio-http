@@ -157,8 +157,15 @@ lean_lib TestSupport where
   root := `FixtureHand
   moreLinkArgs := #["-lpq"]
 
+/-- The test support in C that `lsrv-test` links: `lsrv_retained_bytes`, the
+allocator blocks a Lean value holds (README, "Memory"). -/
+target retained.o pkg : FilePath := do
+  let src ← inputTextFile <| pkg.dir / "test" / "retained.c"
+  buildLeanO (pkg.buildDir / "test" / "retained.o") src
+
 @[default_target] lean_exe «lsrv-test» where
   root := `Test
+  moreLinkObjs := #[retained.o]
 
 @[default_target] lean_exe «lsrv-bench» where
   root := `Bench

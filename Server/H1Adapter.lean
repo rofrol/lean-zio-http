@@ -44,7 +44,10 @@ open Std.Http Std.Http.Protocol
 the header block separately (Config.lean), where the connection bounds the
 whole buffer by `inCap`; `maxHeaderValueLength` is the whole buffer, so that a
 complete head over the limit gets 431 from the aggregate `maxHeaderBytes`
-check (H1.lean:1828) rather than 400 from a value cut off at its own limit. -/
+check (H1.lean:1828) rather than 400 from a value cut off at its own limit.
+H1 maps the request-target's count limits (path segments, query parameters) to
+`maxUriLength` as well (`requestTargetConfig`), so a target may parse into an
+element per byte, which the adapter keeps until the request completes. -/
 def config : H1.Config :=
   { maxHeaders := maxHeaders
     maxHeaderBytes := maxHeadBytes
@@ -78,7 +81,9 @@ inductive Parsed where
 the H1 machine, the bytes of the connection's buffer already fed to it, the
 body pulled so far, and whether the `100-continue` the head asked for was
 granted. Its input holds the buffer's unread suffix, so `buf.size -
-remainingBytes` is what the machine has consumed of the buffer. -/
+remainingBytes` is what the machine has consumed of the buffer. What it holds is
+bounded from `config`'s limits in README "Memory" ("The adapter's state"),
+which `lsrv-test` checks against the blocks a state holds. -/
 structure Parser where
   machine : H1.Machine .receiving := { config }
   fed : Nat := 0
