@@ -6,7 +6,9 @@
 // result it reports back). Around that the loop owns admission (at most `max_conns`
 // connections, the rest wait in the kernel's listen queue), the
 // classification of accept errors, and the graceful shutdown on SIGTERM or
-// SIGINT (README, "Production contract").
+// SIGINT (README, "Production contract"), and the per-connection deadlines'
+// timers: it arms one for the deadline and generation Lean's state names
+// after each event, and reports its end back (Conn.Event.expired).
 const std = @import("std");
 const zio = @import("zio");
 const ev = zio.ev;
@@ -20,9 +22,13 @@ pub const Action = extern struct {
     room: usize, // recv: most bytes to receive
     len: usize, // send: bytes glue.c copied into out
     query: ?*anyopaque, // query: the Server.Query, owned
+    deadline: u8, // the deadline of Lean's new state: 0 none, 1 idle, 2 head, 3 body, 4 write
+    gen: Gen, // with a deadline: its generation, owned; null without
 };
 
 pub const State = ?*anyopaque; // a Lean Conn.State, owned by the connection
+/// A deadline period's generation: a Lean Nat, compared exactly (never truncated).
+pub const Gen = ?*anyopaque;
 
 extern fn ekk_open(state: *State, out: [*]u8, cap: usize, act: *Action) void;
 extern fn ekk_recv(state: *State, data: [*]const u8, n: usize, out: [*]u8, cap: usize, act: *Action) void;
@@ -30,6 +36,9 @@ extern fn ekk_sent(state: *State, n: usize, out: [*]u8, cap: usize, act: *Action
 extern fn ekk_fail(state: *State, out: [*]u8, cap: usize, act: *Action) void;
 extern fn ekk_refused(state: *State, out: [*]u8, cap: usize, act: *Action) void;
 extern fn ekk_answer(state: *State, result: ?*anyopaque, out: [*]u8, cap: usize, act: *Action) void;
+extern fn ekk_expired(state: *State, kind: u8, gen: Gen, out: [*]u8, cap: usize, act: *Action) void;
+extern fn ekk_gen_eq(a: Gen, b: Gen) u8;
+extern fn ekk_gen_free(g: Gen) void;
 extern fn ekk_free(state: State) void;
 extern fn ekk_string_cstr(s: *anyopaque) [*:0]const u8;
 extern fn ekk_thread_init() void;
@@ -127,6 +136,49 @@ fn releaseSlot() void {
     if (slots_used.fetchSub(1, .acq_rel) == 0) @panic("slot released twice");
 }
 
+/// One armed deadline timer: the deadline and generation it was armed for,
+/// fixed for its life, so a callback reports the period it belongs to.
+/// Each arm is allocated anew and never re-armed: a timer whose callback is
+/// already on its way (`clearTimer` false) is left to it.
+pub const Arm = struct {
+    timer: ev.Timer,
+    conn: *Conn,
+    kind: u8,
+    gen: Gen,
+    /// The connection no longer waits for this arm (another period replaced
+    /// it, or the connection closes) but its callback is still to run; the
+    /// callback then only releases it.
+    retired: bool = false,
+
+    fn release(self: *Arm) void {
+        ekk_gen_free(self.gen);
+        alloc.destroy(self);
+    }
+
+    /// The timer ended. A retired arm only releases itself (and frees its
+    /// closed connection when it was the last); the current arm reports its
+    /// expiry to Lean, which closes the connection (Conn.step_expired_current:
+    /// the loop's arm always names the deadline and generation of Lean's
+    /// state, so it is current).
+    fn timerCb(_: *ev.Loop, c: *ev.Completion) void {
+        const self: *Arm = @ptrCast(@alignCast(c.userdata.?));
+        const conn = self.conn;
+        if (self.retired) {
+            self.release();
+            conn.retired_arms -= 1;
+            if (conn.retired_arms == 0 and conn.closed) conn.destroy();
+            return;
+        }
+        if (conn.arm != self) @panic("a timer that is neither current nor retired ended");
+        conn.arm = null;
+        var act: Action = undefined;
+        ekk_expired(&conn.state, self.kind, self.gen, &conn.out, out_cap, &act);
+        self.release();
+        if (act.kind != 2 or act.deadline != 0) @panic("Lean did not answer the current deadline's expiry with close");
+        conn.expire();
+    }
+};
+
 const Comp = union { recv: ev.NetRecv, send: ev.NetSend, close: ev.NetClose };
 /// A query has no completion of its own: it is the connection's operation in
 /// flight until the pool delivers its result.
@@ -144,7 +196,7 @@ const Op = struct {
     conn: *Conn,
 };
 
-const Conn = struct {
+pub const Conn = struct {
     fd: ev.Backend.NetHandle,
     lp: *LoopCtx,
     state: State = null,
@@ -172,6 +224,17 @@ const Conn = struct {
     injected_send: u64 = 0,
     /// The connection's place in its loop's PostgreSQL pool.
     waiter: pg.Waiter = .{ .deliver = answered },
+    /// The timer of the deadline Lean's state runs under, if any.
+    arm: ?*Arm = null,
+    /// Retired arms whose callbacks are still to run: the connection is
+    /// freed only after the last of them.
+    retired_arms: u32 = 0,
+    /// The current deadline expired while a receive or a send was in flight:
+    /// Lean has closed, the operation is canceled, and its completion,
+    /// whatever its result, only leads to the close.
+    closing: bool = false,
+    /// The close completed; the connection waits for its retired arms.
+    closed: bool = false,
 
     /// Numbers and returns the next operation; ends the process if one is outstanding.
     fn begin(self: *Conn, kind: OpKind) *Op {
@@ -193,9 +256,59 @@ const Conn = struct {
         self.cur = null;
     }
 
-    /// Performs the action Lean answered; during shutdown a receive is
-    /// declined and reported as `refused` instead.
+    /// Keeps the timer on the deadline and generation of Lean's state (taking
+    /// ownership of `gen`): the same pair keeps its arm, so a period's due
+    /// time is fixed when it starts; another pair retires the arm and arms
+    /// the new one for its full budget from now; none disarms.
+    fn track(self: *Conn, kind: u8, gen: Gen) void {
+        if (self.arm) |a| {
+            if (kind == a.kind and ekk_gen_eq(a.gen, gen) != 0) {
+                ekk_gen_free(gen);
+                return;
+            }
+            self.disarm();
+        }
+        if (kind == 0) return;
+        if (kind > budget_ms.len) @panic("Lean named an unknown deadline");
+        const a = alloc.create(Arm) catch fatal("no memory for a deadline timer", .{});
+        a.* = .{ .timer = ev.Timer.init(.none), .conn = self, .kind = kind, .gen = gen };
+        a.timer.c.callback = Arm.timerCb;
+        a.timer.c.userdata = a;
+        self.arm = a;
+        self.lp.loop.setTimer(&a.timer, .fromMilliseconds(budget_ms[kind - 1]));
+    }
+
+    /// Takes the current arm off; one whose callback is already on its way
+    /// is retired and released by that callback.
+    pub fn disarm(self: *Conn) void {
+        const a = self.arm orelse return;
+        self.arm = null;
+        if (self.lp.loop.clearTimer(&a.timer)) {
+            a.release();
+        } else {
+            a.retired = true;
+            self.retired_arms += 1;
+        }
+    }
+
+    /// Lean closed on an expiry: the receive or send in flight is canceled,
+    /// and its completion closes. A query has no deadline
+    /// (Conn.Phase.deadline), and a close is preceded by disarming.
+    fn expire(self: *Conn) void {
+        const op = self.cur orelse @panic("an expiry with no operation in flight");
+        self.closing = true;
+        switch (op.kind) {
+            .recv => self.lp.loop.cancel(&op.comp.recv.c),
+            .send => self.lp.loop.cancel(&op.comp.send.c),
+            .query, .close => @panic("a deadline expired while querying or closing"),
+        }
+    }
+
+    /// Performs the action Lean answered, after setting the timer to the
+    /// deadline of Lean's new state; during shutdown a receive is declined
+    /// and reported as `refused` instead.
     fn apply(self: *Conn, act: Action) void {
+        self.track(act.deadline, act.gen);
         switch (act.kind) {
             0 => {
                 if (act.room == 0) return self.fail(); // excluded by Conn.step_recv
@@ -249,6 +362,7 @@ const Conn = struct {
         const op: *Op = @ptrCast(@alignCast(c.userdata.?));
         const self = op.conn;
         self.finish(op, c, .recv);
+        if (self.closing) return self.close(); // Lean closed on an expiry; the result is not reported
         const n = op.comp.recv.getResult() catch |err| switch (err) {
             error.Canceled => return self.refuse(), // only the shutdown cancels a receive
             else => return self.fail(),
@@ -276,6 +390,7 @@ const Conn = struct {
         const op: *Op = @ptrCast(@alignCast(c.userdata.?));
         const self = op.conn;
         self.finish(op, c, .send);
+        if (self.closing) return self.close(); // Lean closed on an expiry; the result is not reported
         const n = op.comp.send.getResult() catch return self.fail();
         if (n > self.out_len) @panic("send reported more bytes than given");
         crashPoint(&send_ok, testing.crash_after_send, "send", self.id, n);
@@ -314,6 +429,7 @@ const Conn = struct {
         const op: *Op = @ptrCast(@alignCast(c.userdata.?));
         const self = op.conn;
         self.finish(op, c, .close);
+        if (self.arm != null) @panic("a connection closed with its deadline armed");
         ekk_free(self.state);
         self.state = null;
         const lp = self.lp;
@@ -322,8 +438,15 @@ const Conn = struct {
         if (testing.trace) {
             std.debug.print("free {d} {d} {d} {d}\n", .{ self.id, self.done, self.injected_recv, self.injected_send });
             self.freed = true; // kept allocated, like its operations: a later completion panics in finish()
-        } else alloc.destroy(self);
+        }
+        self.closed = true;
+        if (self.retired_arms == 0) self.destroy();
         lp.resumeAccept();
+    }
+
+    /// Frees a closed connection none of whose timers is still to run.
+    fn destroy(self: *Conn) void {
+        if (!testing.trace) alloc.destroy(self);
     }
 };
 
@@ -457,7 +580,9 @@ var pg_conns: u32 = 0;
 /// Each per-connection deadline's budget in milliseconds, at least 1
 /// (Transport.Options: idleMs, headMs, bodyMs, writeMs), indexed by the
 /// deadline's code (Transport.deadlineCode) less 1: idle, head, body, write.
-var budget_ms: [4]u32 = .{ 1, 1, 1, 1 };
+/// The tests (serve_test.zig) set it themselves; 0 there makes a timer due
+/// at once.
+pub var budget_ms: [4]u32 = .{ 1, 1, 1, 1 };
 
 /// Writes a loop's one-byte report; a write that fails would leave the
 /// waiter blocked forever, so it ends the process instead.

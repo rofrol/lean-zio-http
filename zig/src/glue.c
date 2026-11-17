@@ -21,22 +21,30 @@ extern lean_object *ekk_conn_on_sent(uint64_t now, lean_object *state, size_t n)
 extern lean_object *ekk_conn_on_fail(lean_object *state);
 extern lean_object *ekk_conn_on_refused(lean_object *state);
 extern lean_object *ekk_conn_on_answer(uint64_t now, lean_object *state, lean_object *result);
+extern lean_object *ekk_conn_on_expired(lean_object *state, uint8_t kind, lean_object *gen);
+extern uint8_t ekk_conn_deadline(lean_object *state);
+extern lean_object *ekk_conn_gen(lean_object *state);
 
 void ekk_thread_init(void) { lean_initialize_thread(); }
 void ekk_thread_fini(void) { lean_finalize_thread(); }
 
 /* Conn.Action decoded for the loop. Constructor order in Conn.lean:
-   recv (room) = 0, send (data, off) = 1, close = 2, none = 3, query (q) = 4. */
+   recv (room) = 0, send (data, off) = 1, close = 2, none = 3, query (q) = 4.
+   With it, the deadline the new state runs under (Transport.stateDeadline)
+   and its generation. */
 typedef struct {
     uint8_t kind;  /* 0 recv, 1 send, 2 close, 3 none, 4 query */
     size_t room;   /* recv: most bytes to receive */
     size_t len;    /* send: bytes copied into out */
     lean_object *query; /* query: the Server.Query, owned by the receiver */
+    uint8_t deadline; /* 0 none, 1 idle, 2 head, 3 body, 4 write */
+    lean_object *gen; /* with a deadline: its generation (a Nat), owned by the receiver; else NULL */
 } ekk_action;
 
 /* Splits the (State × Action) pair: stores the new state in *state and decodes
    the action; a send copies data[off..] into out, at most cap bytes, and the
-   loop reports how many of them it sent. */
+   loop reports how many of them it sent. The exported getters take the state
+   owned, so each call gets a reference of its own. */
 static void take(lean_object *pair, lean_object **state, uint8_t *out, size_t cap, ekk_action *act) {
     lean_object *s = lean_ctor_get(pair, 0);
     lean_object *a = lean_ctor_get(pair, 1);
@@ -62,6 +70,13 @@ static void take(lean_object *pair, lean_object **state, uint8_t *out, size_t ca
         act->len = n;
     }
     lean_dec(a);
+    lean_inc(s);
+    act->deadline = ekk_conn_deadline(s);
+    act->gen = NULL;
+    if (act->deadline != 0) {
+        lean_inc(s);
+        act->gen = ekk_conn_gen(s);
+    }
 }
 
 void ekk_open(lean_object **state, uint8_t *out, size_t cap, ekk_action *act) {
@@ -90,6 +105,18 @@ void ekk_refused(lean_object **state, uint8_t *out, size_t cap, ekk_action *act)
 }
 
 void ekk_free(lean_object *state) { lean_dec(state); }
+
+/* The timer armed for deadline `kind` in generation `gen` (borrowed: the
+   loop keeps its own reference until it releases the arm) ended. */
+void ekk_expired(lean_object **state, uint8_t kind, lean_object *gen, uint8_t *out, size_t cap, ekk_action *act) {
+    lean_inc(gen);
+    take(ekk_conn_on_expired(*state, kind, gen), state, out, cap, act);
+}
+
+/* Generations compare as natural numbers, whatever their size. */
+uint8_t ekk_gen_eq(lean_object *a, lean_object *b) { return lean_nat_eq(a, b); }
+
+void ekk_gen_free(lean_object *g) { lean_dec(g); }
 
 /* A Lean String's bytes, NUL-terminated (Transport.main rejects a NUL). */
 const char *ekk_string_cstr(lean_object *s) { return lean_string_cstr(s); }

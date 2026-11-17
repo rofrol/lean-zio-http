@@ -1,7 +1,8 @@
 // Tests of the Zig/Lean boundary (zig/src/serve.zig, glue.c,
 // Server/Conn.lean) over real sockets. Each scenario starts a server
 // executable with the loop's test settings (--chunk, --fail-every, --trace,
-// --max-conns, --crash-after-recv, --crash-after-send), drives connections
+// --max-conns, --crash-after-recv, --crash-after-send) or short deadline
+// budgets (--idle-ms, --head-ms, --body-ms), drives connections
 // against it, and then checks, from the server's trace lines, that every
 // connection it accepted was freed exactly once and that SIGTERM ended it
 // gracefully (exit status 0 after "stopped"). The crash scenarios check what
@@ -33,6 +34,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
 )
 
 // zioShutWarning is the one server output allowed besides the trace: on macOS
@@ -464,6 +466,79 @@ func shutdown(path string) (string, error) {
 		return "", fmt.Errorf("the response was sent completely before the stop arrived")
 	}
 	return summary, err
+}
+
+// deadlines checks the idle, head and body expiries end to end on two
+// one-loop servers. On the first, the idle and head budgets are short and
+// the body's is long; it holds three connections: one that sends nothing
+// (the head's budget runs from accept), one with half a head, and one that
+// got its response and sends nothing more (keep-alive). On the second, only
+// the body's budget is short, so a connection holding a head and part of
+// its body can be closed within the test's deadline only by the body's
+// expiry. Each connection must see the server's close with no byte (after
+// the response, for the keep-alive one): an expired head or body gets no
+// 408, an idle connection is closed silently. Every connection is freed
+// once, and each server stops gracefully.
+func deadlines(path string) (string, error) {
+	// The budgets: external peer deadlines (README, "Deadlines"); the short
+	// ones end the scenario soon, the long ones exceed the test's deadline
+	// below, so they cannot be what closed a connection. The closes are
+	// awaited, not timed.
+	const short, long = "100", "600000"
+	first := []struct{ what, bytes string }{
+		{"nothing sent", ""},
+		{"half a head", get[:len(get)/2]},
+		{"keep-alive after a response", get},
+	}
+	second := []struct{ what, bytes string }{
+		{"a head and part of its body", "POST /echo HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n\r\nhe"},
+	}
+	var reports []string
+	for _, run := range []struct {
+		args  []string
+		sends []struct{ what, bytes string }
+	}{
+		{[]string{"--idle-ms", short, "--head-ms", short, "--body-ms", long}, first},
+		{[]string{"--idle-ms", long, "--head-ms", long, "--body-ms", short}, second},
+	} {
+		report, err := deadlineRun(path, run.args, run.sends)
+		if err != nil {
+			return "", err
+		}
+		reports = append(reports, report)
+	}
+	return strings.Join(reports, "; "), nil
+}
+
+func deadlineRun(path string, budgets []string, sends []struct{ what, bytes string }) (string, error) {
+	s, err := start(path, append([]string{"1", "--trace"}, budgets...)...)
+	if err != nil {
+		return "", err
+	}
+	defer s.stop()
+	t := newTrace(false)
+	for _, sc := range sends {
+		c, err := dial(s.addr)
+		if err != nil {
+			return "", err
+		}
+		defer c.Close()
+		// delay: test deadline: bounds the wait for the server's close; its expiry fails the scenario.
+		c.SetReadDeadline(time.Now().Add(30 * time.Second))
+		r := bufio.NewReader(c)
+		if _, err := io.WriteString(c, sc.bytes); err != nil {
+			return "", fmt.Errorf("%s: %w", sc.what, err)
+		}
+		if sc.bytes == get {
+			if err := readExact(r, false); err != nil {
+				return "", fmt.Errorf("%s: %w", sc.what, err)
+			}
+		}
+		if err := expectEOF(r, sc.what); err != nil {
+			return "", err
+		}
+	}
+	return s.account(t, int64(len(sends)))
 }
 
 // admission runs a one-loop server with --max-conns 2: two connections are
@@ -1273,6 +1348,7 @@ func main() {
 		{"Expect: 100-continue and a response over the bound, operations of at most 7 bytes", []string{"2", "--chunk", "7", "--trace"}, false, false, expectations, nil, true},
 		{"graceful shutdown with a response in flight, an idle and a partial connection", nil, false, false, nil, shutdown, false},
 		{"admission: at most 2 connections", nil, false, false, nil, admission, false},
+		{"deadlines: idle, head and body expire and close", nil, false, false, nil, deadlines, false},
 		{"crash after the first receive", nil, false, false, nil, func(p string) (string, error) {
 			return crashPoint(p, "--crash-after-recv", 1, 0)
 		}, false},

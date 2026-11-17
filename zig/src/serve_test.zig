@@ -3,8 +3,10 @@
 //! contract"). serve.zig runs on real zio.ev loops and real sockets. glue.c
 //! (the Lean side) is replaced by the fake below, which always gives the same
 //! answers: after an open, and after a receive that returned bytes, it asks
-//! to receive again; at end of input, on a refusal and on a failure it asks
-//! to close. Clients connect over TCP on 127.0.0.1. Before a single-loop test
+//! to receive again; at end of input, on a refusal, on a failure and on an
+//! expiry it asks to close. When a test sets `open_dl` and `recv_dl`, its
+//! states run under those deadlines, each receive with bytes starting a new
+//! generation, as Lean's do (Conn.step). Clients connect over TCP on 127.0.0.1. Before a single-loop test
 //! polls its loop for an event, it waits (`awaitReadable`) until the kernel
 //! has made that event ready: a connection queued on the listening socket, or
 //! bytes readable at the server's end. The loop's nonblocking polls then find
@@ -30,7 +32,7 @@ const max_steps = 1000;
 
 // ---- the fake glue.c ----
 
-const Kind = enum(u8) { open, recv, refused, fail, free, ready, snapshot, done };
+const Kind = enum(u8) { open, recv, refused, fail, free, ready, snapshot, done, expired };
 
 const Event = extern struct {
     kind: Kind,
@@ -40,16 +42,31 @@ const Event = extern struct {
     armed: bool = false,
     paused: bool = false,
     conn: u32 = 0,
-    /// recv: bytes received (0: end of input); snapshot: open connections.
+    /// recv: bytes received (0: end of input); snapshot: open connections;
+    /// expired: the generation.
     n: u32 = 0,
     /// snapshot: `slots_used`, as the loop read it.
     slots: u32 = 0,
-    /// recv: the first byte received.
+    /// recv: the first byte received; expired: the deadline's code.
     byte: u8 = 0,
 };
 
-/// The Lean state of one fake connection.
-const FakeConn = struct { id: u32, loop: u8 };
+/// Deadline codes as glue.c reports them (Transport.deadlineCode).
+const none_code: u8 = 0;
+const idle_code: u8 = 1;
+const head_code: u8 = 2;
+
+/// The Lean state of one fake connection: the deadline it runs under and
+/// its generation.
+const FakeConn = struct { id: u32, loop: u8, dl: u8 = none_code, gen: u32 = 0 };
+
+/// The deadline a new connection runs under, and the one after each receive
+/// with bytes. Tests set them before a loop starts.
+var open_dl: u8 = none_code;
+var recv_dl: u8 = none_code;
+/// When set, a receive with bytes keeps the connection's deadline and
+/// generation (a fragment within one period, as Lean's head fragments).
+var recv_keeps = false;
 
 var events: [2]c.fd_t = .{ -1, -1 };
 var next_conn = std.atomic.Value(u32).init(0);
@@ -75,29 +92,50 @@ fn connOf(state: serve.State) *FakeConn {
 }
 
 fn answer(act: *serve.Action, kind: u8, n: usize) void {
-    act.* = .{ .kind = kind, .room = n, .len = 0, .query = null };
+    act.* = .{ .kind = kind, .room = n, .len = 0, .query = null, .deadline = none_code, .gen = null };
+}
+
+/// A generation as the loop holds it: never null.
+fn genPtr(g: u32) serve.Gen {
+    return @ptrFromInt(@as(usize, g) + 1);
+}
+
+/// Asks to receive `n` bytes, under the connection's deadline.
+fn answerRecv(act: *serve.Action, fc: *const FakeConn, n: usize) void {
+    answer(act, 0, n);
+    act.deadline = fc.dl;
+    if (fc.dl != none_code) act.gen = genPtr(fc.gen);
 }
 
 export fn ekk_open(state: *serve.State, _: [*]u8, _: usize, act: *serve.Action) void {
     enter("ekk_open");
     const fc = std.heap.c_allocator.create(FakeConn) catch @panic("out of memory");
-    fc.* = .{ .id = next_conn.fetchAdd(1, .monotonic), .loop = loop_index };
+    fc.* = .{ .id = next_conn.fetchAdd(1, .monotonic), .loop = loop_index, .dl = open_dl };
     state.* = fc;
     emit(.{ .kind = .open, .loop = fc.loop, .conn = fc.id });
-    answer(act, 0, room);
+    answerRecv(act, fc, room);
 }
 
 export fn ekk_recv(state: *serve.State, data: [*]const u8, n: usize, _: [*]u8, _: usize, act: *serve.Action) void {
     enter("ekk_recv");
     const fc = connOf(state.*);
     emit(.{ .kind = .recv, .loop = fc.loop, .conn = fc.id, .n = @intCast(n), .byte = if (n > 0) data[0] else 0 });
-    if (n == 0) answer(act, 2, 0) else answer(act, 0, room);
+    if (n == 0) {
+        fc.dl = none_code;
+        return answer(act, 2, 0);
+    }
+    if (!recv_keeps) {
+        fc.dl = recv_dl;
+        fc.gen += 1;
+    }
+    answerRecv(act, fc, room);
 }
 
 export fn ekk_refused(state: *serve.State, _: [*]u8, _: usize, act: *serve.Action) void {
     enter("ekk_refused");
     const fc = connOf(state.*);
     emit(.{ .kind = .refused, .loop = fc.loop, .conn = fc.id });
+    fc.dl = none_code;
     answer(act, 2, 0);
 }
 
@@ -105,8 +143,27 @@ export fn ekk_fail(state: *serve.State, _: [*]u8, _: usize, act: *serve.Action) 
     enter("ekk_fail");
     const fc = connOf(state.*);
     emit(.{ .kind = .fail, .loop = fc.loop, .conn = fc.id });
+    fc.dl = none_code;
     answer(act, 2, 0);
 }
+
+/// The loop reports only its current arm (a retired one's callback calls
+/// nothing): an expiry of any other deadline or generation is a stale one
+/// the loop should not have reported.
+export fn ekk_expired(state: *serve.State, kind: u8, gen: serve.Gen, _: [*]u8, _: usize, act: *serve.Action) void {
+    enter("ekk_expired");
+    const fc = connOf(state.*);
+    if (fc.dl == none_code or kind != fc.dl or gen != genPtr(fc.gen)) @panic("the loop reported a stale expiry");
+    emit(.{ .kind = .expired, .loop = fc.loop, .conn = fc.id, .n = fc.gen, .byte = kind });
+    fc.dl = none_code;
+    answer(act, 2, 0);
+}
+
+export fn ekk_gen_eq(a: serve.Gen, b: serve.Gen) u8 {
+    return @intFromBool(a == b);
+}
+
+export fn ekk_gen_free(_: serve.Gen) void {}
 
 export fn ekk_free(state: serve.State) void {
     enter("ekk_free");
@@ -296,6 +353,10 @@ const Single = struct {
         try std.testing.expectEqual(@as(u32, 0), serve.slots_used.load(.monotonic));
         try openEvents();
         room = recv_room;
+        open_dl = none_code;
+        recv_dl = none_code;
+        recv_keeps = false;
+        serve.budget_ms = .{ never, never, never, never };
         stops = 0;
         serve.max_conns = 8;
         self.listener = try Listener.open();
@@ -448,6 +509,184 @@ test "a receive whose result is queued when the shutdown cancels it is dispatche
     }
 }
 
+// ---- deadlines ----
+
+/// A budget no test reaches: each deadline test makes its timers due
+/// itself, and the others arm none.
+const never: u32 = 1 << 31;
+/// A budget whose timer is due when it is armed.
+const due_at_once: u32 = 0;
+
+/// Moves the connection's current deadline to now (a test hook): its timer
+/// is due at the loop's next timer check, which comes before its I/O in
+/// every poll (zio 830564437b2c, `Loop.poll`: `checkTimers`, then the
+/// backend, then the queued completions).
+fn dueNow(s: *Single) void {
+    const conn = s.lp.head.?;
+    s.lp.loop.setTimer(&conn.arm.?.timer, .{ .duration = .zero });
+}
+
+/// Checks that the log is exactly `want` (kinds, and for receives and
+/// expiries their bytes or deadline and generation), all of one connection.
+fn expectLog(s: *const Single, want: []const Event) !void {
+    if (s.n != want.len) {
+        s.dump();
+        return error.UnexpectedEvents;
+    }
+    for (want, s.log[0..s.n]) |w, e| {
+        try std.testing.expectEqual(w.kind, e.kind);
+        try std.testing.expectEqual(s.log[0].conn, e.conn);
+        if (w.kind == .recv or w.kind == .expired) {
+            try std.testing.expectEqual(w.n, e.n);
+            try std.testing.expectEqual(w.byte, e.byte);
+        }
+    }
+}
+
+test "a deadline whose timer ends closes the connection, and the receive in flight is not reported" {
+    var s: Single = undefined;
+    try s.init(64);
+    defer s.deinit();
+    open_dl = head_code;
+    serve.budget_ms[head_code - 1] = due_at_once;
+    const cl = try s.listener.connect();
+    defer _ = c.close(cl);
+    awaitReadable(s.listener.fd);
+    try s.stepUntil(.free, 1);
+    try expectLog(&s, &.{ .{ .kind = .open }, .{ .kind = .expired, .n = 0, .byte = head_code }, .{ .kind = .free } });
+    // The client sees the close.
+    var b: [1]u8 = undefined;
+    try std.testing.expectEqual(@as(isize, 0), c.read(cl, &b, 1));
+    s.lp.stop.notify();
+    try s.finish();
+}
+
+test "a receive within one period keeps its armed timer and due time, and that timer's expiry is reported" {
+    var s: Single = undefined;
+    try s.init(64);
+    defer s.deinit();
+    open_dl = head_code;
+    recv_keeps = true;
+    const cl = try s.listener.connect();
+    defer _ = c.close(cl);
+    awaitReadable(s.listener.fd);
+    try s.stepUntil(.open, 1);
+    const conn = s.lp.head.?;
+    const arm = conn.arm.?;
+    const due = arm.timer.deadline;
+    try send(cl, "a");
+    try s.stepUntil(.recv, 1);
+    // The same deadline and generation: the arm and its due time stay, so
+    // a peer sending a byte at a time cannot extend the period.
+    try std.testing.expect(conn.arm.? == arm);
+    try std.testing.expect(!arm.retired);
+    try std.testing.expectEqual(due, arm.timer.deadline);
+    dueNow(&s);
+    try s.stepUntil(.free, 1);
+    try expectLog(&s, &.{ .{ .kind = .open }, .{ .kind = .recv, .n = 1, .byte = 'a' }, .{ .kind = .expired, .n = 0, .byte = head_code }, .{ .kind = .free } });
+    s.lp.stop.notify();
+    try s.finish();
+}
+
+test "an expiry the loop runs before a ready receive closes, and the bytes are not reported" {
+    var s: Single = undefined;
+    try s.init(64);
+    defer s.deinit();
+    open_dl = head_code;
+    const cl = try s.listener.connect();
+    defer _ = c.close(cl);
+    awaitReadable(s.listener.fd);
+    try s.stepUntil(.open, 1);
+    // The receive is parked; its bytes become readable and its deadline
+    // due before the loop polls again. That poll runs the timer first:
+    // the expiry cancels the receive, whose result only leads to the close.
+    try send(cl, "a");
+    awaitReadable(s.lp.head.?.fd);
+    dueNow(&s);
+    try s.stepUntil(.free, 1);
+    try expectLog(&s, &.{ .{ .kind = .open }, .{ .kind = .expired, .n = 0, .byte = head_code }, .{ .kind = .free } });
+    s.lp.stop.notify();
+    try s.finish();
+}
+
+test "a receive the loop runs before a due expiry wins: that expiry is stale and not reported" {
+    var s: Single = undefined;
+    // One byte per receive: "ab" takes two receives.
+    try s.init(1);
+    defer s.deinit();
+    open_dl = head_code;
+    recv_dl = idle_code;
+    serve.budget_ms[idle_code - 1] = due_at_once;
+    const cl = try s.listener.connect();
+    defer _ = c.close(cl);
+    awaitReadable(s.listener.fd);
+    try s.stepUntil(.open, 1);
+    // In one poll the parked receive returns "a"; its callback arms the
+    // idle deadline of generation 1, due at once, and starts the next
+    // receive, which finds "b" and is queued with its result. The queued
+    // completion runs before the next timer check, so "b" is reported and
+    // generation 1's due timer is replaced by generation 2's, whose expiry
+    // the fake checks is current.
+    try send(cl, "ab");
+    awaitReadable(s.lp.head.?.fd);
+    try s.stepUntil(.free, 1);
+    try expectLog(&s, &.{
+        .{ .kind = .open },
+        .{ .kind = .recv, .n = 1, .byte = 'a' },
+        .{ .kind = .recv, .n = 1, .byte = 'b' },
+        .{ .kind = .expired, .n = 2, .byte = idle_code },
+        .{ .kind = .free },
+    });
+    s.lp.stop.notify();
+    try s.finish();
+}
+
+/// The retired-arm test: a timer of the test's own, due before the
+/// connection's, whose callback takes the connection's arm off while that
+/// arm's own callback is already on its way.
+var retire_conn: ?*serve.Conn = null;
+var retired_seen: u32 = 0;
+var cleared_inline: bool = false;
+
+fn retireCb(_: *ev.Loop, _: *ev.Completion) void {
+    const conn = retire_conn.?;
+    const arm = conn.arm.?;
+    // The connection's timer fired in the same batch: its result is set.
+    cleared_inline = !arm.timer.c.has_result;
+    conn.disarm();
+    retired_seen = conn.retired_arms;
+}
+
+test "a timer whose callback is already on its way when its arm is replaced is retired: its callback reports nothing" {
+    var s: Single = undefined;
+    try s.init(64);
+    defer s.deinit();
+    open_dl = head_code;
+    const cl = try s.listener.connect();
+    awaitReadable(s.listener.fd);
+    try s.stepUntil(.open, 1);
+    retire_conn = s.lp.head.?;
+    retired_seen = 0;
+    dueNow(&s);
+    // Due at the start of the monotonic clock: before the connection's
+    // deadline in the timer heap, so both fire in one batch, this first.
+    var first = ev.Timer.init(.none);
+    first.c.callback = retireCb;
+    s.lp.loop.setTimer(&first, .{ .deadline = .zero });
+    try s.lp.loop.poll(.zero);
+    try std.testing.expect(!cleared_inline);
+    try std.testing.expectEqual(@as(u32, 1), retired_seen);
+    // The retired callback ran in the same batch and released the arm.
+    try std.testing.expectEqual(@as(u32, 0), retire_conn.?.retired_arms);
+    try std.testing.expect(retire_conn.?.arm == null);
+    // The connection goes on without a deadline: the client's close ends it.
+    _ = c.close(cl);
+    try s.stepUntil(.free, 1);
+    try expectLog(&s, &.{ .{ .kind = .open }, .{ .kind = .recv, .n = 0, .byte = 0 }, .{ .kind = .free } });
+    s.lp.stop.notify();
+    try s.finish();
+}
+
 // ---- admission across loops, each on its own thread ----
 
 const nloops = 2;
@@ -597,6 +836,8 @@ test "admission across two loops: a full server pauses both acceptors, and the l
     defer closeEvents();
     room = 64;
     serve.max_conns = 2;
+    open_dl = none_code;
+    recv_dl = none_code;
     var listener = try Listener.open();
     defer listener.close();
     var m: Multi = .{};

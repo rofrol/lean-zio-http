@@ -97,8 +97,10 @@ only `Server.Query` values.
   mode reset after each pipelined query); a server with `--pg` exits with
   status 1 at startup when the libpq it runs is older.
 - Command line: `lsrv [THREADS] [--port N] [--max-conns N] [--pg CONNINFO]
-  [--pg-conns N]` (`--pg-conns`, default 4, is per loop; without `--pg` no
-  pool is made and every query fails with `08006`), then the test settings:
+  [--pg-conns N] [--idle-ms N] [--head-ms N] [--body-ms N] [--write-ms N]`
+  (`--pg-conns`, default 4, is per loop; without `--pg` no pool is made and
+  every query fails with `08006`; the four budgets, in milliseconds, are in
+  "Deadlines" below), then the test settings:
   `--chunk N` caps every receive and send at N bytes, `--fail-every N`
   reports every N-th completed receive and every N-th completed send to Lean
   as failed, `--trace` prints `open <id>` and `free <id> <operations>
@@ -155,6 +157,25 @@ only `Server.Query` values.
   field name or value that is not valid becomes `500` with
   `Connection: close` (`Server.Response.check`). Streaming larger bodies is
   not offered; it would change the handler interface.
+- **Deadlines.** Each connection has at most one deadline at a time, set by
+  its phase; when it passes, the connection closes silently: no 408, and
+  bytes already sent stay sent. Every budget is a peer's budget, configurable
+  from 1 ms to below 2^32 ms (another value: exit status 2):
+  keep-alive idle `--idle-ms` 60,000 (nginx's `keepalive_timeout` default is
+  75 s), from the end of a response with nothing buffered to the next byte;
+  request head `--head-ms` 10,000 (H2O's header timeout), absolute, from the
+  accept for the first request and from when reading starts for a later one
+  (a pipelined head's budget starts once the previous response is sent, not
+  at its first byte); body `--body-ms` 30,000 from the head's acceptance,
+  across an interim `100 Continue`; response write `--write-ms` 30,000 from
+  the start of each response. A connection waiting for a query has no
+  deadline (queries have none yet, "Not yet"). `Conn.step` takes
+  `Event.expired kind generation`: the loop's timer reports the phase it was
+  armed for, and an expiry of an earlier phase is stale and changes nothing
+  (`Conn.step_expired_stale`, `expired_old_stale`). Which of a due timer and
+  a ready receive or send wins is the order zio runs their callbacks in; an
+  expiry counts once it is reported, and a completion that arrives after it
+  is not reported. The shutdown's own drain bound is a separate item.
 - **Admission.** At most `--max-conns` connections (default 4,096) are open
   process-wide; the rest wait in the kernel's listen queue. A loop arms its
   accept only with a free slot, and an accepted connection keeps the slot
@@ -196,8 +217,9 @@ only `Server.Query` values.
   it is in flight: every completion queued before the stop has been
   dispatched. When all loops have returned the process prints `stopped` and
   exits with status 0. A peer that does not read its response holds the
-  shutdown until it does; ending that wait is the supervisor's deadline
-  (SIGKILL), not the server's.
+  shutdown at most for the write budget (`--write-ms`), after which its
+  connection closes; a shorter bound for the whole shutdown is the
+  supervisor's (SIGKILL).
   A query in flight or waiting for a pool slot also holds the shutdown
   until it is answered (section "PostgreSQL").
 - **Transport tests.** `zig build test` in `zig/` (`bench.sh` runs it) also
@@ -227,8 +249,17 @@ only `Server.Query` values.
   a byte wake the loop, and checks that serve's shutdown waits until the
   notify finishes. With 9bef33d's steps (its `pending` was a plain counter)
   the loop takes the stop at once and the test fails.
-- **Not yet:** idle, read and write deadlines per connection (a peer can hold
-  a connection slot as long as it likes), deadlines for queries, chunked
+  (5) Deadlines: a timer that ends closes the connection, and the receive
+  it canceled is not reported; an expiry run before a ready receive closes
+  and the bytes are not reported; a receive within one period keeps its
+  armed timer and due time; a receive run before a due expiry wins, and the
+  replaced deadline's expiry is not reported, only the new one's; a timer
+  disarmed while its callback is already on its way is retired, and its
+  callback reports nothing. Each order is forced (a timer set due at once
+  after the receive is ready, or a test timer in the same batch), not
+  timed. `bench/boundary`'s `deadlines` scenario checks the idle, head and
+  body expiries end to end with short budgets.
+- **Not yet:** deadlines for queries, chunked
   request bodies, percent-decoding and query parsing, Go's larger limits.
 
 ## PostgreSQL
