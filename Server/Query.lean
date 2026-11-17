@@ -35,22 +35,29 @@ inductive Query.Result where
   /-- The statement failed or did not run. `sqlstate` is PostgreSQL's error
   code; the pool's own failures use class 08 (connection exception: `08006`
   when the connection was lost or could not be made, so the statement may or
-  may not have run), `54000` (a result over `Query.maxResultBytes`, or a
-  query the pool cannot send) and `25000` (the statement left a transaction
-  open, which closing its session rolled back). -/
+  may not have run), `54000` and `25000` (the statement left a transaction
+  open, which closing its session rolled back). `54000` is either a query the
+  pool cannot send, which did not run, or a result over
+  `Query.maxResultBytes`: the pool closes the session at the row that crosses
+  the bound, before the statement's end, so as for `08006` whether it took
+  effect is unknown (a write may have been committed or rolled back), and it
+  is not to be retried on its own; the message says which. -/
   | error (sqlstate : String) (message : String)
   deriving Inhabited
 
 /-- Most bytes the Lean value of a `rows` result may cost, a larger one
-becomes `error "54000"`. The pool charges it before building it, as a
-conservative count of the objects it would allocate: the result, each column
-name, each row (one slot per field, so a `NULL` or empty value costs its slot)
-and each value's `some` and string, with each object's header and rounding,
-and invalid UTF-8 charged three times for its replacement characters. So the
-row and field counts are bounded too: a result of one column of `NULL`s holds
-fewer than 22,000 rows. This is a budget for the result, not a ceiling on the
-process's memory: libpq's own copy of the result and the allocator's overhead
-come on top. -/
+becomes `error "54000"`, whose statement's outcome is unknown
+(`Query.Result.error`). The pool receives rows one at a time and charges
+each before building it, as a conservative count of the objects it
+allocates: the result, each column name, each row (one slot per field, so a
+`NULL` or empty value costs its slot) and each value's `some` and string,
+with each object's header and rounding, and invalid UTF-8 charged three
+times for its replacement characters. So the row and field counts are
+bounded too: a result of one column of `NULL`s holds fewer than 22,000 rows.
+This bounds the result the pool gathers, not the process's memory: libpq
+holds one whole protocol message at a time before the pool sees it, so a
+single row larger than the bound is received whole before it is refused,
+and the allocator's overhead comes on top. -/
 def Query.maxResultBytes : Nat := 1048576
 
 /-- An answer that may wait for queries: `done a`, or `query q k`, which runs

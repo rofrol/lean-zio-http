@@ -5,8 +5,10 @@
    message at a time, or one byte at a time. After every piece the test does
    what pg.zig does when the socket is readable, ekk_pg_consume then
    ekk_pg_collect, and checks that the query completes exactly at the
-   piece that ends its reply, with the expected result. It includes pg.c to
-   see its session's fields (last_null, prepared), and counts its
+   piece that ends its reply, with the expected result, and that the rows it
+   holds are exactly the DataRows of the running execution received so far
+   (single-row mode). It includes pg.c to see its session's fields
+   (last_null, prepared, rows, limit), and counts its
    PQgetResult calls: a collect that keeps getting results (a reply it
    misreads, such as COPY when it does not stop) fails the test instead of
    looping.
@@ -20,7 +22,7 @@
 #include <stdlib.h>
 
 /* PQgetResult calls left to the running ekk_pg_collect; reply() sets it
-   before each. A reply here has at most seven results, the NULLs between
+   before each. A reply here has at most twelve results, the NULLs between
    commands included. */
 static int results_left;
 
@@ -35,6 +37,20 @@ static PGresult *bounded_get_result(PGconn *c) {
 #define PQgetResult bounded_get_result
 #include "pg.c"
 #undef PQgetResult
+
+/* A whole PGresult's rows as Result.rows, through the same rows_take
+   that collect gives each single row, or 54000 when they cost more than
+   `limit`. */
+static lean_object *rows_within(PGresult *r, size_t limit) {
+    ekk_rows b = {0};
+    if (!rows_take(&b, r, limit)) {
+        rows_drop(&b);
+        return ekk_pg_error("54000", "over the limit");
+    }
+    return rows_finish(&b);
+}
+
+static lean_object *rows_of(PGresult *r) { return rows_within(r, EKK_MAX_RESULT_BYTES); }
 
 #include <errno.h>
 #include <stdarg.h>
@@ -87,6 +103,10 @@ static void rowdesc(msgs *m, const char *col) {
 }
 static void datarow(msgs *m, const char *v) {
     size_t a = begin(m, 'D'); put16(m, 1); put32(m, (uint32_t)strlen(v)); memcpy(m->b + m->n, v, strlen(v)); m->n += strlen(v); end(m, a);
+}
+/* A DataRow of one field: `n` bytes 'v'. */
+static void datarow_n(msgs *m, size_t n) {
+    size_t a = begin(m, 'D'); put16(m, 1); put32(m, (uint32_t)n); memset(m->b + m->n, 'v', n); m->n += n; end(m, a);
 }
 /* An ErrorResponse; `routine` (field R, the server function that raised
    it) is left out when NULL. */
@@ -244,24 +264,75 @@ static const char *piece_name[] = {"whole", "per message", "per byte"};
    leave at 0. When a piece ends at byte `between` (nonzero), the end of one
    command's results with the next command's not yet arrived, collect must
    have stopped there with last_null set. */
-static int reply(ekk_pg *p, fake *f, msgs *m, enum piece how, lean_object **acc, size_t between) {
-    size_t at = 0, i = 0;
-    while (at < m->n) {
-        size_t next = how == WHOLE ? m->n : how == MESSAGE ? m->ends[i++] : at + 1;
-        CHECK(write(f->conn, m->b + at, next - at) == (ssize_t)(next - at), "fake write");
-        at = next;
-        CHECK(ekk_pg_consume(p) == 1, "ekk_pg_consume failed after byte %zu: %s", at, PQerrorMessage(p->c));
+/* The DataRows among the messages that end at or before byte `at` since
+   the last RowDescription, CommandComplete or ErrorResponse: the rows of
+   the running execution received so far. */
+static size_t rows_received(msgs *m, size_t at) {
+    size_t n = 0, start = 0;
+    for (size_t i = 0; i < m->nmsg && m->ends[i] <= at; i++) {
+        char t = (char)m->b[start];
+        if (t == 'D') n++;
+        else if (t == 'T' || t == 'C' || t == 'E') n = 0;
+        start = m->ends[i];
+    }
+    return n;
+}
+
+static size_t rows_held(ekk_pg *p) { return p->rows.rows ? lean_array_size(p->rows.rows) : 0; }
+
+/* While `on`, the column names and first row of a result being collected,
+   with a reference of the test's own, taken the first time collect holds a
+   row; kept_released checks that pg.c has since released its references. */
+static struct { int on; lean_object *cols, *row; } kept;
+
+static void keep(ekk_pg *p) {
+    if (!kept.on || kept.row || rows_held(p) == 0) return;
+    kept.cols = p->rows.cols;
+    kept.row = lean_array_get_core(p->rows.rows, 0);
+    lean_inc(kept.cols);
+    lean_inc(kept.row);
+}
+
+static void kept_released(void) {
+    CHECK(kept.row != NULL, "no row was held to check");
+    CHECK(lean_is_exclusive(kept.cols) && lean_is_exclusive(kept.row), "the rows gathered were not released");
+    lean_dec(kept.cols);
+    lean_dec(kept.row);
+    kept.on = 0;
+    kept.cols = kept.row = NULL;
+}
+
+/* Delivers the reply in pieces until collect returns nonzero; after each,
+   consume and collect, which must hold the rows received so far (keep()
+   takes them). An AF_UNIX write is readable by the peer when write
+   returns, so each piece reaches libpq's next read. Returns collect's
+   result and sets *at to the bytes delivered. */
+static int reply_until(ekk_pg *p, fake *f, msgs *m, enum piece how, lean_object **acc, size_t between, size_t *at) {
+    size_t i = 0;
+    *at = 0;
+    while (*at < m->n) {
+        size_t next = how == WHOLE ? m->n : how == MESSAGE ? m->ends[i++] : *at + 1;
+        CHECK(write(f->conn, m->b + *at, next - *at) == (ssize_t)(next - *at), "fake write");
+        *at = next;
+        CHECK(ekk_pg_consume(p) == 1, "ekk_pg_consume failed after byte %zu: %s", *at, PQerrorMessage(p->c));
         results_left = 32;
         int rc = ekk_pg_collect(p, acc);
-        if (at < m->n) {
-            CHECK(rc == 0, "collect returned %d after %zu of %zu bytes", rc, at, m->n);
-            CHECK(at != between || p->last_null, "collect did not stop between two commands at byte %zu", at);
-        } else {
-            return rc;
-        }
+        if (rc != 0) return rc;
+        CHECK(*at != between || p->last_null, "collect did not stop between two commands at byte %zu", *at);
+        CHECK(rows_held(p) == rows_received(m, *at), "collect holds %zu rows after byte %zu, %zu received",
+              rows_held(p), *at, rows_received(m, *at));
+        keep(p);
     }
-    fail(__LINE__, "empty reply");
     return 0;
+}
+
+/* reply_until, which must end exactly at the reply's last byte. */
+static int reply(ekk_pg *p, fake *f, msgs *m, enum piece how, lean_object **acc, size_t between) {
+    size_t at;
+    int rc = reply_until(p, f, m, how, acc, between, &at);
+    CHECK(rc != 0, "not complete after the reply's %zu bytes", m->n);
+    CHECK(at == m->n, "collect returned %d after %zu of %zu bytes", rc, at, m->n);
+    return rc;
 }
 
 static void expect_error(lean_object *r, const char *sqlstate) {
@@ -491,7 +562,8 @@ static void cut(enum piece how) {
     lean_object *acc = NULL;
     /* All but the RowDescription's last byte, then EOF. */
     m.n--; m.ends[m.nmsg - 1]--;
-    CHECK(reply(p, &f, &m, how, &acc, 0) == 0, "complete without a Sync");
+    size_t at;
+    CHECK(reply_until(p, &f, &m, how, &acc, 0, &at) == 0, "complete without a Sync");
     close(f.conn);
     f.conn = -1;
     if (ekk_pg_consume(p) == 1) {
@@ -510,7 +582,8 @@ static void cut(enum piece how) {
 /* A PGresult of `nf` (at most 4) text columns named `cols` and `nt` rows whose field (t, f) is value(t, f, &len): NULL for
    SQL NULL. */
 typedef const char *(*value_fn)(int t, int f, int *len);
-static PGresult *made(int nf, const char *const *cols, int nt, value_fn value) {
+/* Rows t0 .. t0 + nt - 1 of value(t, f, &len). */
+static PGresult *made_from(int nf, const char *const *cols, int t0, int nt, value_fn value) {
     PGresult *r = PQmakeEmptyPGresult(NULL, PGRES_TUPLES_OK);
     CHECK(r != NULL, "PQmakeEmptyPGresult");
     PGresAttDesc d[4] = {0};
@@ -524,10 +597,28 @@ static PGresult *made(int nf, const char *const *cols, int nt, value_fn value) {
     for (int t = 0; t < nt; t++)
         for (int f = 0; f < nf; f++) {
             int len = -1;
-            const char *v = value(t, f, &len);
+            const char *v = value(t0 + t, f, &len);
             CHECK(PQsetvalue(r, t, f, (char *)v, v ? len : -1), "PQsetvalue");
         }
     return r;
+}
+
+static PGresult *made(int nf, const char *const *cols, int nt, value_fn value) { return made_from(nf, cols, 0, nt, value); }
+
+/* The rows of value(t, f) for t < nt as single-row mode delivers them, one
+   PGresult each, then the zero-row result, gathered as collect does. */
+static lean_object *rows_by_row(int nf, const char *const *cols, int nt, value_fn value, size_t limit) {
+    ekk_rows b = {0};
+    for (int t = 0; t <= nt; t++) {
+        PGresult *r = made_from(nf, cols, t, t < nt ? 1 : 0, value);
+        int ok = rows_take(&b, r, limit);
+        PQclear(r);
+        if (!ok) {
+            rows_drop(&b);
+            return ekk_pg_error("54000", "over the limit");
+        }
+    }
+    return rows_finish(&b);
 }
 
 /* What the Lean value rows_of built costs by the same measure as
@@ -573,6 +664,12 @@ static const char *mixed[] = {NULL, "", "hello", "za\xc5\xbc\xc3\xb3\xc5\x82\xc4
 #define MIXED_ROWS (int)(sizeof mixed / sizeof mixed[0])
 static const char *mixed_value(int t, int f, int *len) {
     const char *v = mixed[(t + f) % MIXED_ROWS];
+    if (v) *len = (int)strlen(v);
+    return v;
+}
+/* Mixed values 0 to 3 only: valid UTF-8, charged exactly as built. */
+static const char *valid_value(int t, int f, int *len) {
+    const char *v = mixed[(t + f) % 4];
     if (v) *len = (int)strlen(v);
     return v;
 }
@@ -647,6 +744,21 @@ static void cost_bound(void) {
     expect_error(rows_within(r, c - 1), "54000");
     PQclear(r);
 
+    current = "result cost: row by row, the same exact bound";
+    res = rows_by_row(2, cols, 3, mixed_value, SIZE_MAX - 1);
+    CHECK(lean_ptr_tag(res) == 0 && built_cost(res) == c, "row by row costs %zu, whole %zu", built_cost(res), c);
+    lean_dec(res);
+    expect_rows_count(rows_by_row(2, cols, 3, mixed_value, c), 3);
+    expect_error(rows_by_row(2, cols, 3, mixed_value, c - 1), "54000");
+    current = "result cost: row by row, many rows copied to their exact size";
+    res = rows_by_row(2, cols, 35, valid_value, SIZE_MAX - 1);
+    c = built_cost(res);
+    CHECK(lean_array_capacity(lean_ctor_get(res, 1)) == 35, "row array capacity %zu",
+          lean_array_capacity(lean_ctor_get(res, 1)));
+    lean_dec(res);
+    expect_rows_count(rows_by_row(2, cols, 35, valid_value, c), 35);
+    expect_error(rows_by_row(2, cols, 35, valid_value, c - 1), "54000");
+
     current = "result cost: invalid UTF-8 charged at least as built";
     r = made(2, cols, 3 * MIXED_ROWS, mixed_value);
     res = rows_within(r, SIZE_MAX - 1);
@@ -681,8 +793,192 @@ static void cost_bound(void) {
     PQclear(r);
 }
 
+
+/* ---- single-row collection (pg.c, ekk_rows) ---- */
+
+/* Rows of one column `col` whose values, joined by ',', are `values`. */
+static void expect_values(lean_object *r, const char *col, size_t n, const char *values) {
+    CHECK(r != NULL && lean_ptr_tag(r) == 0, "expected rows, got %s: %s", r ? lean_string_cstr(lean_ctor_get(r, 0)) : "nothing",
+          r ? lean_string_cstr(lean_ctor_get(r, 1)) : "");
+    lean_object *cols = lean_ctor_get(r, 0), *rows = lean_ctor_get(r, 1);
+    CHECK(lean_array_size(cols) == 1 && strcmp(lean_string_cstr(lean_array_get_core(cols, 0)), col) == 0, "column");
+    CHECK(lean_array_size(rows) == n, "%zu rows, expected %zu", lean_array_size(rows), n);
+    char joined[256] = "";
+    for (size_t t = 0; t < n; t++) {
+        lean_object *v = lean_array_get_core(lean_array_get_core(rows, t), 0);
+        CHECK(!lean_is_scalar(v), "row %zu is NULL", t);
+        if (t) strcat(joined, ",");
+        strncat(joined, lean_string_cstr(lean_ctor_get(v, 0)), sizeof joined - strlen(joined) - 2);
+    }
+    CHECK(strcmp(joined, values) == 0, "values %s, expected %s", joined, values);
+    lean_dec(r);
+}
+
+/* A cached SQL_A execution answered with three rows of `len` bytes each. */
+static void three_rows(msgs *m, size_t len) {
+    *m = (msgs){0};
+    empty(m, '2'); rowdesc(m, "x"); datarow_n(m, len); datarow_n(m, len); datarow_n(m, len); complete(m, "SELECT 3"); ready(m, 'I');
+}
+
+/* Where the k-th message (from 0) of type t ends. */
+static size_t end_of(msgs *m, char t, int k) {
+    size_t start = 0;
+    for (size_t i = 0; i < m->nmsg; i++) {
+        if ((char)m->b[start] == t && k-- == 0) return m->ends[i];
+        start = m->ends[i];
+    }
+    fail(__LINE__, "no message %c", t);
+    return 0;
+}
+
+/* The query's rows crossed the bound at byte `at` of the reply, which
+   ends there: 54000, the rows gathered released, the session to close. */
+static void expect_overflow(ekk_pg *p, int rc, lean_object *acc, size_t at, size_t crossed) {
+    CHECK(rc == -1, "collect returned %d over the bound", rc);
+    CHECK(at == crossed, "the bound ended the reply at byte %zu, not at the row that crossed it (%zu)", at, crossed);
+    CHECK(rows_held(p) == 0 && p->rows.cols == NULL, "rows still held after the bound");
+    CHECK(strstr(lean_string_cstr(lean_ctor_get(acc, 1)), "unknown") != NULL, "the message does not say the outcome is unknown");
+    expect_error(acc, "54000");
+}
+
+/* Rows arrive one at a time (reply() checks how many are held after each
+   piece) on a first use, a cached and an unnamed execution; zero rows keep
+   their columns; rows then an error answer the error; and a result over
+   the session's limit closes it at the row that crosses it, a result at
+   exactly the limit does not. */
+static void rows_and_bound(enum piece how) {
+    fake f;
+    fake_open(&f);
+    ekk_pg *p = connect_fake(&f);
+    lean_object *acc;
+    msgs m;
+    size_t at;
+
+    current = "rows: first use, three rows";
+    send_query(p, &f, SQL_A, "1", "PBDES");
+    m = (msgs){0};
+    empty(&m, '1'); empty(&m, '2'); rowdesc(&m, "x"); datarow(&m, "1"); datarow(&m, "2"); datarow(&m, "3");
+    complete(&m, "SELECT 3"); ready(&m, 'I');
+    acc = NULL;
+    CHECK(reply(p, &f, &m, how, &acc, m.ends[0]) == 1, "not complete");
+    expect_values(acc, "x", 3, "1,2,3");
+
+    current = "rows: cached, zero rows keep their columns";
+    send_query(p, &f, SQL_A, "1", "BDES");
+    m = (msgs){0};
+    empty(&m, '2'); rowdesc(&m, "x"); complete(&m, "SELECT 0"); ready(&m, 'I');
+    acc = NULL;
+    CHECK(reply(p, &f, &m, how, &acc, 0) == 1, "not complete");
+    expect_values(acc, "x", 0, "");
+
+    current = "rows: rows then an error answer the error";
+    send_query(p, &f, SQL_A, "1", "BDES");
+    m = (msgs){0};
+    empty(&m, '2'); rowdesc(&m, "x"); datarow(&m, "1"); datarow(&m, "2"); errresp(&m, "22012", "division by zero"); ready(&m, 'I');
+    acc = NULL;
+    kept.on = how != WHOLE;
+    CHECK(reply(p, &f, &m, how, &acc, 0) == 1, "not complete");
+    expect_error(acc, "22012");
+    CHECK(rows_held(p) == 0, "rows still held after the error");
+    if (how != WHOLE) kept_released();
+
+    current = "rows: the measure of three rows";
+    send_query(p, &f, SQL_A, "1", "BDES");
+    three_rows(&m, 100);
+    acc = NULL;
+    CHECK(reply(p, &f, &m, how, &acc, 0) == 1, "not complete");
+    size_t c = built_cost(acc);
+    expect_rows_count(acc, 3);
+
+    current = "rows: a result at exactly the limit";
+    p->limit = c;
+    send_query(p, &f, SQL_A, "1", "BDES");
+    three_rows(&m, 100);
+    acc = NULL;
+    CHECK(reply(p, &f, &m, how, &acc, 0) == 1, "not complete at the limit");
+    expect_rows_count(acc, 3);
+
+    current = "rows: one byte over the limit, cached";
+    p->limit = c - 1;
+    send_query(p, &f, SQL_A, "1", "BDES");
+    three_rows(&m, 100);
+    acc = NULL;
+    kept.on = how != WHOLE;
+    int rc = reply_until(p, &f, &m, how, &acc, 0, &at);
+    expect_overflow(p, rc, acc, at, how == WHOLE ? m.n : end_of(&m, 'D', 2));
+    if (how != WHOLE) kept_released();
+    finish(p, &f);
+
+    current = "rows: a single field over the limit, first use";
+    p = connect_fake(&f);
+    p->limit = 200;
+    send_query(p, &f, SQL_A, "1", "PBDES");
+    m = (msgs){0};
+    empty(&m, '1'); empty(&m, '2'); rowdesc(&m, "x"); datarow_n(&m, 300); complete(&m, "SELECT 1"); ready(&m, 'I');
+    acc = NULL;
+    rc = reply_until(p, &f, &m, how, &acc, m.ends[0], &at);
+    expect_overflow(p, rc, acc, at, how == WHOLE ? m.n : end_of(&m, 'D', 0));
+    finish(p, &f);
+
+    current = "rows: unnamed, past EKK_STATEMENTS cached";
+    p = connect_fake(&f);
+    for (int i = 0; i < EKK_STATEMENTS; i++) {
+        char sql[32];
+        snprintf(sql, sizeof sql, "SELECT %d AS y", i);
+        prepare_ok(p, &f, how, sql, "y", (unsigned long long)i);
+    }
+    send_query(p, &f, "SELECT 99 AS x", NULL, "PBDES");
+    m = (msgs){0};
+    empty(&m, '1'); empty(&m, '2'); rowdesc(&m, "x"); datarow(&m, "7"); datarow(&m, "8"); complete(&m, "SELECT 2"); ready(&m, 'I');
+    acc = NULL;
+    CHECK(reply(p, &f, &m, how, &acc, 0) == 1, "not complete");
+    expect_values(acc, "x", 2, "7,8");
+    CHECK(p->prepared == EKK_STATEMENTS, "prepared %d", p->prepared);
+
+    current = "rows: unnamed, over the limit";
+    /* The result's own objects and the first row of 100 bytes cost 368, the
+       second row 216 more. */
+    p->limit = 400;
+    send_query(p, &f, "SELECT 98 AS x", NULL, "PBDES");
+    m = (msgs){0};
+    empty(&m, '1'); empty(&m, '2'); rowdesc(&m, "x"); datarow_n(&m, 100); datarow_n(&m, 100); complete(&m, "SELECT 2"); ready(&m, 'I');
+    acc = NULL;
+    kept.on = how != WHOLE;
+    rc = reply_until(p, &f, &m, how, &acc, 0, &at);
+    expect_overflow(p, rc, acc, at, how == WHOLE ? m.n : end_of(&m, 'D', 1));
+    if (how != WHOLE) kept_released();
+    finish(p, &f);
+
+    current = "rows: the session ends with rows held";
+    p = connect_fake(&f);
+    send_query(p, &f, SQL_A, "1", "PBDES");
+    m = (msgs){0};
+    empty(&m, '1'); empty(&m, '2'); rowdesc(&m, "x"); datarow(&m, "1"); datarow(&m, "2");
+    CHECK(write(f.conn, m.b, m.n) == (ssize_t)m.n, "fake write");
+    CHECK(ekk_pg_consume(p) == 1, "ekk_pg_consume failed: %s", PQerrorMessage(p->c));
+    results_left = 32;
+    acc = NULL;
+    CHECK(ekk_pg_collect(p, &acc) == 0, "complete without its end");
+    CHECK(rows_held(p) == 2, "%zu rows held, 2 received", rows_held(p));
+    kept.on = 1;
+    keep(p);
+    finish(p, &f);
+    kept_released();
+    fake_close(&f);
+}
+
+/* The libpq versions the pool accepts (pg.c, libpq_supported). */
+static void libpq_versions(void) {
+    current = "libpq versions";
+    int no[] = {130020, 140000, 140005, 150000}, yes[] = {140006, 140019, 150001, 160000, 170000, 180006};
+    for (size_t i = 0; i < sizeof no / sizeof no[0]; i++) CHECK(!libpq_supported(no[i]), "%d accepted", no[i]);
+    for (size_t i = 0; i < sizeof yes / sizeof yes[0]; i++) CHECK(libpq_supported(yes[i]), "%d refused", yes[i]);
+    CHECK(ekk_pg_libpq_supported(), "the libpq this test links (%d) is refused", PQlibVersion());
+}
+
 int main(void) {
     lean_initialize_runtime_module();
+    libpq_versions();
     utf8_agrees();
     cost_overflow();
     cost_bound();
@@ -695,6 +991,7 @@ int main(void) {
         ending(how, "COPY FROM STDIN", "COPY t FROM STDIN", 'G', "0A000");
         ending(how, "a transaction left open", "BEGIN", 'T', "25000");
         cut(how);
+        rows_and_bound(how);
         printf("pg_glue_test: replies %s: ok\n", piece_name[how]);
     }
     return 0;

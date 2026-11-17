@@ -44,8 +44,34 @@ lean_object *ekk_pg_error(const char *sqlstate, const char *message) {
    cannot collide with a forgotten statement the server still holds; those
    are counted in `stale`, and a session that reaches EKK_STATEMENTS of them
    is closed after the query's result, which bounds what it leaves on the
-   server. */
+   server.
+
+   Every execution runs in libpq's single-row mode, so its rows arrive one
+   PGresult each and are charged against Query.maxResultBytes as they
+   arrive (ekk_rows); a result that crosses the bound closes the session
+   before the rest arrives. libpq lets the mode be set only while its
+   command is the head of libpq's queue and none of its results has been
+   parsed: for a cached or unnamed execution right after sending it, on a
+   first use once the Prepare's results have ended (`stage`). */
 #define EKK_STATEMENTS 64
+
+/* Where the query in flight is in its commands. */
+typedef enum {
+    EKK_PREPARING, /* the Prepare's result comes first */
+    EKK_PREPARED,  /* the Prepare succeeded; the NULL ending it comes next */
+    EKK_EXECUTING, /* the execution's results, in single-row mode */
+    EKK_SKIPPED,   /* preparing failed, so PostgreSQL skips the execution */
+} ekk_stage;
+
+/* The Result.rows of the query in flight, built as its rows arrive. `cost`
+   is what the finished Result costs so far, by the measure of
+   Query.maxResultBytes (below); `cols` is NULL until a result has
+   described the columns. */
+typedef struct {
+    lean_object *cols;
+    lean_object *rows;
+    size_t cost;
+} ekk_rows;
 
 typedef struct {
     PGconn *c;
@@ -54,10 +80,34 @@ typedef struct {
     int prepared;                    /* entries in sql and name */
     unsigned long long next_name;    /* the next statement's name; never reused */
     int stale;                       /* forgotten statements perhaps still on the server */
-    int preparing; /* the query in flight prepares sql[prepared - 1] first */
+    ekk_stage stage; /* EKK_PREPARING..: the query in flight prepares sql[prepared - 1] */
     int cached;    /* the query in flight executes the entry prepared before, or -1 */
     int last_null; /* PQgetResult's last return was NULL */
+    ekk_rows rows; /* the query in flight's rows so far */
+    size_t limit;  /* EKK_MAX_RESULT_BYTES; the tests (pg_glue_test.c) set less */
 } ekk_pg;
+
+/* libpq's single-row mode for the command at the head of libpq's queue.
+   The callers set it only where libpq allows it (above), so a refusal is a
+   programming error, never a reason to buffer the whole result. */
+static void single_row(ekk_pg *p) {
+    if (!PQsetSingleRowMode(p->c)) {
+        fprintf(stderr, "pg.c: libpq refused single-row mode for the execution\n");
+        abort();
+    }
+}
+
+/* Whether the libpq the process runs supports the pool: pipeline mode
+   (14) with single-row mode reset after each pipelined query ("libpq:
+   Reset singlerow flag correctly in pipeline mode", in 14.6, 15.1 and
+   16.0). `v` is PQlibVersion's major * 10000 + minor. */
+static int libpq_supported(int v) { return v >= 150001 || (v >= 140006 && v < 150000); }
+
+int ekk_pg_libpq_supported(void) { return libpq_supported(PQlibVersion()); }
+
+int ekk_pg_libpq_version(void) { return PQlibVersion(); }
+
+static void rows_drop(ekk_rows *b);
 
 /* The connection's last error, for a lost connection: class 08006. */
 lean_object *ekk_pg_lost(ekk_pg *p) {
@@ -73,6 +123,7 @@ ekk_pg *ekk_pg_start(const char *conninfo) {
     const char *vals[] = {conninfo, "UTF8", NULL};
     ekk_pg *p = calloc(1, sizeof *p);
     if (p == NULL) return NULL;
+    p->limit = EKK_MAX_RESULT_BYTES;
     p->c = PQconnectStartParams(keys, vals, 1);
     if (p->c == NULL) { free(p); return NULL; }
     return p;
@@ -94,6 +145,7 @@ int ekk_pg_connect_poll(ekk_pg *p) {
 int ekk_pg_socket(ekk_pg *p) { return PQsocket(p->c); }
 
 void ekk_pg_finish(ekk_pg *p) {
+    rows_drop(&p->rows);
     PQfinish(p->c);
     for (int i = 0; i < p->prepared; i++) free(p->sql[i]);
     free(p);
@@ -120,9 +172,10 @@ int ekk_pg_send(ekk_pg *p, lean_object *q, lean_object **err) {
     const char **vals = NULL;
     const char *text = cstr(sql);
     *err = NULL;
-    p->preparing = 0;
+    p->stage = EKK_EXECUTING;
     p->cached = -1;
     p->last_null = 0;
+    rows_drop(&p->rows);
     if (text == NULL || n > 65535) {
         *err = ekk_pg_error("54000", text == NULL ? "a NUL character in the SQL" : "more than 65535 parameters");
         rc = 1;
@@ -146,15 +199,17 @@ int ekk_pg_send(ekk_pg *p, lean_object *q, lean_object **err) {
         snprintf(name, sizeof name, "ekk%llu", p->name[k]);
         p->cached = k;
         ok = PQsendQueryPrepared(p->c, name, (int)n, vals, NULL, NULL, 0);
+        if (ok) single_row(p);
     } else if (k < EKK_STATEMENTS && (p->sql[k] = strdup(text)) != NULL) {
         p->name[k] = p->next_name++;
         snprintf(name, sizeof name, "ekk%llu", p->name[k]);
         p->prepared++;
-        p->preparing = 1;
+        p->stage = EKK_PREPARING; /* single-row mode once the Prepare's results end */
         ok = PQsendPrepare(p->c, name, text, (int)n, NULL)
             && PQsendQueryPrepared(p->c, name, (int)n, vals, NULL, NULL, 0);
     } else {
         ok = PQsendQueryParams(p->c, text, (int)n, NULL, vals, NULL, NULL, 0);
+        if (ok) single_row(p);
     }
     rc = ok && PQpipelineSync(p->c) ? 0 : 2;
 done:
@@ -179,8 +234,15 @@ int ekk_pg_consume(ekk_pg *p) {
    costs what lean_alloc_object or lean_alloc_ctor asks for, rounded up to
    LEAN_OBJECT_SIZE_DELTA, plus one word for the size a big object's
    allocation keeps before it (lean.h). The arithmetic saturates at SIZE_MAX,
-   which no limit reaches. This bounds the result it hands to Lean, not the
-   PGresult libpq built before (qsqb5f), nor the allocator's own overhead. */
+   which no limit reaches. Rows are charged one at a time as single-row mode
+   delivers them, so the rows held are bounded by the limit too. The row
+   array doubles as rows arrive and is copied to its exact size once
+   complete; that growth's slack, at most two words per row (the old and
+   the new array at a doubling or at the copy), is not charged. This bounds
+   what the pool builds, not libpq's buffers: libpq takes in a whole
+   protocol message, a DataRow of any size included, before the pool sees
+   it, and its input buffer keeps the largest such message's size until
+   the session is closed; nor the allocator's own overhead. */
 
 /* Adds `n` to *total: 0 once the sum exceeds `limit` (or overflows). */
 static int charge(size_t *total, size_t n, size_t limit) {
@@ -243,43 +305,57 @@ static int charge_text(size_t *total, const char *s, size_t n, size_t limit) {
     return charge(total, string_cost(n, utf8_valid((const unsigned char *)s, n)), limit);
 }
 
-/* Whether the Result rows_of builds from `r` costs at most `limit` bytes
-   (less than SIZE_MAX). */
-static int result_fits(PGresult *r, size_t limit) {
-    int nf = PQnfields(r), nt = PQntuples(r);
-    size_t total = 0;
-    if (!charge(&total, object_cost(sizeof(lean_ctor_object), 2), limit)
-        || !charge(&total, object_cost(sizeof(lean_array_object), (size_t)nf), limit)
-        || !charge(&total, object_cost(sizeof(lean_array_object), (size_t)nt), limit))
-        return 0;
-    for (int f = 0; f < nf; f++) {
-        const char *name = PQfname(r, f);
-        size_t n = strnlen(name, limit + 1);
-        if (n > limit || !charge_text(&total, name, n, limit)) return 0;
-    }
-    size_t row = object_cost(sizeof(lean_array_object), (size_t)nf), some = object_cost(sizeof(lean_ctor_object), 1);
-    for (int t = 0; t < nt; t++) {
-        if (!charge(&total, row, limit)) return 0;
-        for (int f = 0; f < nf; f++) {
-            if (PQgetisnull(r, t, f)) continue;
-            if (!charge(&total, some, limit)
-                || !charge_text(&total, PQgetvalue(r, t, f), (size_t)PQgetlength(r, t, f), limit))
-                return 0;
-        }
-    }
-    return 1;
+/* An array of the first `n` slots of `a` (exclusive) with capacity `cap`;
+   `a` is freed, its elements moved. */
+static lean_object *moved(lean_object *a, size_t n, size_t cap) {
+    lean_object *r = lean_alloc_array(n, cap);
+    memcpy(lean_array_cptr(r), lean_array_cptr(a), n * sizeof(lean_object *));
+    lean_to_array(a)->m_size = 0; /* free only the array */
+    lean_dec(a);
+    return r;
 }
 
-/* A PGresult with rows as Result.rows, or Result.error when that would cost
-   more than `limit` bytes (result_fits). */
-static lean_object *rows_within(PGresult *r, size_t limit) {
-    if (!result_fits(r, limit)) return ekk_pg_error("54000", "the result exceeds Query.maxResultBytes");
+/* Appends `row` to b's rows, doubling the array when it is full. */
+static void rows_push(ekk_rows *b, lean_object *row) {
+    size_t n = lean_array_size(b->rows);
+    if (n == lean_array_capacity(b->rows)) b->rows = moved(b->rows, n, n ? 2 * n : 8);
+    lean_array_cptr(b->rows)[n] = row;
+    lean_to_array(b->rows)->m_size = n + 1;
+}
+
+/* Adds r's rows to `b`, and its column names when `b` has none yet,
+   charging each before it is built: 0, with nothing of the row that
+   crossed it built, once `b` would cost more than `limit` bytes (less than
+   SIZE_MAX). */
+static int rows_take(ekk_rows *b, PGresult *r, size_t limit) {
     int nf = PQnfields(r), nt = PQntuples(r);
-    lean_object *cols = lean_alloc_array(0, nf);
-    for (int f = 0; f < nf; f++) cols = lean_array_push(cols, lean_mk_string(PQfname(r, f)));
-    lean_object *rows = lean_alloc_array(0, nt);
+    if (b->cols == NULL) {
+        /* The Result, the column array and names, the row array's header;
+           each row adds its slot in the row array. */
+        if (!charge(&b->cost, object_cost(sizeof(lean_ctor_object), 2), limit)
+            || !charge(&b->cost, object_cost(sizeof(lean_array_object), (size_t)nf), limit)
+            || !charge(&b->cost, object_cost(sizeof(lean_array_object), 0), limit))
+            return 0;
+        for (int f = 0; f < nf; f++) {
+            const char *name = PQfname(r, f);
+            size_t n = strnlen(name, limit + 1);
+            if (n > limit || !charge_text(&b->cost, name, n, limit)) return 0;
+        }
+        b->cols = lean_alloc_array(0, nf);
+        for (int f = 0; f < nf; f++) b->cols = lean_array_push(b->cols, lean_mk_string(PQfname(r, f)));
+        b->rows = lean_alloc_array(0, 0);
+    }
+    size_t row = sizeof(void *) + object_cost(sizeof(lean_array_object), (size_t)nf);
+    size_t some = object_cost(sizeof(lean_ctor_object), 1);
     for (int t = 0; t < nt; t++) {
-        lean_object *row = lean_alloc_array(0, nf);
+        if (!charge(&b->cost, row, limit)) return 0;
+        for (int f = 0; f < nf; f++) {
+            if (PQgetisnull(r, t, f)) continue;
+            if (!charge(&b->cost, some, limit)
+                || !charge_text(&b->cost, PQgetvalue(r, t, f), (size_t)PQgetlength(r, t, f), limit))
+                return 0;
+        }
+        lean_object *o = lean_alloc_array(0, nf);
         for (int f = 0; f < nf; f++) {
             lean_object *v;
             if (PQgetisnull(r, t, f)) v = lean_box(0);
@@ -288,17 +364,31 @@ static lean_object *rows_within(PGresult *r, size_t limit) {
                 /* Validates the UTF-8 (invalid bytes become U+FFFD). */
                 lean_ctor_set(v, 0, lean_mk_string_from_bytes(PQgetvalue(r, t, f), (size_t)PQgetlength(r, t, f)));
             }
-            row = lean_array_push(row, v);
+            o = lean_array_push(o, v);
         }
-        rows = lean_array_push(rows, row);
+        rows_push(b, o);
     }
-    lean_object *res = lean_alloc_ctor(0, 2, 0);
-    lean_ctor_set(res, 0, cols);
-    lean_ctor_set(res, 1, rows);
-    return res;
+    return 1;
 }
 
-static lean_object *rows_of(PGresult *r) { return rows_within(r, EKK_MAX_RESULT_BYTES); }
+static void rows_drop(ekk_rows *b) {
+    if (b->cols) lean_dec(b->cols);
+    if (b->rows) lean_dec(b->rows);
+    *b = (ekk_rows){0};
+}
+
+/* `b`, which rows_take has described, as Result.rows; `b` is left empty.
+   The row array is copied to its exact size, as charged. */
+static lean_object *rows_finish(ekk_rows *b) {
+    lean_object *rows = b->rows;
+    size_t n = lean_array_size(rows);
+    if (lean_array_capacity(rows) != n) rows = moved(rows, n, n);
+    lean_object *res = lean_alloc_ctor(0, 2, 0);
+    lean_ctor_set(res, 0, b->cols);
+    lean_ctor_set(res, 1, rows);
+    *b = (ekk_rows){0};
+    return res;
+}
 
 /* Forgets cache entry k, keeping the others in order. */
 static void forget(ekk_pg *p, int k) {
@@ -329,16 +419,24 @@ static lean_object *error_of(PGresult *r) {
     return ekk_pg_error(st ? st : "XX000", PQresultErrorMessage(r));
 }
 
+/* The answer to a result that crossed Query.maxResultBytes: the session is
+   closed before the statement's end, so whether it took effect is unknown. */
+#define EKK_TOO_BIG "the result exceeds Query.maxResultBytes; the session was closed before the statement ended, so whether it took effect is unknown"
+
 /* Collects the results that have arrived, without blocking, until the
-   query's Sync. *acc holds the query's Result: its last result (a later
-   error wins over earlier rows), or the error of preparing its statement
-   (which is then forgotten, and the execution PostgreSQL skipped is
-   ignored). A cached statement that went stale is forgotten (`invalidated`).
-   1 when the Sync arrived (*acc is complete), 0 when more input is needed,
-   -1 when the session must be closed, with *acc the query's result: an
-   error when the connection failed, the statement started COPY, which this
-   pool does not speak, or it left a transaction open; the query's own
-   result when the session holds EKK_STATEMENTS stale statements. */
+   query's Sync. *acc holds the query's Result: its execution's rows,
+   gathered row by row (single-row mode) and complete at the zero-row
+   result that ends them, or its error (an error after some rows discards
+   them), or the error of preparing its statement (which is then forgotten,
+   and the execution PostgreSQL skipped is ignored). A cached statement
+   that went stale is forgotten (`invalidated`). 1 when the Sync arrived
+   (*acc is complete), 0 when more input is needed, -1 when the session
+   must be closed, with *acc the query's result: an error when the
+   connection failed, the statement started COPY, which this pool does not
+   speak, it left a transaction open, or its rows crossed
+   Query.maxResultBytes (54000, EKK_TOO_BIG: the rows gathered are
+   released, the rest is never read); the query's own result when the
+   session holds EKK_STATEMENTS stale statements. */
 int ekk_pg_collect(ekk_pg *p, lean_object **acc) {
     while (!PQisBusy(p->c)) {
         PGresult *r = PQgetResult(p->c);
@@ -351,12 +449,19 @@ int ekk_pg_collect(ekk_pg *p, lean_object **acc) {
                 return -1;
             }
             p->last_null = 1;
+            if (p->stage == EKK_PREPARED) {
+                /* The execution is libpq's queue head now, and the next
+                   PQisBusy would parse its first result. */
+                single_row(p);
+                p->stage = EKK_EXECUTING;
+            }
             continue;
         }
         p->last_null = 0;
         lean_object *v = NULL;
         int stop = 0;
-        switch (PQresultStatus(r)) {
+        ExecStatusType st = PQresultStatus(r);
+        switch (st) {
         case PGRES_PIPELINE_SYNC:
             PQclear(r);
             if (*acc == NULL) *acc = ekk_pg_error("08006", "no result");
@@ -371,12 +476,21 @@ int ekk_pg_collect(ekk_pg *p, lean_object **acc) {
         case PGRES_PIPELINE_ABORTED:
             break; /* skipped after the error already in *acc */
         case PGRES_COMMAND_OK:
-            if (p->preparing) { p->preparing = 0; break; } /* the statement is prepared */
-            v = rows_of(r);
-            break;
+            if (p->stage == EKK_PREPARING) { p->stage = EKK_PREPARED; break; } /* the statement is prepared */
+            /* fall through: a statement without rows */
         case PGRES_TUPLES_OK:
         case PGRES_EMPTY_QUERY:
-            v = rows_of(r);
+        case PGRES_SINGLE_TUPLE:
+            if (!rows_take(&p->rows, r, p->limit)) {
+                PQclear(r);
+                rows_drop(&p->rows);
+                if (*acc) lean_dec(*acc);
+                *acc = ekk_pg_error("54000", EKK_TOO_BIG);
+                return -1;
+            }
+            /* A single row is followed by more, or by the zero-row
+               PGRES_TUPLES_OK that ends them (or an error). */
+            if (st != PGRES_SINGLE_TUPLE) v = rows_finish(&p->rows);
             break;
         case PGRES_COPY_IN:
         case PGRES_COPY_OUT:
@@ -385,16 +499,17 @@ int ekk_pg_collect(ekk_pg *p, lean_object **acc) {
             stop = 1;
             break;
         default:
-            if (p->preparing) {
+            if (p->stage == EKK_PREPARING) {
                 /* Preparing failed: forget the statement, which the server
                    does not hold. */
-                p->preparing = 0;
+                p->stage = EKK_SKIPPED;
                 forget(p, p->prepared - 1);
             } else if (p->cached >= 0 && invalidated(r)) {
                 forget(p, p->cached);
                 p->cached = -1;
                 p->stale++;
             }
+            rows_drop(&p->rows); /* rows before the error are not the answer */
             v = error_of(r);
         }
         PQclear(r);

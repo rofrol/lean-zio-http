@@ -18,6 +18,10 @@ randomnumber int)`, filled by bench.sh.
   d=0, `database error 22012`.
 - `GET /begin`: `BEGIN`, which leaves a transaction open, answered
   `database error 25000` (`Server.Query`).
+- `GET /insert?n=N`: inserts N rows of 1,000 bytes into the table `big
+  (v text)`, which bench/dbcheck creates, returning them, answered with the
+  number of rows returned; past about 1,000 rows the result is over
+  `Query.maxResultBytes`, answered `database error 54000`.
 - `GET /` and the rest: `App.Hello`, with no query.
 
 A failed query is answered 503 when the database could not be reached or the
@@ -80,6 +84,12 @@ def single (q : Query) : Await Response := do
   | .error st _ => pure (failed st)
   | r => pure (text 200 (((first r).join).getD "null"))
 
+def insert (n : Nat) : Await Response := do
+  match ← Await.run { sql := "INSERT INTO big (v) SELECT repeat('x', 1000) FROM generate_series(1, $1::int) RETURNING v",
+                      params := #[some (toString n)] } with
+  | .error st _ => pure (failed st)
+  | .rows _ rows => pure (text 200 (toString rows.size))
+
 def app : Handler := fun r =>
   if r.method != "GET" then .done (App.Hello.respond r) else
   match path r.target with
@@ -98,6 +108,10 @@ def app : Handler := fun r =>
     | some d => single { sql := "SELECT 1 / $1::int", params := #[some (toString d)] }
     | none => .done (text 400 "bad d\n")
   | "/begin" => single { sql := "BEGIN" }
+  | "/insert" =>
+    match (param r.target "n").bind String.toNat? with
+    | some n => if n < 2 ^ 31 then insert n else .done (text 400 "bad n\n")
+    | none => .done (text 400 "bad n\n")
   | _ => .done (App.Hello.respond r)
 
 end App.Db

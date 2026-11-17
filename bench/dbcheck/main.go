@@ -21,6 +21,11 @@
 //     ALTER TABLE changed answers 500 with 0A000 once, then 200 on the same
 //     backend, twice (the type changed and changed back), so preparing the
 //     text again does not collide with the statements left on the server;
+//   - oversized result: on one slot, an INSERT ... RETURNING within
+//     Query.maxResultBytes answers its rows; one over it answers 500 with
+//     54000, the session is closed, the statement took effect wholly or not
+//     at all (its outcome is unknown to the server), and the next query
+//     answers 200 on a fresh session;
 //   - database down: queries answer 503 while it is stopped, 200 once started;
 //   - shutdown: SIGTERM with a query waiting lets it finish, then the server
 //     exits with status 0 after printing "stopped".
@@ -379,6 +384,48 @@ func testSchemaChange() {
 	s.stop("schema change")
 }
 
+// awaitNoBackends returns once lsrv has no backend left. It reads
+// pg_stat_activity: PostgreSQL, an external producer, sends no event for
+// this. Bounded in reads.
+func awaitNoBackends(c *pgx.Conn) bool {
+	for i := 0; i < 100000; i++ {
+		if backends(c) == 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func count(c *pgx.Conn, sql string) int {
+	var k int
+	if err := c.QueryRow(ctx, sql).Scan(&k); err != nil {
+		panic(err)
+	}
+	return k
+}
+
+func testOversized() {
+	c := connect()
+	run(c, "DROP TABLE IF EXISTS big")
+	run(c, "CREATE TABLE big (v text)")
+	s := start("1", "--pg-conns", "1", "--trace")
+	expect("oversized: within the bound", get("/insert?n=10"), 200, "10")
+	expect("oversized: over the bound", get("/insert?n=2000"), 500, "database error 54000\n")
+	s.await("oversized: the session closed", 1, func(l string) bool { return l == "pg closed" })
+	// The server ends the statement's backend (an error writing to the
+	// closed connection) or it finishes first; either way it is atomic.
+	if !awaitNoBackends(c) {
+		fail("oversized: the closed session's backend never ended")
+	}
+	if n := count(c, "SELECT count(*) FROM big"); n != 10 && n != 2010 {
+		fail("oversized: %d rows in big, want 10 (rolled back) or 2010 (committed)", n)
+	}
+	expect("oversized: the next query", get("/db?id=42"), 200, world42)
+	run(c, "DROP TABLE big")
+	c.Close(ctx)
+	s.stop("oversized")
+}
+
 func testDown() {
 	s := start("1", "--pg-conns", "2")
 	expect("down: before", get("/db?id=42"), 200, world42)
@@ -420,7 +467,7 @@ func main() {
 	}{
 		{"results", testResults}, {"slow query", testSlowQuery}, {"exhaustion", testExhaustion},
 		{"restart", testRestart}, {"errors", testErrors},
-		{"schema change", testSchemaChange}, {"down", testDown}, {"shutdown", testShutdown},
+		{"schema change", testSchemaChange}, {"oversized", testOversized}, {"down", testDown}, {"shutdown", testShutdown},
 	} {
 		before := failures
 		t.run()

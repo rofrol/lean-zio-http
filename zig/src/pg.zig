@@ -9,8 +9,10 @@
 // Rules the code below keeps:
 // - Every query gets exactly one result: rows, PostgreSQL's error, or a
 //   pool error (`08006` when the connection was lost or could not be made,
-//   `54000` for a query that cannot be sent). A query is never retried: once
-//   it may have reached the server, losing the connection fails it.
+//   `54000` for a query that cannot be sent or whose result crossed
+//   Query.maxResultBytes, which closes its session). A query is never
+//   retried: once it may have reached the server, losing the connection or
+//   closing its session fails it.
 // - Waiters wait in FIFO order when no connection is idle (pool exhaustion,
 //   or a connect in flight); each waiter has at most one query
 //   (Conn.step_query), so the queue is bounded by the loop's connections.
@@ -49,6 +51,10 @@ extern fn ekk_pg_flush(c: *Session) c_int;
 extern fn ekk_pg_consume(c: *Session) c_int;
 extern fn ekk_pg_collect(c: *Session, acc: *Lean) c_int;
 extern fn ekk_query_drop(q: Lean) void;
+/// Whether the process's libpq is one the pool supports (pg.c: 14.6, 15.1,
+/// or 16 and later), and its version (PQlibVersion).
+pub extern fn ekk_pg_libpq_supported() c_int;
+pub extern fn ekk_pg_libpq_version() c_int;
 
 /// What waits for a query: embedded in the asking connection. `deliver`
 /// receives the result (owned) and may submit the waiter's next query at once.
@@ -278,8 +284,9 @@ pub const Slot = struct {
         self.acc = null;
         self.waiter = null;
         if (rc < 0) {
-            // COPY, a transaction left open, a lost connection or too many
-            // stale statements (pg.c): the session serves no other query.
+            // COPY, a transaction left open, a result over the bound, a lost
+            // connection or too many stale statements (pg.c): the session
+            // serves no other query.
             self.teardown();
         } else {
             self.state = .idle;

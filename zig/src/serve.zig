@@ -606,6 +606,10 @@ export fn ekk_serve(port: u16, threads: u32, maxc: u32, conninfo: *anyopaque, co
     if (threads == 0 or maxc == 0) return 1;
     pg_conninfo = ekk_string_cstr(conninfo);
     pg_conns = conns;
+    if (conns > 0 and pg.ekk_pg_libpq_supported() == 0) {
+        std.debug.print("libpq {d} is not supported: the PostgreSQL pool needs libpq 14.6, 15.1, or 16 and later\n", .{pg.ekk_pg_libpq_version()});
+        return 1;
+    }
     testing = .{ .chunk = chunk, .fail_every = fail_every, .trace = trace != 0, .crash_after_recv = crash_recv, .crash_after_send = crash_send };
     max_conns = maxc;
     // Each database connection holds libpq's socket and the loop's duplicate.

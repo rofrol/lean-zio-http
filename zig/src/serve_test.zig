@@ -125,6 +125,12 @@ export fn ekk_answer(_: *serve.State, _: ?*anyopaque, _: [*]u8, _: usize, _: *se
 export fn ekk_string_cstr(_: *anyopaque) [*:0]const u8 {
     @panic("ekk_string_cstr: only ekk_serve calls it");
 }
+export fn ekk_pg_libpq_supported() c_int {
+    @panic("ekk_pg_libpq_supported: only ekk_serve calls it");
+}
+export fn ekk_pg_libpq_version() c_int {
+    @panic("ekk_pg_libpq_version: only ekk_serve calls it");
+}
 export fn ekk_thread_init() void {}
 export fn ekk_thread_fini() void {}
 export fn ekk_stop_signals() c_int {

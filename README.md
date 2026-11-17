@@ -93,7 +93,9 @@ only `Server.Query` values.
   owner the callback is the last thing the loop does with it. Each loop
   also owns a PostgreSQL pool (`src/pg.zig`, section "PostgreSQL"). The
   library needs libpq's headers (`-Dpq-include`) and the servers link
-  `-lpq`.
+  `-lpq`: libpq 14.6, 15.1, or 16 and later (pipeline mode, and single-row
+  mode reset after each pipelined query); a server with `--pg` exits with
+  status 1 at startup when the libpq it runs is older.
 - Command line: `lsrv [THREADS] [--port N] [--max-conns N] [--pg CONNINFO]
   [--pg-conns N]` (`--pg-conns`, default 4, is per loop; without `--pg` no
   pool is made and every query fails with `08006`), then the test settings:
@@ -271,10 +273,18 @@ else meanwhile; the loop serves its other connections (`Conn.step_query`,
   its SQLSTATE, or a pool error: `08006` when the connection could not be
   made or was lost (also for a query in flight when the server restarts),
   `54000` for a query that cannot be sent (a NUL byte, more than 65,535
-  parameters) or a result over `Query.maxResultBytes` (1 MiB, charged
-  before the result is built for every object of its Lean value: each row
-  and field, `NULL` and empty ones included, and each string with its
-  header). A
+  parameters), which did not run, or a result over `Query.maxResultBytes`
+  (1 MiB, charged for every object of its Lean value before it is built:
+  each row and field, `NULL` and empty ones included, and each string with
+  its header). Rows are received one at a time (libpq's single-row mode)
+  and charged as they arrive; at the row that crosses the bound the rows
+  gathered are released, the query is answered `54000` once and its
+  session is closed without reading the rest. So, as for `08006`, whether
+  the statement took effect is unknown (a write with a large `RETURNING`
+  may have been committed, or rolled back when the server noticed the
+  closed connection; effects outside transactions, such as sequences,
+  stay), the message says so, and the query is not to be retried on its
+  own. A
   query is never retried: once it may have reached the server, a lost
   connection fails it, and its outcome is unknown (a write may have been
   committed); the next query opens a fresh connection. Likewise a process
@@ -315,14 +325,25 @@ else meanwhile; the loop serves its other connections (`Conn.step_query`,
   COPY in and out, a transaction left open, a connection lost mid-reply,
   cached statements going stale (`0A000` from `RevalidateCachedQuery` and
   `26000` forget the statement, another `0A000` keeps it, a failed
-  transaction still closes the session, 64 stale statements close it).
-  `bench/dbcheck` changes a column's type under a cached statement and back.
+  transaction still closes the session, 64 stale statements close it), and
+  single-row collection: after every piece the rows held are exactly the
+  rows received (first use, cached and unnamed executions), zero rows keep
+  their columns, rows then an error answer the error, a result at exactly
+  the bound is answered, and one byte over it, or a single field over it,
+  ends the session at the row that crosses it.
+  `bench/dbcheck` changes a column's type under a cached statement and back,
+  and runs an `INSERT ... RETURNING` over the bound (`54000`, the session
+  closed, the insert wholly applied or not at all).
   A chain of queries that fail synchronously, each asked again from its
   error, runs entirely inside the `submit` that started it: the loop serves
   nothing else until the chain ends.
-- **Not bounded yet:** libpq gathers a whole result before the size check,
-  so a query returning more than 1 MiB costs that memory until it is
-  refused; a query or a connection attempt has no deadline, so a stuck
+- **Bounded only in part:** the pool gathers at most `Query.maxResultBytes`
+  of a result, but libpq takes in a whole protocol message before the pool
+  sees it, so one row larger than the bound costs its full size (in libpq's
+  input buffer and again in its result) before the session is closed, and
+  libpq's input buffer keeps the size of the largest message a session
+  received until the session is closed. **Not bounded yet:** a query or a
+  connection attempt has no deadline, so a stuck
   database holds connections, and shutdown, until it answers.
 
 Measured by `bench.sh` (M1, 2026-11-16, 8 loops with 4 connections each
@@ -404,8 +425,8 @@ action constructors, tens of bytes each):
   8,192 bytes, plus the `Server.Query` and continuation the handler built
   (bounded by what it builds), and while the continuation turns it into the
   answer a result whose Lean value costs at most `Query.maxResultBytes`
-  (counted with object headers; libpq's copy of it, freed once the value is
-  built, comes on top).
+  (counted with object headers; libpq's buffers are the pool session's,
+  section "PostgreSQL", "Bounded only in part").
 
 These count the arrays the connection's state holds; a copy of buffer bytes
 that the adapter keeps is the adapter's (below). Allocations made and
