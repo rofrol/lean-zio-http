@@ -13,7 +13,8 @@
    (lean/Server/Query.lean). Layouts: Query is a structure, constructor 0 with
    fields sql, params; Option: none = box(0), some = constructor 1 with one
    field; Result.rows = constructor 0 (columns, rows), Result.error =
-   constructor 1 (sqlstate, message). */
+   constructor 1 (sqlstate, message), Result.abandoned = constructor 2
+   (sqlstate, message). */
 
 /* Query.maxResultBytes in Server/Query.lean; lsrv-test (Test.lean,
    resultBoundAgrees) reads the line below and fails when the two differ.
@@ -23,12 +24,19 @@
 
 void ekk_query_drop(lean_object *q) { lean_dec(q); }
 
-lean_object *ekk_pg_error(const char *sqlstate, const char *message) {
-    lean_object *r = lean_alloc_ctor(1, 2, 0);
+static lean_object *failure(unsigned tag, const char *sqlstate, const char *message) {
+    lean_object *r = lean_alloc_ctor(tag, 2, 0);
     lean_ctor_set(r, 0, lean_mk_string(sqlstate));
     lean_ctor_set(r, 1, lean_mk_string(message ? message : ""));
     return r;
 }
+
+/* Result.error: the statement failed or did not run. */
+lean_object *ekk_pg_error(const char *sqlstate, const char *message) { return failure(1, sqlstate, message); }
+
+/* Result.abandoned: the pool gave the statement up after it may have
+   reached the database, so its outcome is unknown. */
+lean_object *ekk_pg_abandoned(const char *sqlstate, const char *message) { return failure(2, sqlstate, message); }
 
 /* A pool slot's session: the libpq connection, in non-blocking pipeline mode,
    and the statements prepared on it. Each Query.sql gets a named statement
@@ -422,8 +430,9 @@ static lean_object *error_of(PGresult *r) {
     return ekk_pg_error(st ? st : "XX000", PQresultErrorMessage(r));
 }
 
-/* The answer to a result that crossed Query.maxResultBytes: the session is
-   closed before the statement's end, so whether it took effect is unknown. */
+/* The message of the answer to a result that crossed Query.maxResultBytes
+   (Result.abandoned): the session is closed before the statement's end, so
+   whether it took effect is unknown. */
 #define EKK_TOO_BIG "the result exceeds Query.maxResultBytes; the session was closed before the statement ended, so whether it took effect is unknown"
 
 /* Collects the results that have arrived, without blocking, until the
@@ -436,9 +445,9 @@ static lean_object *error_of(PGresult *r) {
    (*acc is complete), 0 when more input is needed, -1 when the session
    must be closed, with *acc the query's result: an error when the
    connection failed, the statement started COPY, which this pool does not
-   speak, it left a transaction open, or its rows crossed
-   Query.maxResultBytes (54000, EKK_TOO_BIG: the rows gathered are
-   released, the rest is never read); the query's own result when the
+   speak, or it left a transaction open; Result.abandoned 54000
+   (EKK_TOO_BIG) when its rows crossed Query.maxResultBytes (the rows
+   gathered are released, the rest is never read); the query's own result when the
    session holds EKK_STATEMENTS stale statements. */
 int ekk_pg_collect(ekk_pg *p, lean_object **acc) {
     while (!PQisBusy(p->c)) {
@@ -488,7 +497,7 @@ int ekk_pg_collect(ekk_pg *p, lean_object **acc) {
                 PQclear(r);
                 rows_drop(&p->rows);
                 if (*acc) lean_dec(*acc);
-                *acc = ekk_pg_error("54000", EKK_TOO_BIG);
+                *acc = ekk_pg_abandoned("54000", EKK_TOO_BIG);
                 return -1;
             }
             /* A single row is followed by more, or by the zero-row

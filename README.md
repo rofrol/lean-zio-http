@@ -323,21 +323,26 @@ else meanwhile; the loop serves its other connections (`Conn.step_query`,
   Parameters and results are text; one statement per query.
 - **Results and errors.** Every query is answered exactly once: rows (text
   values, `none` for NULL, invalid UTF-8 replaced), PostgreSQL's error with
-  its SQLSTATE, or a pool error: `08006` when the connection could not be
-  made or was lost (also for a query in flight when the server restarts),
-  `54000` for a query that cannot be sent (a NUL byte, more than 65,535
-  parameters), which did not run, or a result over `Query.maxResultBytes`
-  (1 MiB, charged for every object of its Lean value before it is built:
-  each row and field, `NULL` and empty ones included, and each string with
-  its header). Rows are received one at a time (libpq's single-row mode)
-  and charged as they arrive; at the row that crosses the bound the rows
-  gathered are released, the query is answered `54000` once and its
-  session is closed without reading the rest. So, as for `08006`, whether
-  the statement took effect is unknown (a write with a large `RETURNING`
-  may have been committed, or rolled back when the server noticed the
-  closed connection; effects outside transactions, such as sequences,
-  stay), the message says so, and the query is not to be retried on its
-  own. A
+  its SQLSTATE, a pool error (`Query.Result.error`): `08006` when the
+  connection could not be made or was lost (also for a query in flight
+  when the server restarts), `54000` for a query that cannot be sent (a
+  NUL byte, more than 65,535 parameters), which did not run; or the query
+  abandoned (`Query.Result.abandoned`), now only for a result over
+  `Query.maxResultBytes` (1 MiB, charged for every object of its Lean
+  value before it is built: each row and field, `NULL` and empty ones
+  included, and each string with its header), with SQLSTATE `54000`. Rows
+  are received one at a time (libpq's single-row mode) and charged as they
+  arrive; at the row that crosses the bound the rows gathered are
+  released, the query is answered `abandoned "54000"` once and its session
+  is closed without reading the rest. So whether the statement took effect
+  is unknown (a write with a large `RETURNING` may have been committed, or
+  rolled back when the server noticed the closed connection; effects
+  outside transactions, such as sequences, stay). `abandoned` says that
+  structurally, so a caller need not read the message; it promises no
+  rollback and never authorizes sending the statement again, which only
+  the caller's own means (an idempotent statement, a key it checks) can
+  make safe. An `error` does not prove the opposite: a lost connection
+  (`08006`) may also have an unknown outcome. A
   query is never retried: once it may have reached the server, a lost
   connection fails it, and its outcome is unknown (a write may have been
   committed); the next query opens a fresh connection. Likewise a process
@@ -349,7 +354,8 @@ else meanwhile; the loop serves its other connections (`Conn.step_query`,
   in flight, and a flood of requests is answered from it rather than with
   a connect each; there are no timers, backoff or circuit breaker, so this
   bounds concurrent connects, not their rate while the database stays down.
-  `App.Db` answers class 08 with 503 and other errors with 500.
+  `App.Db` answers class 08 with 503, other errors with 500, and an
+  abandoned query with 500 and `outcome unknown` in its body.
 - **Liveness.** An idle connection keeps its receive armed, so a connection
   the server closed is ended when the loop handles its EOF. This is best
   effort: a query the loop dispatches before handling the EOF fails with
@@ -383,10 +389,12 @@ else meanwhile; the loop serves its other connections (`Conn.step_query`,
   rows received (first use, cached and unnamed executions), zero rows keep
   their columns, rows then an error answer the error, a result at exactly
   the bound is answered, and one byte over it, or a single field over it,
-  ends the session at the row that crosses it.
+  ends the session at the row that crosses it, answered `abandoned`
+  (constructor 2), while a query with a NUL character is an `error 54000`
+  (constructor 1) that sends nothing.
   `bench/dbcheck` changes a column's type under a cached statement and back,
-  and runs an `INSERT ... RETURNING` over the bound (`54000`, the session
-  closed, the insert wholly applied or not at all).
+  and runs an `INSERT ... RETURNING` over the bound (abandoned with
+  `54000`, the session closed, the insert wholly applied or not at all).
   A chain of queries that fail synchronously, each asked again from its
   error, runs entirely inside the `submit` that started it: the loop serves
   nothing else until the chain ends.

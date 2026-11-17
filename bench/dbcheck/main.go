@@ -22,9 +22,10 @@
 //     backend, twice (the type changed and changed back), so preparing the
 //     text again does not collide with the statements left on the server;
 //   - oversized result: on one slot, an INSERT ... RETURNING within
-//     Query.maxResultBytes answers its rows; one over it answers 500 with
-//     54000, the session is closed, the statement took effect wholly or not
-//     at all (its outcome is unknown to the server), and the next query
+//     Query.maxResultBytes answers its rows; one over it is abandoned
+//     (Query.Result.abandoned) and answers 500 with 54000 and "outcome
+//     unknown", the session is closed, the statement took effect wholly or
+//     not at all (its outcome is unknown to the server), and the next query
 //     answers 200 on a fresh session;
 //   - database down: queries answer 503 while it is stopped, 200 once started;
 //   - shutdown: SIGTERM with a query waiting lets it finish, then the server
@@ -410,7 +411,7 @@ func testOversized() {
 	run(c, "CREATE TABLE big (v text)")
 	s := start("1", "--pg-conns", "1", "--trace")
 	expect("oversized: within the bound", get("/insert?n=10"), 200, "10")
-	expect("oversized: over the bound", get("/insert?n=2000"), 500, "database error 54000\n")
+	expect("oversized: over the bound", get("/insert?n=2000"), 500, "database error 54000, outcome unknown\n")
 	s.await("oversized: the session closed", 1, func(l string) bool { return l == "pg closed" })
 	// The server ends the statement's backend (an error writing to the
 	// closed connection) or it finishes first; either way it is atomic.

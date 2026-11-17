@@ -21,12 +21,14 @@ randomnumber int)`, filled by bench.sh.
 - `GET /insert?n=N`: inserts N rows of 1,000 bytes into the table `big
   (v text)`, which bench/dbcheck creates, returning them, answered with the
   number of rows returned; past about 1,000 rows the result is over
-  `Query.maxResultBytes`, answered `database error 54000`.
+  `Query.maxResultBytes`, which the pool abandons (`Query.Result.abandoned`),
+  answered `database error 54000, outcome unknown`.
 - `GET /` and the rest: `App.Hello`, with no query.
 
 A failed query is answered 503 when the database could not be reached or the
 connection was lost (SQLSTATE class 08) and 500 otherwise, with the SQLSTATE
-as the body. -/
+as the body; an abandoned one (`Query.Result.abandoned`) is answered 500, its
+body adding `, outcome unknown`. -/
 
 namespace App.Db
 
@@ -40,6 +42,10 @@ def json (body : String) : Response :=
 
 def failed (sqlstate : String) : Response :=
   text (if sqlstate.startsWith "08" then 503 else 500) s!"database error {sqlstate}\n"
+
+/-- A query the pool abandoned: whether it took effect is unknown. -/
+def abandoned (sqlstate : String) : Response :=
+  text 500 s!"database error {sqlstate}, outcome unknown\n"
 
 /-- The value of `name` in the request-target's query, as sent. -/
 def param (target name : String) : Option String :=
@@ -55,11 +61,12 @@ def path (target : String) : String := (target.splitOn "?").headD target
 /-- The first field of the first row, if any. -/
 def first : Query.Result → Option (Option String)
   | .rows _ rows => rows[0]? >>= (·[0]?)
-  | .error .. => none
+  | .error .. | .abandoned .. => none
 
 def world (id : Nat) : Await Response := do
   match ← Await.run { sql := "SELECT id, randomnumber FROM world WHERE id = $1", params := #[some (toString id)] } with
   | .error st _ => pure (failed st)
+  | .abandoned st _ => pure (abandoned st)
   | .rows _ rows =>
     match rows[0]? with
     | some #[some i, some n] => pure (json s!"\{\"id\":{i},\"randomNumber\":{n}}")
@@ -68,26 +75,31 @@ def world (id : Nat) : Await Response := do
 def chain : Await Response := do
   match ← Await.run { sql := "SELECT 1" } with
   | .error st _ => pure (failed st)
+  | .abandoned st _ => pure (abandoned st)
   | r@(.rows ..) =>
     match ← Await.run { sql := "SELECT $1::int + 1", params := #[(first r).join] } with
     | .error st _ => pure (failed st)
+    | .abandoned st _ => pure (abandoned st)
     | r2 => pure (text 200 (((first r2).join).getD "null"))
 
 def lock (key : Nat) : Await Response := do
   match ← Await.run { sql := "SELECT pg_advisory_xact_lock_shared($1)", params := #[some (toString key)] } with
   | .error st _ => pure (failed st)
+  | .abandoned st _ => pure (abandoned st)
   | .rows .. => pure (text 200 "released")
 
 /-- One query whose first field is the answer. -/
 def single (q : Query) : Await Response := do
   match ← Await.run q with
   | .error st _ => pure (failed st)
+  | .abandoned st _ => pure (abandoned st)
   | r => pure (text 200 (((first r).join).getD "null"))
 
 def insert (n : Nat) : Await Response := do
   match ← Await.run { sql := "INSERT INTO big (v) SELECT repeat('x', 1000) FROM generate_series(1, $1::int) RETURNING v",
                       params := #[some (toString n)] } with
   | .error st _ => pure (failed st)
+  | .abandoned st _ => pure (abandoned st)
   | .rows _ rows => pure (text 200 (toString rows.size))
 
 def app : Handler := fun r =>

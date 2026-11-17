@@ -432,6 +432,15 @@ def queryScenario : Check Unit := do
   let (_, a6) := Conn.step h 0 s5 (.answered (.error "08006" "lost"))
   let some (resp3, _) ← expectSend "query: a lost connection" a6 | return
   if statusLine resp3 != "HTTP/1.1 503 Service Unavailable" then fail s!"query: a lost connection answered {statusLine resp3}"
+  -- An abandoned query (its outcome unknown) reaches the handler as itself,
+  -- at either query of `/chain`: 500 saying so, never a result.
+  let (c1, _) := Conn.step h 0 (Conn.initial h) (.received (bytes req))
+  let (c2, _) := Conn.step h 0 c1 (.answered (.rows #["?column?"] #[#[some "1"]]))
+  for (what, s) in [("the first query", c1), ("the second query", c2)] do
+    let (_, a) := Conn.step h 0 s (.answered (.abandoned "54000" "the result exceeds Query.maxResultBytes"))
+    let some (r, _) ← expectSend s!"query: {what} abandoned" a | return
+    if statusLine r != "HTTP/1.1 500 Internal Server Error" || !(String.fromUTF8! r).endsWith "\r\n\r\ndatabase error 54000, outcome unknown\n" then
+      fail s!"query: {what} abandoned answered {repr (String.fromUTF8! r)}"
   expectClose "query: a failure while querying" (Conn.step h 0 s5 .failed).2
   -- An answer out of place (no query asked) closes.
   expectClose "query: an answer while reading" (Conn.step h 0 (Conn.initial h) (.answered (.rows #[] #[]))).2
@@ -475,14 +484,14 @@ def sameStep : Await Dated → Await Dated → Bool
 
 /-- Two answers alike: the same kind, bytes consumed and response bytes; a
 query's continuation is a function, compared by the query it asks and by its
-first step on a row, on no rows and on an error. -/
+first step on a row, on no rows, on an error and on an abandoned query. -/
 def sameReply : Reply → Reply → Bool
   | .needMore a, .needMore b => a == b
   | .continue a, .continue b => a == b
   | .respond n a, .respond m b => n == m && sameDated a b
   | .await n q k, .await m r l =>
     n == m && q.sql == r.sql && q.params == r.params &&
-      [Query.Result.rows #["id", "randomnumber"] #[#[some "42", some "7"]], .rows #[] #[], .error "08006" "lost"].all
+      [Query.Result.rows #["id", "randomnumber"] #[#[some "42", some "7"]], .rows #[] #[], .error "08006" "lost", .abandoned "54000" "over"].all
         fun res => sameStep (k res) (l res)
   | _, _ => false
 

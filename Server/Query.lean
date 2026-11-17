@@ -15,7 +15,8 @@ may be seen by later queries of any request; a query must not change it, nor
 deallocate prepared statements (`DEALLOCATE`, `DISCARD ALL`), which the pool
 caches per session. A query is never retried by the server: when its
 connection is lost, its answer is an error, and whether it took effect is
-unknown. -/
+unknown; a query the pool gives up on after it may have reached the
+database is answered `abandoned` (`Query.Result`). -/
 
 namespace Server
 
@@ -35,19 +36,28 @@ inductive Query.Result where
   /-- The statement failed or did not run. `sqlstate` is PostgreSQL's error
   code; the pool's own failures use class 08 (connection exception: `08006`
   when the connection was lost or could not be made, so the statement may or
-  may not have run), `54000` and `25000` (the statement left a transaction
-  open, which closing its session rolled back). `54000` is either a query the
-  pool cannot send, which did not run, or a result over
-  `Query.maxResultBytes`: the pool closes the session at the row that crosses
-  the bound, before the statement's end, so as for `08006` whether it took
-  effect is unknown (a write may have been committed or rolled back), and it
-  is not to be retried on its own; the message says which. -/
+  may not have run), `54000` (a query the pool cannot send: a NUL character,
+  more than 65,535 parameters; it did not run) and `25000` (the statement
+  left a transaction open, which closing its session rolled back). An
+  `error` does not establish that the statement had no effect, nor that
+  sending it again is safe: class 08 may have an unknown outcome as well
+  (only `abandoned` says so structurally). -/
   | error (sqlstate : String) (message : String)
+  /-- The pool abandoned the statement after it may have reached the
+  database, and closed its session before the statement's end, so whether
+  it took effect is unknown: a write may have been committed or rolled back,
+  and effects outside transactions (sequences) may stay. The server
+  promises no rollback, and this answer never authorizes sending the
+  statement again: a caller that does so needs its own means (an
+  idempotent statement, a key it checks) to know that is safe. `sqlstate`
+  and `message` say why: `54000` for a result over `Query.maxResultBytes`
+  (the pool stops at the row that crosses the bound). -/
+  | abandoned (sqlstate : String) (message : String)
   deriving Inhabited
 
 /-- Most bytes the Lean value of a `rows` result may cost, a larger one
-becomes `error "54000"`, whose statement's outcome is unknown
-(`Query.Result.error`). The pool receives rows one at a time and charges
+becomes `abandoned "54000"`, whose statement's outcome is unknown
+(`Query.Result.abandoned`). The pool receives rows one at a time and charges
 each before building it, as a conservative count of the objects it
 allocates: the result, each column name, each row (one slot per field, so a
 `NULL` or empty value costs its slot) and each value's `some` and string,

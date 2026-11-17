@@ -9,8 +9,9 @@
 // Rules the code below keeps:
 // - Every query gets exactly one result: rows, PostgreSQL's error, or a
 //   pool error (`08006` when the connection was lost or could not be made,
-//   `54000` for a query that cannot be sent or whose result crossed
-//   Query.maxResultBytes, which closes its session). A query is never
+//   `54000` for a query that cannot be sent), or the query abandoned
+//   (`Result.abandoned` `54000`: its result crossed Query.maxResultBytes,
+//   which closes its session, so its outcome is unknown). A query is never
 //   retried: once it may have reached the server, losing the connection or
 //   closing its session fails it.
 // - Waiters wait in FIFO order when no connection is idle (pool exhaustion,

@@ -41,13 +41,13 @@ static PGresult *bounded_get_result(PGconn *c) {
 #undef PQgetResult
 
 /* A whole PGresult's rows as Result.rows, through the same rows_take
-   that collect gives each single row, or 54000 when they cost more than
-   `limit`. */
+   that collect gives each single row, or Result.abandoned 54000 (as
+   collect answers) when they cost more than `limit`. */
 static lean_object *rows_within(PGresult *r, size_t limit) {
     ekk_rows b = {0};
     if (!rows_take(&b, r, limit)) {
         rows_drop(&b);
-        return ekk_pg_error("54000", "over the limit");
+        return ekk_pg_abandoned("54000", "over the limit");
     }
     return rows_finish(&b);
 }
@@ -337,12 +337,20 @@ static int reply(ekk_pg *p, fake *f, msgs *m, enum piece how, lean_object **acc,
     return rc;
 }
 
-static void expect_error(lean_object *r, const char *sqlstate) {
-    CHECK(r != NULL && lean_ptr_tag(r) == 1, "expected error %s, got %s", sqlstate, r ? "rows" : "nothing");
+/* A Result.error (tag 1) or Result.abandoned (tag 2) with `sqlstate`. */
+static void expect_failure(lean_object *r, unsigned tag, const char *sqlstate) {
+    static const char *const kinds[] = {"rows", "error", "abandoned"};
+    unsigned got_tag = r ? lean_ptr_tag(r) : 3;
+    CHECK(got_tag == tag, "expected %s %s, got %s", kinds[tag], sqlstate, got_tag < 3 ? kinds[got_tag] : "nothing");
     const char *got = lean_string_cstr(lean_ctor_get(r, 0));
-    CHECK(strcmp(got, sqlstate) == 0, "expected error %s, got %s: %s", sqlstate, got, lean_string_cstr(lean_ctor_get(r, 1)));
+    CHECK(strcmp(got, sqlstate) == 0, "expected %s %s, got %s: %s", kinds[tag], sqlstate, got, lean_string_cstr(lean_ctor_get(r, 1)));
     lean_dec(r);
 }
+
+static void expect_error(lean_object *r, const char *sqlstate) { expect_failure(r, 1, sqlstate); }
+
+/* The pool abandoned the statement: its outcome is unknown. */
+static void expect_abandoned(lean_object *r, const char *sqlstate) { expect_failure(r, 2, sqlstate); }
 
 /* Rows: the column names joined by ',' and the first row's values. */
 static void expect_rows(lean_object *r, const char *col, const char *value) {
@@ -551,6 +559,37 @@ static void ending(enum piece how, const char *name, const char *sql, char last,
     fake_close(&f);
 }
 
+/* A query the pool cannot send (a NUL character in its SQL or in a
+   parameter) did not run: it is a Result.error 54000, never abandoned, and
+   nothing reaches the server. */
+static void unsendable(void) {
+    fake f;
+    fake_open(&f);
+    ekk_pg *p = connect_fake(&f);
+    for (int in_param = 0; in_param <= 1; in_param++) {
+        current = in_param ? "unsendable: a NUL character in a parameter" : "unsendable: a NUL character in the SQL";
+        lean_object *q = query(SQL_A, in_param ? "" : NULL);
+        lean_object *bad = lean_mk_string_from_bytes("a\0b", 3);
+        if (in_param) {
+            lean_object *params = lean_ctor_get(q, 1);
+            lean_object *some = lean_array_get_core(params, 0);
+            lean_dec(lean_ctor_get(some, 0));
+            lean_ctor_set(some, 0, bad);
+        } else {
+            lean_dec(lean_ctor_get(q, 0));
+            lean_ctor_set(q, 0, bad);
+        }
+        lean_object *err = NULL;
+        CHECK(ekk_pg_send(p, q, &err) == 1, "a query with a NUL character was sent");
+        CHECK(ekk_pg_flush(p) == 0, "ekk_pg_flush left output");
+        uint8_t in[64];
+        CHECK(take_input(&f, in, sizeof in) == 0, "the client sent bytes for an unsendable query");
+        expect_error(err, "54000");
+    }
+    finish(p, &f);
+    fake_close(&f);
+}
+
 /* The server's connection ends in the middle of a reply: the query fails
    with 08006, through consume (pg.zig's `lost`) or collect. */
 static void cut(enum piece how) {
@@ -617,7 +656,7 @@ static lean_object *rows_by_row(int nf, const char *const *cols, int nt, value_f
         PQclear(r);
         if (!ok) {
             rows_drop(&b);
-            return ekk_pg_error("54000", "over the limit");
+            return ekk_pg_abandoned("54000", "over the limit");
         }
     }
     return rows_finish(&b);
@@ -743,7 +782,7 @@ static void cost_bound(void) {
     /* Mixed values 0 to 3 (NULL, empty, ASCII, multibyte): all valid, so
        charged as built. */
     expect_rows_count(rows_within(r, c), 3);
-    expect_error(rows_within(r, c - 1), "54000");
+    expect_abandoned(rows_within(r, c - 1), "54000");
     PQclear(r);
 
     current = "result cost: row by row, the same exact bound";
@@ -751,7 +790,7 @@ static void cost_bound(void) {
     CHECK(lean_ptr_tag(res) == 0 && built_cost(res) == c, "row by row costs %zu, whole %zu", built_cost(res), c);
     lean_dec(res);
     expect_rows_count(rows_by_row(2, cols, 3, mixed_value, c), 3);
-    expect_error(rows_by_row(2, cols, 3, mixed_value, c - 1), "54000");
+    expect_abandoned(rows_by_row(2, cols, 3, mixed_value, c - 1), "54000");
     current = "result cost: row by row, many rows copied to their exact size";
     res = rows_by_row(2, cols, 35, valid_value, SIZE_MAX - 1);
     c = built_cost(res);
@@ -759,14 +798,14 @@ static void cost_bound(void) {
           lean_array_capacity(lean_ctor_get(res, 1)));
     lean_dec(res);
     expect_rows_count(rows_by_row(2, cols, 35, valid_value, c), 35);
-    expect_error(rows_by_row(2, cols, 35, valid_value, c - 1), "54000");
+    expect_abandoned(rows_by_row(2, cols, 35, valid_value, c - 1), "54000");
 
     current = "result cost: invalid UTF-8 charged at least as built";
     r = made(2, cols, 3 * MIXED_ROWS, mixed_value);
     res = rows_within(r, SIZE_MAX - 1);
     c = built_cost(res);
     lean_dec(res);
-    expect_error(rows_within(r, c - 1), "54000");
+    expect_abandoned(rows_within(r, c - 1), "54000");
     PQclear(r);
 
     current = "result cost: each invalid byte replaced, charged as built";
@@ -775,7 +814,7 @@ static void cost_bound(void) {
     c = built_cost(res);
     lean_dec(res);
     expect_rows_count(rows_within(r, c), 1);
-    expect_error(rows_within(r, c - 1), "54000");
+    expect_abandoned(rows_within(r, c - 1), "54000");
     PQclear(r);
 
     /* At Query.maxResultBytes, 22,000 rows of one NULL (40 bytes each and a
@@ -783,11 +822,11 @@ static void cost_bound(void) {
        its string) are over the bound, though they hold no text. */
     current = "result cost: many NULLs over Query.maxResultBytes";
     r = made(1, cols, 22000, null_value);
-    expect_error(rows_of(r), "54000");
+    expect_abandoned(rows_of(r), "54000");
     PQclear(r);
     current = "result cost: many empty strings over Query.maxResultBytes";
     r = made(1, cols, 22000, empty_value);
-    expect_error(rows_of(r), "54000");
+    expect_abandoned(rows_of(r), "54000");
     PQclear(r);
     current = "result cost: many NULLs within Query.maxResultBytes";
     r = made(1, cols, 21000, null_value);
@@ -834,13 +873,14 @@ static size_t end_of(msgs *m, char t, int k) {
 }
 
 /* The query's rows crossed the bound at byte `at` of the reply, which
-   ends there: 54000, the rows gathered released, the session to close. */
+   ends there: abandoned with 54000 (its outcome unknown), the rows
+   gathered released, the session to close. */
 static void expect_overflow(ekk_pg *p, int rc, lean_object *acc, size_t at, size_t crossed) {
     CHECK(rc == -1, "collect returned %d over the bound", rc);
     CHECK(at == crossed, "the bound ended the reply at byte %zu, not at the row that crossed it (%zu)", at, crossed);
     CHECK(rows_held(p) == 0 && p->rows.cols == NULL, "rows still held after the bound");
     CHECK(strstr(lean_string_cstr(lean_ctor_get(acc, 1)), "unknown") != NULL, "the message does not say the outcome is unknown");
-    expect_error(acc, "54000");
+    expect_abandoned(acc, "54000");
 }
 
 /* Rows arrive one at a time (reply() checks how many are held after each
@@ -990,6 +1030,8 @@ int main(void) {
     cost_overflow();
     cost_bound();
     printf("pg_glue_test: result cost: ok\n");
+    unsendable();
+    printf("pg_glue_test: unsendable queries: ok\n");
     for (enum piece how = WHOLE; how <= BYTE; how++) {
         usable_session(how);
         stale_statements(how);
