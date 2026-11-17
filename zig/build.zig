@@ -50,6 +50,20 @@ pub fn build(b: *std.Build) void {
     const serve_tests = b.addTest(.{ .root_module = serve_mod });
     test_step.dependOn(&b.addRunArtifact(serve_tests).step);
 
+    // `zig build cleanup-controls`: serve_test.zig's tests after two negative
+    // controls of Single.deinit (src/cleanup_controls_test.zig). It fails by
+    // design; ./cleanup-controls.sh runs it and checks how.
+    const controls_step = b.step("cleanup-controls", "Run the transport's tests after the cleanup's negative controls (fails by design; see ./cleanup-controls.sh)");
+    const controls_mod = b.createModule(.{
+        .root_source_file = b.path("src/cleanup_controls_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    controls_mod.addImport("zio", zio.module("zio"));
+    const controls_tests = b.addTest(.{ .root_module = controls_mod });
+    controls_step.dependOn(&b.addRunArtifact(controls_tests).step);
+
     const lean_lib = b.option([]const u8, "lean-lib", "Lean library directory, with libleanshared (tests)");
     const pq_lib = b.option([]const u8, "pq-lib", "libpq library directory (tests)");
     if (lean_lib == null or pq_lib == null) {

@@ -449,7 +449,7 @@ const Listener = struct {
     }
 
     /// A blocking client connected to the listener.
-    fn connect(self: *const Listener) !c.fd_t {
+    pub fn connect(self: *const Listener) !c.fd_t {
         const fd = switch (self.addr) {
             .tcp => socket(c.AF.INET, c.SOCK.STREAM, 0),
             .unix => socket(c.AF.UNIX, c.SOCK.STREAM, 0),
@@ -467,7 +467,7 @@ const Listener = struct {
 
 /// Waits until the kernel reports `fd` readable: a connection queued on a
 /// listening socket, or bytes (or an end of input) on a connection.
-fn awaitReadable(fd: c.fd_t) void {
+pub fn awaitReadable(fd: c.fd_t) void {
     var fds = [1]c.pollfd{.{ .fd = fd, .events = c.POLL.IN, .revents = 0 }};
     if (c.poll(&fds, 1, -1) != 1) @panic("poll for readiness failed");
 }
@@ -503,14 +503,14 @@ fn stopWrapped(loop: *ev.Loop, comp: *ev.Completion) void {
     stops += 1;
 }
 
-const Single = struct {
+pub const Single = struct {
     lp: serve.LoopCtx,
     listener: Listener,
     log: [64]Event = undefined,
     n: usize = 0,
 
     /// On a TCP listener on 127.0.0.1.
-    fn init(self: *Single, recv_room: usize) !void {
+    pub fn init(self: *Single, recv_room: usize) !void {
         return self.initOn(recv_room, .tcp);
     }
 
@@ -555,7 +555,9 @@ const Single = struct {
     /// failure: lib/compiler/test_runner.zig `log`, counted in
     /// `log_err_count`; Maker/Step/Run.zig "logged {d} errors", Zig 0.17.1).
     /// For a test that failed, the line only adds to what it printed.
-    fn deinit(self: *Single) void {
+    /// ./cleanup-controls.sh checks both outcomes; run it for every change
+    /// here and at each update of Zig.
+    pub fn deinit(self: *Single) void {
         var open: u32 = 0;
         var it = self.lp.head;
         while (it) |conn| : (it = conn.next) open += 1;
@@ -580,6 +582,7 @@ const Single = struct {
         }
         self.lp.loop.run() catch |err| std.debug.panic("Single.deinit could not run the loop to its end: {}", .{err});
         if (self.lp.head != null or serve.slots_used.load(.monotonic) != 0) @panic("Single.deinit left a connection or a slot behind");
+        if (open != 0 or slots != 0) std.log.warn("Single.deinit drained them", .{});
         self.lp.loop.deinit();
         self.listener.close();
         closeEvents();
@@ -610,7 +613,7 @@ const Single = struct {
 
     /// Polls the loop without blocking until `want` events of `kind` have
     /// arrived in all, at most `max_steps` polls.
-    fn stepUntil(self: *Single, kind: Kind, want: usize) !void {
+    pub fn stepUntil(self: *Single, kind: Kind, want: usize) !void {
         var step: usize = 0;
         while (true) : (step += 1) {
             self.collect();

@@ -885,6 +885,18 @@ the M1 (2026-11-17, 10 releases from 14.6 to 18.7) the first run, building
 every libpq, took 269 s, and a run on a warm cache 5 s; the cache holds
 81 MB, the checkout 596 MB.
 
+`./cleanup-controls.sh` checks the transport tests' cleanup
+(`Single.deinit` in `zig/src/serve_test.zig`) with two negative controls
+(`zig/src/cleanup_controls_test.zig`, run by `zig build cleanup-controls`):
+a test that fails with connections open must fail with its own error, its
+connections drained, and every test after it must pass; a test that passes
+but leaves a connection open must be reported for the leak it logged at
+error level (Zig 0.17.1's runner fails a passing test that logged an
+error). The script checks those reports by name and the test counts, so a
+compile error or any other failure fails it. It is opt-in, not part of
+`check.sh` (item znorfg): run it at each update of Zig and for every change
+to `Single.deinit`.
+
 `bench/boundary` starts the fixture server (`lsrv-fixture`, and
 `lsrv-fixture-hand` with `-no-continue`) with the test settings and checks:
 exact 60,001-byte responses through 7-byte operations, split and pipelined
