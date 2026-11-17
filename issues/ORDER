@@ -1,6 +1,7 @@
 ## Next, in order
 
 ytzycm Per-connection idle, read and write deadlines for the Lean HTTP server
+j3avm2 Set TCP_NODELAY on the listening socket, not on each accepted one (zio issue 926)
 ycpzlt Should Server.Query carry a structured "outcome unknown" signal for a query the server abandoned?
 3jnkx5 Deadlines for PostgreSQL queries, connection attempts and shutdown in the Lean server
 lgxdi7 Prepare the upstream question for mxzlsx (Std.Http H1 reparses an unfinished field line)
