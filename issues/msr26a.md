@@ -1,7 +1,0 @@
-Decide whether the per-connection bound counts the loop connection's malloc block, not its struct size
-
-Seen in item xlto7s (README.md "Memory", `bench/boundary -memsnap DIR`, M1, 2026-11-16, nine runs): the loop's connection is a 16,712-byte `Conn` (`@sizeOf`, Zig 0.17.1; zig/src/serve.zig `alloc.create(Conn)` with `std.heap.c_allocator`), and `heap -s` shows each one as a 20,480-byte block; the malloc zone grows 21.1 KiB resident per added connection. The stated bound and `perConnBound` in bench/boundary/main.go (`memory`, `memoryFull`) count 16,640 bytes for it, and the 2 KiB allowance for allocator and object headers does not cover the 3.8 KiB of the block's size class. A further 2.9 to 3.9 KiB per connection is a residual in Lean's mimalloc region that the snapshots do not attribute.
-
-Question: should this go into es53kx (capacities) as part of restating the bound with allocated sizes, and should `Conn` be shrunk to fit a smaller block (it is 328 bytes over 16 KiB; which block sizes the zone uses below 20,480 was not checked)? Options: fold into es53kx and restate the bound from allocated block sizes | shrink `Conn` to fit a smaller block | leave the bound as stated with the measured excess documented.
-
-Moved to Needs a decision by the coordinating session on 2026-11-16: restating the per-connection bound is a contract statement (the same reasoning as es53kx in consult round 20261116-145342-a8e2). Recommendation: fold into es53kx and restate the bound from allocated block sizes.
