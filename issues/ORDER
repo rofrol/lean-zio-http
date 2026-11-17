@@ -7,8 +7,8 @@ jqzv42 Decide whether to ask upstream for request-target count limits apart from
 4lmjda Collect PostgreSQL rows in chunks with libpq 17 as the minimum (xkkwcb)
 7mzw77 Accept that stale-statement recognition relies on PostgreSQL's undocumented source-function field
 ycpzlt Should Server.Query carry a structured "outcome unknown" signal for a query the server abandoned?
-u4moqo Move the toolchain to the first nightly with lean4 PR 16417 (Std.Http RFC fixes)
 ytzycm Per-connection idle, read and write deadlines for the Lean HTTP server
+u4moqo Move the toolchain to the first nightly with lean4 PR 16417 (Std.Http RFC fixes)
 3jnkx5 Deadlines for PostgreSQL queries, connection attempts and shutdown in the Lean server
 
 ## Proposed
