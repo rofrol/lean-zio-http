@@ -379,10 +379,15 @@ else meanwhile; the loop serves its other connections (`Conn.step_query`,
   is unknown (a write may have been committed); the next query opens a
   fresh connection. Likewise a process
   that ends after a query was sent leaves its outcome to PostgreSQL, as
-  for any client that disconnects. A connect that fails fails every query
-  waiting at that moment, each once with `08006`, also when other
-  connections of the pool are busy; a query submitted later starts the
-  next connect. So with the database down a loop has at most one connect
+  for any client that disconnects. A connect that fails (or reaches its
+  deadline) while no connection of the pool is busy fails every query
+  waiting at that moment, each once with `08006`; a query submitted later
+  starts the next connect. While connections are busy, the queries waiting
+  wait for them instead, each to its own deadline, and no connect starts
+  until one of them gets a complete answer from the database (rows or
+  PostgreSQL's error), which then serves the queue and lets a connect start
+  again; when the last busy connection ends without such an answer (lost,
+  expired, closed), the queue fails once with `08006`. So with the database down a loop has at most one connect
   in flight, and a flood of requests is answered from it rather than with
   a connect each; there are no retries, backoff or circuit breaker, so this
   bounds concurrent connects, not their rate while the database stays down.
@@ -452,9 +457,13 @@ else meanwhile; the loop serves its other connections (`Conn.step_query`,
   query's expiry closes its session without reading, which never serves
   again, a connect's deadline fails its waiters, a waiter's own earlier
   deadline, a timer callback after the completion changing nothing, a
-  budget refused with `22023`), and a lost connection before the query
-  reached libpq (`error`) and after (`abandoned`: a failed send, flush or
-  read).
+  budget refused with `22023`, the drain's end), a lost connection before
+  the query reached libpq (`error`) and after (`abandoned`: a failed send,
+  flush or read), and a connect failing while a session is busy: the queue
+  waits, no connect starts until that session's answer serves it, a
+  connect's deadline follows the same rule, a session lost without an
+  answer fails the queue once with `08006`, and a waiting query still ends
+  at its own deadline.
   `src/pg_glue_test.c` runs `pg.c` and the real libpq against a fake
   PostgreSQL server on a Unix socket, each reply delivered whole, a message
   at a time and a byte at a time: command boundaries and Sync, errors,

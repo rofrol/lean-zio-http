@@ -35,9 +35,15 @@
 // - Connections open on demand, when a query waits and no connection is
 //   idle, and at most one connect per pool is in flight (`Pool.attempt`): a
 //   connect is not tied to a query. When it succeeds, the new idle
-//   connection serves the queue like any other; when it fails, every query
-//   waiting at that moment fails once with `08006`, and a query submitted
-//   later (also from those deliveries) may start the next connect. A connect
+//   connection serves the queue like any other. When it fails (or reaches
+//   its deadline) with no connection busy, every query waiting at that
+//   moment fails once with `08006`, and a query submitted later (also from
+//   those deliveries) may start the next connect. When it fails while
+//   connections are busy, the queue waits for them instead, each query to
+//   its own deadline, and no connect starts (`Pool.connect_failed`) until
+//   one of them gets a complete answer from the database; when the last
+//   busy one ends without such an answer, the queue fails once with
+//   `08006`. A busy connection is a candidate, not proof of health. A connect
 //   ends at its deadline at the latest; there are no retries or backoff:
 //   this bounds concurrent connects per loop, not the rate of connects while
 //   the database stays down.
@@ -236,7 +242,7 @@ pub const Slot = struct {
 
     /// The connect failed with no duplicate registered.
     fn connectFailed(self: *Slot) void {
-        self.pool.failWaiting(self.pg, null);
+        self.pool.connectFailedFor(self.pg, null);
         if (self.pg) |pg| ekk_pg_finish(pg);
         self.pg = null;
         self.state = .disconnected;
@@ -354,6 +360,8 @@ pub const Slot = struct {
             // serves no other query.
             self.teardown();
         } else {
+            // A complete answer of the database's: connects may start again.
+            self.pool.connect_failed = false;
             self.state = .idle;
         }
         w.deliver(w, result);
@@ -414,7 +422,7 @@ pub const Slot = struct {
         // A connect step that ended in `closing` (connectFailedAfterPoll):
         // its poll failed, so libpq has no message worth reporting.
         const failed = self.pool.attempt == self;
-        if (failed) self.pool.failWaiting(null, if (self.connect_expired) "the connect's deadline passed (--pg-connect-ms)" else null);
+        if (failed) self.pool.connectFailedFor(null, if (self.connect_expired) "the connect's deadline passed (--pg-connect-ms)" else null);
         if (self.pg) |pg| {
             ekk_pg_finish(pg);
             if (self.pool.trace) std.debug.print("pg closed\n", .{});
@@ -471,6 +479,11 @@ pub const Pool = struct {
     /// synchronous connect failures (the database down) is a loop, not a
     /// recursion as deep as the queue.
     dispatching: bool = false,
+    /// A connect failed while sessions were busy (`connectFailedFor`): the
+    /// queries waiting wait for those sessions, and no connect starts, until
+    /// a busy session gets a complete answer from the database (`collect`)
+    /// or none is busy any more (`dispatch` then fails the queue).
+    connect_failed: bool = false,
     /// Prints `pg closed` when a slot has ended its session (tests).
     trace: bool,
 
@@ -540,6 +553,17 @@ pub const Pool = struct {
                 w.deliver(w, r);
                 continue;
             }
+            if (self.connect_failed and self.find(.busy) == null) {
+                // The sessions the queue waited for are gone without an
+                // answer that cleared the failed connect: it fails now.
+                self.connect_failed = false;
+                while (self.dequeue()) |w| {
+                    ekk_query_drop(w.query);
+                    w.query = null;
+                    self.ready(w, ekk_pg_error("08006", "could not connect, and no session that was running remained to serve the query"));
+                }
+                continue;
+            }
             if (self.head == null) break;
             if (self.slots.len == 0) {
                 // No database configured (--pg): fail each query. Through
@@ -555,7 +579,7 @@ pub const Pool = struct {
                 slot.run(self.dequeue().?);
                 continue;
             }
-            if (self.attempt != null) break;
+            if (self.attempt != null or self.connect_failed) break;
             // A connect that ends at once (success or failure) changes the
             // queue or the slots, and the loop goes on from there.
             const slot = self.find(.disconnected) orelse break;
@@ -635,6 +659,18 @@ pub const Pool = struct {
     fn find(self: *Pool, state: SlotState) ?*Slot {
         for (self.slots) |*s| if (s.state == state) return s;
         return null;
+    }
+
+    /// The connect in flight failed (`pg`, `message` as for `failWaiting`).
+    /// While a session is busy, the queries waiting keep waiting, each to
+    /// its own deadline, for that session to finish (`connect_failed`);
+    /// otherwise they fail now.
+    fn connectFailedFor(self: *Pool, pg: ?*Session, message: ?[*:0]const u8) void {
+        if (self.find(.busy) != null) {
+            self.connect_failed = true;
+            return;
+        }
+        self.failWaiting(pg, message);
     }
 
     /// The connect in flight failed: every query waiting now fails once with

@@ -1225,3 +1225,143 @@ test "g: a connection lost after the query was handed to libpq abandons it with 
         try fx.deinit();
     }
 }
+
+// ---- (h) a failed connect while sessions are busy ----
+
+test "h: a connect that fails while a session is busy keeps the queue, starting no connect until that session's answer, which serves it" {
+    var fx: Fixture = .{};
+    try fx.initBudgets(2, .{ .query_ms = far, .query_max_ms = far, .connect_ms = far });
+    var a: TestWaiter = .{ .pool = &fx.pool };
+    const peer = try sentAndBusy(&fx, &a, query());
+    fake.start.push(&.{1});
+    fake.connect_poll.push(&.{0}); // the second connect fails at once
+    var b: TestWaiter = .{ .pool = &fx.pool };
+    var d: TestWaiter = .{ .pool = &fx.pool };
+    b.submit();
+    try std.testing.expectEqual(@as(usize, 0), b.n);
+    try std.testing.expect(fx.pool.connect_failed);
+    try std.testing.expectEqual(.disconnected, fx.pool.slots[1].state);
+    // A later query waits too, and starts no connect.
+    d.submit();
+    try std.testing.expectEqual(@as(usize, 2), fake.count.get(.start));
+    // a's answer clears the failure: its session runs b, and with d still
+    // waiting a connect starts again; it fails too while b runs, so d
+    // waits for that session as well.
+    fake.consume.push(&.{ 1, 1, 1 });
+    fake.collect.push(&.{ 1, 1, 1 });
+    fake.send.push(&.{ 0, 0 });
+    fake.flush.push(&.{ 0, 0 });
+    fake.start.push(&.{0});
+    try poke(peer);
+    try fx.until(&a, delivered);
+    try std.testing.expectEqual(@as(usize, 3), fake.count.get(.start));
+    try std.testing.expect(fx.pool.connect_failed);
+    try std.testing.expectEqual(@as(usize, 0), d.n);
+    try poke(peer);
+    try fx.until(&b, delivered);
+    try poke(peer);
+    try fx.until(&d, delivered);
+    for ([_]*TestWaiter{ &a, &b, &d }) |x| {
+        try std.testing.expectEqual(@as(usize, 1), x.n);
+        try std.testing.expectEqual(.rows, x.got[0].kind);
+    }
+    try fx.deinit();
+}
+
+test "h: a connect's deadline passing while a session is busy follows the same rule" {
+    var fx: Fixture = .{};
+    try fx.initBudgets(2, .{ .query_ms = far, .query_max_ms = far, .connect_ms = 10 });
+    var a: TestWaiter = .{ .pool = &fx.pool };
+    const peer = try sentAndBusy(&fx, &a, query());
+    _ = try fx.pair();
+    fake.start.push(&.{1});
+    fake.connect_poll.push(&.{1}); // the second connect waits on a silent server
+    var b: TestWaiter = .{ .pool = &fx.pool };
+    b.submit();
+    try std.testing.expectEqual(.connecting, fx.pool.slots[1].state);
+    try fx.untilTimer(&fx, slotIs(1, .disconnected));
+    try std.testing.expect(fx.pool.connect_failed);
+    try std.testing.expectEqual(@as(usize, 0), b.n);
+    fake.consume.push(&.{ 1, 1 });
+    fake.collect.push(&.{ 1, 1 });
+    fake.send.push(&.{0});
+    fake.flush.push(&.{0});
+    try poke(peer);
+    try fx.until(&a, delivered);
+    try poke(peer);
+    try fx.until(&b, delivered);
+    try std.testing.expectEqual(.rows, b.got[0].kind);
+    try fx.deinit();
+}
+
+test "h: the queue kept for a busy session fails once with 08006 when that session ends without an answer" {
+    var fx: Fixture = .{};
+    try fx.initBudgets(2, .{ .query_ms = far, .query_max_ms = far, .connect_ms = far });
+    var a: TestWaiter = .{ .pool = &fx.pool };
+    const peer = try sentAndBusy(&fx, &a, query());
+    fake.start.push(&.{1});
+    fake.connect_poll.push(&.{0});
+    var b: TestWaiter = .{ .pool = &fx.pool };
+    var d: TestWaiter = .{ .pool = &fx.pool };
+    b.submit();
+    d.submit();
+    try std.testing.expectEqual(@as(usize, 0), b.n + d.n);
+    // a's connection is lost mid-query: a is abandoned, the queue fails.
+    fake.consume.push(&.{0});
+    try poke(peer);
+    try fx.until(&d, delivered);
+    try std.testing.expectEqual(.abandoned, a.got[0].kind);
+    try std.testing.expectEqualSlices(u8, "08006", &a.got[0].sqlstate);
+    for ([_]*TestWaiter{ &b, &d }) |x| {
+        try std.testing.expectEqual(@as(usize, 1), x.n);
+        try std.testing.expectEqual(.err, x.got[0].kind);
+        try std.testing.expectEqualSlices(u8, "08006", &x.got[0].sqlstate);
+    }
+    try std.testing.expect(!fx.pool.connect_failed);
+    try std.testing.expect(fx.pool.head == null);
+    try fx.until(&fx, Fixture.allDisconnected);
+    try std.testing.expectEqual(@as(usize, 2), fake.count.get(.start));
+    try fx.deinit();
+}
+
+test "h: a query kept for a busy session still ends at its own deadline" {
+    var fx: Fixture = .{};
+    try fx.initBudgets(2, .{ .query_ms = far, .query_max_ms = far, .connect_ms = far });
+    var a: TestWaiter = .{ .pool = &fx.pool };
+    const peer = try sentAndBusy(&fx, &a, query());
+    fake.start.push(&.{1});
+    fake.connect_poll.push(&.{0});
+    var b: TestWaiter = .{ .pool = &fx.pool };
+    fx.pool.submit(&b.w, queryMs(10));
+    try std.testing.expect(fx.pool.connect_failed);
+    try fx.untilTimer(&b, delivered);
+    try std.testing.expectEqual(.err, b.got[0].kind);
+    try std.testing.expectEqualSlices(u8, "57014", &b.got[0].sqlstate);
+    try std.testing.expectEqual(.busy, slot0(&fx).state);
+    fake.consume.push(&.{1});
+    fake.collect.push(&.{1});
+    try poke(peer);
+    try fx.until(&a, delivered);
+    try std.testing.expectEqual(.rows, a.got[0].kind);
+    try fx.deinit();
+}
+
+test "h: the busy session's own expiry ends the wait: the queue kept for it fails once with 08006" {
+    var fx: Fixture = .{};
+    try fx.initBudgets(2, .{ .query_ms = far, .query_max_ms = far, .connect_ms = far });
+    var a: TestWaiter = .{ .pool = &fx.pool };
+    _ = try sentAndBusy(&fx, &a, queryMs(10));
+    fake.start.push(&.{1});
+    fake.connect_poll.push(&.{0});
+    var b: TestWaiter = .{ .pool = &fx.pool };
+    b.submit();
+    try std.testing.expect(fx.pool.connect_failed);
+    try fx.untilTimer(&b, delivered);
+    try std.testing.expectEqual(.abandoned, a.got[0].kind);
+    try std.testing.expectEqualSlices(u8, "57014", &a.got[0].sqlstate);
+    try std.testing.expectEqual(.err, b.got[0].kind);
+    try std.testing.expectEqualSlices(u8, "08006", &b.got[0].sqlstate);
+    try std.testing.expect(!fx.pool.connect_failed);
+    try fx.until(&fx, Fixture.allDisconnected);
+    try fx.deinit();
+}
