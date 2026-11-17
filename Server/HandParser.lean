@@ -63,7 +63,8 @@ structure Head where
   bodyStart : Nat
 
 inductive Parsed where
-  | needMore
+  /-- The request is incomplete: its head, or (once the head is accepted) its body. -/
+  | needMore (need : Need)
   | bad (status : Nat)
   | ok (h : Head)
 
@@ -78,7 +79,7 @@ def litHttp1 := "HTTP/1.".toUTF8
 /-- Parses the request at the start of `buf`. -/
 def parse (buf : ByteArray) : Parsed := Id.run do
   let some headEnd := findHeadEnd buf (maxHeadBytes + 4)
-    | return if buf.size >= maxHeadBytes + 4 then .bad 431 else .needMore
+    | return if buf.size >= maxHeadBytes + 4 then .bad 431 else .needMore .head
   -- request-line = method SP request-target SP HTTP-version CRLF
   let mut i := 0
   while i < headEnd && isTChar buf[i]! do i := i + 1
@@ -146,7 +147,7 @@ def parse (buf : ByteArray) : Parsed := Id.run do
   let cl := contentLength.getD 0
   if cl > maxBodyBytes then return .bad 413
   let bodyStart := headEnd + 4
-  if bodyStart + cl > buf.size then return .needMore
+  if bodyStart + cl > buf.size then return .needMore .body
   let close := connClose || (minor == 0 && !connKeepAlive)
   let (hostStart, hostEnd) := host.getD (0, 0)
   return .ok { methodEnd, targetStart, targetEnd, minor, hostStart, hostEnd, fieldsStart,
@@ -182,7 +183,7 @@ def toRequest (buf : ByteArray) (h : Head) : Server.Request :=
 /-- `Server.H1Adapter.handle` with this parser. -/
 def handle (own : Server.Response.OwnFields) (app : Handler) (buf : ByteArray) : Reply :=
   match parse buf with
-  | .needMore => .needMore
+  | .needMore need => .needMore need
   | .bad status => .respond buf.size fun now => (Server.Response.error own now status, true)
   | .ok h =>
     Server.Response.reply (h.bodyStart + h.contentLength) (Server.Response.answer own app (toRequest buf h) h.close)

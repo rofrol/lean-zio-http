@@ -69,7 +69,8 @@ def errorStatus : H1.Error → Nat
   | _ => 400
 
 inductive Parsed where
-  | needMore
+  /-- The request is incomplete: its head, or (once the head is accepted) its body. -/
+  | needMore (need : Need)
   /-- The head asked for `100-continue` and the body is not complete. -/
   | awaitingBody
   | bad (status : Nat)
@@ -146,7 +147,7 @@ def Parser.parse (p : Parser) (buf : ByteArray) : Parser × Parsed :=
   | none =>
     match m.reader.state with
     | .complete => (p, .ok m.reader.messageHead body (buf.size - m.reader.input.remainingBytes) (!m.keepAlive))
-    | _ => (p, if continued then .awaitingBody else .needMore)
+    | s => (p, if continued then .awaitingBody else .needMore (if readingHead s then .head else .body))
 
 /-- Parses the request at the start of `buf` in one call. -/
 def parse (buf : ByteArray) : Parsed := (Parser.parse {} buf).2
@@ -177,7 +178,7 @@ def handle (own : Server.Response.OwnFields) (app : Handler) (p : Parser) (buf :
     Parser × Reply :=
   let (p, parsed) := p.parse buf
   (p, match parsed with
-    | .needMore => .needMore
+    | .needMore need => .needMore need
     | .awaitingBody => .continue Server.Response.continueBytes
     | .bad status => .respond buf.size fun now => (Server.Response.error own now status, true)
     | .ok h body consumed close =>

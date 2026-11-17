@@ -49,7 +49,7 @@ def text (b : ByteArray) : String := String.fromUTF8Lossy b
 
 def hand (b : ByteArray) : V :=
   match Server.HandParser.parse b with
-  | .needMore => .needMore
+  | .needMore _ => .needMore
   | .bad s => .bad s
   | .ok h => .ok (text (b.extract 0 h.methodEnd)) (text (b.extract h.targetStart h.targetEnd))
       h.contentLength h.close (h.bodyStart + h.contentLength)
@@ -61,7 +61,7 @@ def h1Host : ByteArray → Option String := fun b =>
 
 def h1 (b : ByteArray) : V :=
   match Server.H1Adapter.parse b with
-  | .needMore => .needMore
+  | .needMore _ => .needMore
   | .awaitingBody => .awaitingBody
   | .bad s => .bad s
   | .ok h _ n close =>

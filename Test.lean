@@ -14,8 +14,8 @@ codes, connection rules, Host and request-target validation (H1 only),
 Date header, and the adapter's law (`Adapter.Incremental`): a request fed in
 fragments, with the state kept between them, answers as in one call.
 Connection scenarios drive `Conn.step` through partial receives,
-partial sends, the interim response, the shutdown's `refused` and a handler
-that waits for queries. On the corpus `lsrv-bench` measures, both parsers
+partial sends, the interim response, the shutdown's `refused`, a handler
+that waits for queries, and the deadlines' expiries. On the corpus `lsrv-bench` measures, both parsers
 consume the same bytes, and its fragmented requests are answered. The pool's
 result bound in `zig/src/pg.c` equals `Query.maxResultBytes`. Exit status
 1 when any check fails. -/
@@ -25,7 +25,7 @@ open Server
 /-- 0 need more, 1 respond and keep going, 2 respond and close, 3 interim
 response, 4 waits for a query. -/
 def resultKind : Reply → UInt8
-  | .needMore => 0
+  | .needMore _ => 0
   | .continue _ => 3
   | .respond _ f => if (f 0).2 then 2 else 1
   | .await .. => 4
@@ -37,7 +37,7 @@ def consumed : Reply → Nat
 def responseOf : Reply → String
   | .respond _ f => String.fromUTF8! (f 0).1
   | .continue r => String.fromUTF8! r
-  | .needMore | .await .. => ""
+  | .needMore _ | .await .. => ""
 
 def statusOf (r : Reply) : String := ((responseOf r).splitOn "\r\n").head!
 
@@ -266,6 +266,92 @@ def refusedScenario : Check Unit := do
   let (s, _) := Conn.step h 0 (Conn.initial h) (.received (bytes "GET / HTTP/1.1\r\nHo"))
   expectClose "refused with a partial request" (Conn.step h 0 s .refused).2
 
+/-- The deadline `s` runs under, and its generation. -/
+def expectDeadline (what : String) (s : Conn.State σ) (d : Option Conn.Deadline) (gen : Nat) : Check Unit := do
+  if s.phase.deadline != d then fail s!"{what}: deadline {repr s.phase.deadline}, want {repr d}"
+  if s.gen != gen then fail s!"{what}: generation {s.gen}, want {gen}"
+
+/-- An expiry of `d` in generation `g` that must change nothing. -/
+def expectStale (what : String) (h : Server.Adapter σ) (s : Conn.State σ) (d : Conn.Deadline) (g : Nat) : Check Unit := do
+  let (s', a) := Conn.step h 0 s (.expired d g)
+  match a with
+  | .none => pure ()
+  | _ => fail s!"{what}: a stale expiry was acted on"
+  if s'.phase.deadline != s.phase.deadline || s'.gen != s.gen || s'.buf != s.buf then
+    fail s!"{what}: a stale expiry changed the state"
+
+/-- The deadlines through `Conn.step` with H1 (item ytzycm): which deadline
+each phase runs under, that a phase change starts a new generation and a
+fragment of the same head, body or response keeps it, that an expiry of an
+older generation or of another deadline changes nothing, and that the
+current one closes, after which nothing is acted on. -/
+def deadlineScenario : Check Unit := do
+  let h := H1Adapter.adapter {} App.Fixture.app
+  let s0 := Conn.initial h
+  expectDeadline "deadlines: a new connection" s0 (some .head) 0
+  expectClose "deadlines: the first head expires" (Conn.step h 0 s0 (.expired .head 0)).2
+  expectStale "deadlines: another deadline" h s0 .idle 0
+  expectStale "deadlines: a later generation" h s0 .head 1
+  -- A head in two parts keeps its generation; the body starts a new one.
+  let (s1, _) := Conn.step h 0 s0 (.received (bytes "POST /echo HTTP/1.1\r\nHo"))
+  expectDeadline "deadlines: part of the head" s1 (some .head) 0
+  let (s2, _) := Conn.step h 0 s1 (.received (bytes "st: a\r\nContent-Length: 5\r\n\r\nhe"))
+  expectDeadline "deadlines: the head accepted" s2 (some .body) 1
+  expectStale "deadlines: the head's expiry after the head" h s2 .head 0
+  let (s3, _) := Conn.step h 0 s2 (.received (bytes "l"))
+  expectDeadline "deadlines: part of the body" s3 (some .body) 1
+  let (s4, a4) := Conn.step h 0 s3 (.received (bytes "lo"))
+  let some (resp, _) ← expectSend "deadlines: the request" a4 | return
+  expectDeadline "deadlines: the response" s4 (some .write) 2
+  expectStale "deadlines: the body's expiry after the body" h s4 .body 1
+  let (s5, _) := Conn.step h 0 s4 (.sent 3)
+  expectDeadline "deadlines: part of the response" s5 (some .write) 2
+  let (s6, a6) := Conn.step h 0 s5 (.sent (resp.size - 3))
+  expectRecv "deadlines: after the response" a6 inCap
+  expectDeadline "deadlines: keep-alive" s6 (some .idle) 3
+  expectStale "deadlines: the response's expiry after it" h s6 .write 2
+  let (s7, a7) := Conn.step h 0 s6 (.expired .idle 3)
+  expectClose "deadlines: keep-alive expires" a7
+  match (Conn.step h 0 s7 (.received (bytes "GET / HTTP/1.1\r\nHost: a\r\n\r\n"))).2,
+      (Conn.step h 0 s7 (.expired .idle 3)).2 with
+  | .none, .none => pure ()
+  | _, _ => fail "deadlines: an event after the expiry was acted on"
+  -- The next request's first byte ends keep-alive and starts its head.
+  let (s8, _) := Conn.step h 0 s6 (.received (bytes "GET"))
+  expectDeadline "deadlines: the next head" s8 (some .head) 4
+  -- Pipelined: the second response is a new write, the reading after it a new head.
+  let two := "GET / HTTP/1.1\r\nHost: a\r\n\r\nGET / HTTP/1.1\r\nHo"
+  let (p1, pa1) := Conn.step h 0 s0 (.received (bytes two))
+  let some (r1, _) ← expectSend "deadlines: pipelined" pa1 | return
+  expectDeadline "deadlines: the first pipelined response" p1 (some .write) 1
+  let (p2, _) := Conn.step h 0 p1 (.sent r1.size)
+  expectDeadline "deadlines: the pipelined head" p2 (some .head) 2
+  -- Two complete requests: the second response is a new write period.
+  let (w1, wa1) := Conn.step h 0 s0 (.received (bytes "GET / HTTP/1.1\r\nHost: a\r\n\r\nGET / HTTP/1.1\r\nHost: a\r\n\r\n"))
+  let some (q, _) ← expectSend "deadlines: two pipelined requests" wa1 | return
+  expectDeadline "deadlines: the first of two responses" w1 (some .write) 1
+  let (w2, wa2) := Conn.step h 0 w1 (.sent q.size)
+  let some (_, off) ← expectSend "deadlines: the second response" wa2 | return
+  if off != 0 then fail s!"deadlines: the second response starts at {off}"
+  expectDeadline "deadlines: the second response" w2 (some .write) 2
+  expectStale "deadlines: the first response's expiry after it" h w2 .write 1
+  -- Expect continue: the interim response runs under the body's deadline,
+  -- which the body keeps.
+  let (c1, ca1) := Conn.step h 0 s0 (.received (bytes "POST /echo HTTP/1.1\r\nHost: a\r\nExpect: 100-continue\r\nContent-Length: 5\r\n\r\n"))
+  let some (interim, _) ← expectSend "deadlines: a head with Expect" ca1 | return
+  expectDeadline "deadlines: the interim response" c1 (some .body) 1
+  let (c2, _) := Conn.step h 0 c1 (.sent 2)
+  expectDeadline "deadlines: part of the interim response" c2 (some .body) 1
+  let (c3, _) := Conn.step h 0 c2 (.sent (interim.size - 2))
+  expectDeadline "deadlines: the body after the interim response" c3 (some .body) 1
+  expectClose "deadlines: the body expires after the interim response" (Conn.step h 0 c3 (.expired .body 1)).2
+  -- A query runs under no deadline: every expiry while querying is stale.
+  let hd := H1Adapter.adapter {} App.Db.app
+  let (q1, _) := Conn.step hd 0 (Conn.initial hd) (.received (bytes "GET /db?id=1 HTTP/1.1\r\nHost: a\r\n\r\n"))
+  expectDeadline "deadlines: querying" q1 none 1
+  for d in [Conn.Deadline.idle, .head, .body, .write] do
+    for g in [0, 1] do expectStale "deadlines: querying" hd q1 d g
+
 def expectQuery (what : String) (a : Conn.Action) (sql : String) (params : Array (Option String)) : Check Unit :=
   match a with
   | .query q => if q.sql != sql || q.params != params then fail s!"{what}: asked {repr q.sql} {q.params}" else pure ()
@@ -345,7 +431,7 @@ def sameStep : Await Dated → Await Dated → Bool
 query's continuation is a function, compared by the query it asks and by its
 first step on a row, on no rows and on an error. -/
 def sameReply : Reply → Reply → Bool
-  | .needMore, .needMore => true
+  | .needMore a, .needMore b => a == b
   | .continue a, .continue b => a == b
   | .respond n a, .respond m b => n == m && sameDated a b
   | .await n q k, .await m r l =>
@@ -585,12 +671,12 @@ def retainedScenario : Check Unit := do
       let mut p : H1Adapter.Parser := {}
       let mut n := 0
       let mut largest := 0
-      let mut last : H1Adapter.Parsed := .needMore
+      let mut last : H1Adapter.Parsed := .needMore .head
       while n < b.size do
         n := min b.size (n + k)
         (p, last) := p.parse (b.extract 0 n)
         match last with
-        | .needMore | .awaitingBody =>
+        | .needMore _ | .awaitingBody =>
           let head := p.machine.reader.messageHead
           let parts := [("input", retainedBytes p.machine.reader.input, inputBound),
             ("body", retainedBytes p.body, bodyBound), ("target", retainedBytes head.uri, targetBound),
@@ -693,6 +779,7 @@ def main : IO UInt32 := do
     continueScenario
     refusedScenario
     queryScenario
+    deadlineScenario
     clockScenario
     corpusScenario
     for (secs, want) in dates do

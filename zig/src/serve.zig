@@ -454,6 +454,10 @@ var loops: []LoopCtx = &.{};
 /// The PostgreSQL connection string and the connections per loop (0: none).
 var pg_conninfo: [*:0]const u8 = "";
 var pg_conns: u32 = 0;
+/// Each per-connection deadline's budget in milliseconds, at least 1
+/// (Transport.Options: idleMs, headMs, bodyMs, writeMs), indexed by the
+/// deadline's code (Transport.deadlineCode) less 1: idle, head, body, write.
+var budget_ms: [4]u32 = .{ 1, 1, 1, 1 };
 
 /// Writes a loop's one-byte report; a write that fails would leave the
 /// waiter blocked forever, so it ends the process instead.
@@ -539,10 +543,13 @@ fn setupFailed(what: []const u8, port: u16) u8 {
 /// acceptor. On SIGTERM or SIGINT every loop shuts down
 /// gracefully; once all have, it prints "stopped" and returns 0. Each loop
 /// has at most `conns` PostgreSQL connections to `conninfo` (a Lean String,
-/// kept for the process's life). The rest are the test settings (`Testing`),
-/// all zero in normal runs. Returns 1 on setup failure.
-export fn ekk_serve(port: u16, threads: u32, maxc: u32, conninfo: *anyopaque, conns: u32, chunk: usize, fail_every: u32, trace: u8, crash_recv: u32, crash_send: u32) callconv(.c) u8 {
+/// kept for the process's life). `idle_ms` to `write_ms` are the
+/// per-connection deadlines' budgets (`budget_ms`). The rest are the test
+/// settings (`Testing`), all zero in normal runs. Returns 1 on setup failure.
+export fn ekk_serve(port: u16, threads: u32, maxc: u32, conninfo: *anyopaque, conns: u32, idle_ms: u32, head_ms: u32, body_ms: u32, write_ms: u32, chunk: usize, fail_every: u32, trace: u8, crash_recv: u32, crash_send: u32) callconv(.c) u8 {
     if (threads == 0 or maxc == 0) return 1;
+    budget_ms = .{ idle_ms, head_ms, body_ms, write_ms };
+    for (budget_ms) |ms| if (ms == 0) return 1;
     pg_conninfo = ekk_string_cstr(conninfo);
     pg_conns = conns;
     if (conns > 0 and pg.ekk_pg_libpq_supported() == 0) {

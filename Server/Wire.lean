@@ -36,11 +36,21 @@ before it, or the answer of its last query), so only the response sees the
 clock: `Adapter.handle`, its kept state and `init` cannot depend on it. -/
 abbrev Dated := Nat → ByteArray × Bool
 
+/-- What an incomplete request still lacks. The connection bounds the two
+parts by different deadlines (`Server.Conn.Deadline`), so it needs to know
+when the head has been accepted. -/
+inductive Need where
+  /-- The head (request line and fields) is not complete. -/
+  | head
+  /-- The head is complete and accepted, and the body it announced is not. -/
+  | body
+deriving DecidableEq, Repr
+
 /-- What an adapter decides about the bytes buffered on a connection, which
 always start at a request boundary. -/
 inductive Reply where
-  /-- The request is not complete yet. -/
-  | needMore
+  /-- The request is not complete yet; `need` says which part it lacks. -/
+  | needMore (need : Need)
   /-- The request's head is complete and asks for `100-continue`, and its body
   is not complete: send `interim` (once per request; the connection keeps the
   buffered bytes), then receive the body. -/
@@ -56,7 +66,7 @@ inductive Reply where
 /-- Whether the request is still incomplete, so the connection keeps the
 adapter's state for the next call on the same request. -/
 def Reply.waits : Reply → Bool
-  | .needMore | .continue _ => true
+  | .needMore _ | .continue _ => true
   | .respond .. | .await .. => false
 
 /-- A protocol adapter with parse state `σ`, kept on the connection so that a
@@ -94,7 +104,7 @@ theorem Fed.extend {s : σ} {buf : ByteArray} (h : ad.Fed s buf) (d : ByteArray)
 
 /-- The adapter's law: the kept state only saves work. Whatever fragments a
 request arrived in, the answer is the one `handle` gives from `init` on the
-same bytes. The theorems of `Server.Conn` that compare fragmented and whole
+same bytes, the part a `needMore` lacks included. The theorems of `Server.Conn` that compare fragmented and whole
 receives assume it; `lsrv-test` checks it for both adapters (the H1 machine's
 functions are `partial`, so it cannot be proved about them). -/
 def Incremental : Prop := ∀ s buf, ad.Fed s buf → (ad.handle s buf).2 = (ad.handle ad.init buf).2

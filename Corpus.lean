@@ -68,14 +68,14 @@ def fragmentCorpus : List (String × String) :=
 /-- Bytes the hand-written parser consumes, its status on a rejection, or 0 when it needs more. -/
 def handParse (b : ByteArray) : Nat :=
   match HandParser.parse b with
-  | .needMore => 0
+  | .needMore _ => 0
   | .bad s => s
   | .ok h => h.bodyStart + h.contentLength
 
 /-- Bytes H1 consumes, its status on a rejection, or 0 when it needs more. -/
 def h1Parse (b : ByteArray) : Nat :=
   match H1Adapter.parse b with
-  | .needMore | .awaitingBody => 0
+  | .needMore _ | .awaitingBody => 0
   | .bad s => s
   | .ok _ _ n _ => n
 
