@@ -5,3 +5,5 @@ Seen in 4ia52d: the bound a result is charged against is written twice, `def Que
 Question: should the two be tied mechanically, and how?
 Options: pass the Lean value into pg.c (an exported Lean constant the C reads, or a parameter of the pool's setup) so there is one definition | keep both and add a check (a Lean test or a boundary test reading the C value through an exported function) that fails when they differ | leave as is, documented as a duplicate
 Recommendation: the second as the smaller change, unless qsqb5f's redesign of how a result is received already moves the bound's enforcement.
+
+Decided 2026-11-17 by the coordinating session under the user's delegation (no consult round: a test-only, reversible check): add a test that fails when EKK_MAX_RESULT_BYTES and Query.maxResultBytes differ; no FFI change. Runs after qsqb5f, which touches the same limit.
