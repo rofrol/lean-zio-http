@@ -1,6 +1,7 @@
 ## Next, in order
 
 2kaoxd Move zio to the commit that fixes issue 927 and retire the StopGate subset contract
+lgxdi7 Prepare the upstream question for mxzlsx (Std.Http H1 reparses an unfinished field line)
 u4moqo Move the toolchain to the first nightly with lean4 PR 16417 (Std.Http RFC fixes)
 
 ## Proposed
