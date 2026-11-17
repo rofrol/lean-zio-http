@@ -5,10 +5,9 @@ kvnm3u Decide whether the type, not a comment, should keep the clock out of the 
 sy3ims Decide whether to report upstream that Std.Http's H1 reparses an unfinished line from its start on every call
 u4moqo Move the toolchain to the first nightly with lean4 PR 16417 (Std.Http RFC fixes)
 tdtseh Decide how to bound the H1 adapter's state a connection retains
+mpimfx Decide whether to allocate a response with the capacity it needs
 
 ## Proposed
-
-mpimfx Decide whether to allocate a response with the capacity it needs
 
 ## Needs a decision
 
