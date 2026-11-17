@@ -180,17 +180,17 @@ def toRequest (buf : ByteArray) (h : Head) : Server.Request :=
     body := buf.extract h.bodyStart (h.bodyStart + h.contentLength) }
 
 /-- `Server.H1Adapter.handle` with this parser. -/
-def handle (own : Server.Response.OwnFields) (app : Handler) (now : Nat) (buf : ByteArray) : Reply :=
+def handle (own : Server.Response.OwnFields) (app : Handler) (buf : ByteArray) : Reply :=
   match parse buf with
   | .needMore => .needMore
-  | .bad status => .respond buf.size (Server.Response.error own now status) true
+  | .bad status => .respond buf.size fun now => (Server.Response.error own now status, true)
   | .ok h =>
-    Server.Response.reply (h.bodyStart + h.contentLength) (Server.Response.answer own now app (toRequest buf h) h.close)
+    Server.Response.reply (h.bodyStart + h.contentLength) (Server.Response.answer own app (toRequest buf h) h.close)
 
 /-- `Server.H1Adapter.adapter` with this parser. It keeps no state and parses
 the whole buffer again on every receive, so a request in many receives costs
 time quadratic in its size (`lsrv-bench`'s fragmentation table). -/
-def adapter (own : Server.Response.OwnFields) (app : Handler) (now : Nat) : Server.Adapter Unit :=
-  { init := (), handle := fun _ buf => ((), handle own app now buf) }
+def adapter (own : Server.Response.OwnFields) (app : Handler) : Server.Adapter Unit :=
+  { init := (), handle := fun _ buf => ((), handle own app buf) }
 
 end Server.HandParser

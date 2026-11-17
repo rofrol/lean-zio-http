@@ -28,6 +28,14 @@ def maxResponseBytes : Nat := 65536
 maxBodyBytes). -/
 def inCap : Nat := maxHeadBytes + 4 + maxBodyBytes
 
+/-- A final response as a function of the wall clock in Unix seconds (for its
+Date header): its bytes and whether to close the connection after them. The
+connection applies it to the time of the event that sends the response (the
+receive that completed the request, the send that finished the response
+before it, or the answer of its last query), so only the response sees the
+clock: `Adapter.handle`, its kept state and `init` cannot depend on it. -/
+abbrev Dated := Nat → ByteArray × Bool
+
 /-- What an adapter decides about the bytes buffered on a connection, which
 always start at a request boundary. -/
 inductive Reply where
@@ -37,12 +45,13 @@ inductive Reply where
   is not complete: send `interim` (once per request; the connection keeps the
   buffered bytes), then receive the body. -/
   | continue (interim : ByteArray)
-  /-- Send `response` for the first `consumed` bytes; close afterwards when `close`. -/
-  | respond (consumed : Nat) (response : ByteArray) (close : Bool)
+  /-- Send `response` for the first `consumed` bytes, closing afterwards when
+  it says so. -/
+  | respond (consumed : Nat) (response : Dated)
   /-- The first `consumed` bytes are a complete request whose answer waits for
   query `q`: run it, then continue with `k` applied to its result, which ends in
-  a response to send and whether to close afterwards, as with `respond`. -/
-  | await (consumed : Nat) (q : Query) (k : Query.Result → Await (ByteArray × Bool))
+  a response to send, as with `respond`. -/
+  | await (consumed : Nat) (q : Query) (k : Query.Result → Await Dated)
 
 /-- Whether the request is still incomplete, so the connection keeps the
 adapter's state for the next call on the same request. -/
@@ -59,7 +68,8 @@ at a request boundary; `s` is what the adapter returned on its previous call
 for the same request, or `init` for the request's first call. The connection
 keeps the returned state while the answer `waits` (it then calls again with
 `buf` extended by the bytes received meanwhile, possibly none), and starts the
-next request with `init` once one is consumed (`Server.Conn`). -/
+next request with `init` once one is consumed (`Server.Conn`). The adapter is
+one value for every event: the clock reaches only the responses (`Dated`). -/
 structure Adapter (σ : Type) where
   init : σ
   handle : σ → ByteArray → σ × Reply

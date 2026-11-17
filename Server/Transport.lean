@@ -13,35 +13,33 @@ namespace Server.Transport
 
 variable {σ : Type}
 
-/-- A protocol adapter as the transport drives it: the wall clock in Unix
-seconds, then the adapter. Each event gets the adapter for its own time, so
-the state one call keeps is handed to the next call's adapter: `init` and the
-state an adapter keeps must not depend on the clock (only the responses may,
-such as their Date), or `Conn`'s theorems, stated for one adapter, do not
-describe the transport. `Server.H1Adapter` and `Server.HandParser` pass the
-clock only to the response writer. -/
-abbrev Adapter (σ : Type) := Nat → Server.Adapter σ
+/-! The transport drives one adapter value for all of a connection's events
+and passes each event's wall clock (Unix seconds, from the loop) to
+`Conn.step`, which hands it only to the response it sends (`Server.Dated`);
+so `Conn`'s theorems, stated for one adapter at any clock, describe the
+transport. A failure or a declined receive sends nothing, so those events
+pass 0. -/
 
 /-- The connection state of `adapter`'s connections, for the exports' types. -/
-abbrev ConnState {σ : Type} (_ : Adapter σ) : Type := Conn.State σ
+abbrev ConnState {σ : Type} (_ : Server.Adapter σ) : Type := Conn.State σ
 
 /-- A new connection: the initial state and its first action, a receive. -/
-def connOpen (adapter : Adapter σ) : Conn.State σ × Conn.Action := (Conn.initial (adapter 0), .recv inCap)
+def connOpen (adapter : Server.Adapter σ) : Conn.State σ × Conn.Action := (Conn.initial adapter, .recv inCap)
 
-def onRecv (adapter : Adapter σ) (now : UInt64) (s : Conn.State σ) (data : ByteArray) : Conn.State σ × Conn.Action :=
-  Conn.step (adapter now.toNat) s (.received data)
+def onRecv (adapter : Server.Adapter σ) (now : UInt64) (s : Conn.State σ) (data : ByteArray) : Conn.State σ × Conn.Action :=
+  Conn.step adapter now.toNat s (.received data)
 
-def onSent (adapter : Adapter σ) (now : UInt64) (s : Conn.State σ) (n : USize) : Conn.State σ × Conn.Action :=
-  Conn.step (adapter now.toNat) s (.sent n.toNat)
+def onSent (adapter : Server.Adapter σ) (now : UInt64) (s : Conn.State σ) (n : USize) : Conn.State σ × Conn.Action :=
+  Conn.step adapter now.toNat s (.sent n.toNat)
 
-def onFail (adapter : Adapter σ) (s : Conn.State σ) : Conn.State σ × Conn.Action :=
-  Conn.step (adapter 0) s .failed
+def onFail (adapter : Server.Adapter σ) (s : Conn.State σ) : Conn.State σ × Conn.Action :=
+  Conn.step adapter 0 s .failed
 
-def onRefused (adapter : Adapter σ) (s : Conn.State σ) : Conn.State σ × Conn.Action :=
-  Conn.step (adapter 0) s .refused
+def onRefused (adapter : Server.Adapter σ) (s : Conn.State σ) : Conn.State σ × Conn.Action :=
+  Conn.step adapter 0 s .refused
 
-def onAnswer (adapter : Adapter σ) (now : UInt64) (s : Conn.State σ) (r : Query.Result) : Conn.State σ × Conn.Action :=
-  Conn.step (adapter now.toNat) s (.answered r)
+def onAnswer (adapter : Server.Adapter σ) (now : UInt64) (s : Conn.State σ) (r : Query.Result) : Conn.State σ × Conn.Action :=
+  Conn.step adapter now.toNat s (.answered r)
 
 set_option hygiene false in
 /-- Writes the loop's entry points for `adapter` in the executable that uses

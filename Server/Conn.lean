@@ -14,6 +14,11 @@ law `Adapter.Incremental` answers each buffer as from `init`; `fragments`
 proves that receives each answered with another receive end as their
 concatenation received at once.
 
+Each event comes with the wall clock it is reported at, which `step` passes
+only to the response it sends (`Server.Dated`); the adapter is one value, and
+neither `initial` nor the adapter's state sees the clock, so `run_inv` holds
+for any timestamps.
+
 Assumptions on the loop, not proved here: it performs exactly the returned
 action, except that it may decline a `recv` while it shuts down and report
 `refused` instead; it reports the outcome as the next event (except after
@@ -46,7 +51,7 @@ inductive Phase where
   /-- Waiting for the result of the query just asked for, then going on with
   `k`; the request is already consumed from `buf`, and no receive is in
   flight, so bytes the peer pipelines wait in the kernel. -/
-  | querying (k : Query.Result → Await (ByteArray × Bool))
+  | querying (k : Query.Result → Await Dated)
   /-- The close action was issued; nothing more happens. -/
   | closed
 
@@ -103,37 +108,42 @@ def startSend (p : σ) (buf out : ByteArray) (next : Next) : State σ × Action 
   if 0 < out.size ∧ out.size ≤ maxResponseBytes then ({ buf, parser := p, phase := .writing out 0 next }, .send out 0)
   else closeNow ad
 
-/-- Goes on with a request's answer, `buf` holding the bytes after it, which
-start the next request (so the adapter starts again from `init`): sends a
-complete answer (then closes or reads on, as it says), or asks for the query
-it waits for. Both a `respond` and an answered query come through here. -/
-def resume (buf : ByteArray) : Await (ByteArray × Bool) → State σ × Action
-  | .done (out, close) => startSend ad ad.init buf out (if close then .close else .read false)
+/-- Goes on with a request's answer at wall clock `now`, `buf` holding the
+bytes after it, which start the next request (so the adapter starts again
+from `init`): sends a complete answer written at `now` (then closes or reads
+on, as it says), or asks for the query it waits for. Both a `respond` and an
+answered query come through here. -/
+def resume (now : Nat) (buf : ByteArray) : Await Dated → State σ × Action
+  | .done f =>
+    let r := f now
+    startSend ad ad.init buf r.1 (if r.2 then .close else .read false)
   | .query q k => ({ buf, parser := ad.init, phase := .querying k }, .query q)
 
-/-- Answers what is buffered, given the adapter's state `p` for it: a response
-to send, a query to run, the interim `100 Continue`, a receive for more bytes,
-or a close. -/
-def serve (continued : Bool) (p : σ) (buf : ByteArray) : State σ × Action :=
+/-- Answers what is buffered at wall clock `now`, given the adapter's state
+`p` for it: a response to send, a query to run, the interim `100 Continue`, a
+receive for more bytes, or a close. -/
+def serve (now : Nat) (continued : Bool) (p : σ) (buf : ByteArray) : State σ × Action :=
   match (ad.handle p buf).2 with
   | .needMore => wait ad continued (ad.handle p buf).1 buf
   | .continue interim =>
     if continued then wait ad true (ad.handle p buf).1 buf else startSend ad (ad.handle p buf).1 buf interim (.read true)
-  | .respond consumed response close =>
-    if 0 < consumed ∧ consumed ≤ buf.size then resume ad (buf.extract consumed buf.size) (.done (response, close))
+  | .respond consumed response =>
+    if 0 < consumed ∧ consumed ≤ buf.size then resume ad now (buf.extract consumed buf.size) (.done response)
     else closeNow ad
   | .await consumed q k =>
-    if 0 < consumed ∧ consumed ≤ buf.size then resume ad (buf.extract consumed buf.size) (.query q k)
+    if 0 < consumed ∧ consumed ≤ buf.size then resume ad now (buf.extract consumed buf.size) (.query q k)
     else closeNow ad
 
-def step (s : State σ) (e : Event) : State σ × Action :=
+/-- The connection's answer to event `e`, reported at wall clock `now` (Unix
+seconds), which only a response sent in answer to it sees (`Dated`). -/
+def step (now : Nat) (s : State σ) (e : Event) : State σ × Action :=
   match s.phase, e with
   | .closed, _ => (s, .none)
   | _, .failed => closeNow ad
   | _, .refused => closeNow ad
   | .reading continued, .received data =>
     if data.size = 0 then closeNow ad
-    else if s.buf.size + data.size ≤ inCap then serve ad continued s.parser (s.buf ++ data)
+    else if s.buf.size + data.size ≤ inCap then serve ad now continued s.parser (s.buf ++ data)
     else closeNow ad
   | .writing out off next, .sent n =>
     if n = 0 ∨ out.size < off + n then closeNow ad
@@ -141,12 +151,17 @@ def step (s : State σ) (e : Event) : State σ × Action :=
     else match next with
       | .close => closeNow ad
       | .read continued =>
-        if 0 < s.buf.size then serve ad continued s.parser s.buf
+        if 0 < s.buf.size then serve ad now continued s.parser s.buf
         else ({ s with phase := .reading continued }, .recv inCap)
-  | .querying k, .answered r => resume ad s.buf (k r)
+  | .querying k, .answered r => resume ad now s.buf (k r)
   | _, _ => closeNow ad
 
-/-! ## Guarantees -/
+/-! ## Guarantees
+
+Every theorem holds at any wall clock `now`, which a step only passes to the
+response it sends. -/
+
+variable (now : Nat)
 
 /-- The length bound: the buffer never exceeds `inCap`, and a response being
 sent never exceeds `maxResponseBytes`. Lengths, not capacities: what the
@@ -168,14 +183,14 @@ theorem startSend_inv (p : σ) (buf out : ByteArray) (next : Next) (hb : buf.siz
   · rename_i h; refine ⟨hb, ?_⟩; intro o off n hp; simp at hp; obtain ⟨rfl, -, -⟩ := hp; omega
   · exact closeNow_inv ad
 
-theorem resume_inv (buf : ByteArray) (a : Await (ByteArray × Bool)) (hb : buf.size ≤ inCap) :
-    Inv (resume ad buf a).1 := by
+theorem resume_inv (buf : ByteArray) (a : Await Dated) (hb : buf.size ≤ inCap) :
+    Inv (resume ad now buf a).1 := by
   match a with
-  | .done (out, close) => exact startSend_inv ad _ _ _ _ hb
+  | .done f => exact startSend_inv ad _ _ _ _ hb
   | .query q k => exact ⟨hb, by intro o off n h; simp [resume] at h⟩
 
 theorem serve_inv (c : Bool) (p : σ) (buf : ByteArray) (hb : buf.size ≤ inCap) :
-    Inv (serve ad c p buf).1 := by
+    Inv (serve ad now c p buf).1 := by
   unfold serve
   split
   · exact wait_inv ad _ _ _
@@ -191,7 +206,7 @@ theorem serve_inv (c : Bool) (p : σ) (buf : ByteArray) (hb : buf.size ≤ inCap
 
 /-- Every step keeps the buffer within `inCap` and the response within
 `maxResponseBytes`, whatever a query's continuation answers. -/
-theorem step_inv (s : State σ) (e : Event) (hs : Inv s) : Inv (step ad s e).1 := by
+theorem step_inv (s : State σ) (e : Event) (hs : Inv s) : Inv (step ad now s e).1 := by
   obtain ⟨hb, hw⟩ := hs
   unfold step
   split
@@ -211,19 +226,19 @@ theorem step_inv (s : State σ) (e : Event) (hs : Inv s) : Inv (step ad s e).1 :
       · split
         · exact closeNow_inv ad
         · split
-          · exact serve_inv ad _ _ _ hb
+          · exact serve_inv ad now _ _ _ hb
           · refine ⟨hb, ?_⟩; intro o f n h; simp at h
-  · exact resume_inv ad _ _ hb
+  · exact resume_inv ad now _ _ hb
   · exact closeNow_inv ad
 
 /-- A closed connection stays closed and asks for nothing. -/
 theorem step_closed (s : State σ) (e : Event) (h : s.phase = .closed) :
-    step ad s e = (s, .none) := by
+    step ad now s e = (s, .none) := by
   unfold step; rw [h]
 
 /-- A declined receive always closes the connection. -/
 theorem step_refused (s : State σ) (h : s.phase ≠ .closed) :
-    step ad s .refused = closeNow ad := by
+    step ad now s .refused = closeNow ad := by
   unfold step; split <;> simp_all
 
 theorem wait_close (c : Bool) (p : σ) (buf : ByteArray) :
@@ -234,14 +249,14 @@ theorem startSend_close (p : σ) (buf out : ByteArray) (next : Next) :
     (startSend ad p buf out next).2 = .close → (startSend ad p buf out next).1.phase = .closed := by
   unfold startSend; split <;> simp [closeNow]
 
-theorem resume_close (buf : ByteArray) (a : Await (ByteArray × Bool)) :
-    (resume ad buf a).2 = .close → (resume ad buf a).1.phase = .closed := by
+theorem resume_close (buf : ByteArray) (a : Await Dated) :
+    (resume ad now buf a).2 = .close → (resume ad now buf a).1.phase = .closed := by
   match a with
-  | .done (out, close) => exact startSend_close ad _ _ _ _
+  | .done f => exact startSend_close ad _ _ _ _
   | .query q k => simp [resume]
 
 theorem serve_close (c : Bool) (p : σ) (buf : ByteArray) :
-    (serve ad c p buf).2 = .close → (serve ad c p buf).1.phase = .closed := by
+    (serve ad now c p buf).2 = .close → (serve ad now c p buf).1.phase = .closed := by
   unfold serve
   split
   · exact wait_close ad _ _ _
@@ -249,15 +264,15 @@ theorem serve_close (c : Bool) (p : σ) (buf : ByteArray) :
     · exact wait_close ad _ _ _
     · exact startSend_close ad _ _ _ _
   · split
-    · exact resume_close ad _ _
+    · exact resume_close ad now _ _
     · simp [closeNow]
   · split
-    · exact resume_close ad _ _
+    · exact resume_close ad now _ _
     · simp [closeNow]
 
 /-- The close action always leaves the connection closed, so nothing follows it. -/
 theorem step_close (s : State σ) (e : Event) :
-    (step ad s e).2 = .close → (step ad s e).1.phase = .closed := by
+    (step ad now s e).2 = .close → (step ad now s e).1.phase = .closed := by
   unfold step
   split
   · simp
@@ -266,7 +281,7 @@ theorem step_close (s : State σ) (e : Event) :
   · split
     · simp [closeNow]
     · split
-      · exact serve_close ad _ _ _
+      · exact serve_close ad now _ _ _
       · simp [closeNow]
   · split
     · simp [closeNow]
@@ -275,9 +290,9 @@ theorem step_close (s : State σ) (e : Event) :
       · split
         · simp [closeNow]
         · split
-          · exact serve_close ad _ _ _
+          · exact serve_close ad now _ _ _
           · simp
-  · exact resume_close ad _ _
+  · exact resume_close ad now _ _
   · simp [closeNow]
 
 theorem wait_recv (c : Bool) (p : σ) (buf : ByteArray) (room : Nat) :
@@ -290,15 +305,15 @@ theorem startSend_recv (p : σ) (buf out : ByteArray) (next : Next) (room : Nat)
     (startSend ad p buf out next).2 ≠ .recv room := by
   unfold startSend; split <;> simp [closeNow]
 
-theorem resume_recv (buf : ByteArray) (a : Await (ByteArray × Bool)) (room : Nat) :
-    (resume ad buf a).2 ≠ .recv room := by
+theorem resume_recv (buf : ByteArray) (a : Await Dated) (room : Nat) :
+    (resume ad now buf a).2 ≠ .recv room := by
   match a with
-  | .done (out, close) => exact startSend_recv ad _ _ _ _ _
+  | .done f => exact startSend_recv ad _ _ _ _ _
   | .query q k => simp [resume]
 
 theorem serve_recv (c : Bool) (p : σ) (buf : ByteArray) (room : Nat) :
-    (serve ad c p buf).2 = .recv room →
-      0 < room ∧ (serve ad c p buf).1.buf.size + room = inCap := by
+    (serve ad now c p buf).2 = .recv room →
+      0 < room ∧ (serve ad now c p buf).1.buf.size + room = inCap := by
   unfold serve
   split
   · exact wait_recv ad _ _ _ _
@@ -306,16 +321,16 @@ theorem serve_recv (c : Bool) (p : σ) (buf : ByteArray) (room : Nat) :
     · exact wait_recv ad _ _ _ _
     · intro h; exact absurd h (startSend_recv ad _ _ _ _ _)
   · split
-    · intro h; exact absurd h (resume_recv ad _ _ _)
+    · intro h; exact absurd h (resume_recv ad now _ _ _)
     · simp [closeNow]
   · split
-    · intro h; exact absurd h (resume_recv ad _ _ _)
+    · intro h; exact absurd h (resume_recv ad now _ _ _)
     · simp [closeNow]
 
 /-- A receive always has room, and never more than the buffer can take. -/
 theorem step_recv (s : State σ) (e : Event) (room : Nat) :
-    (step ad s e).2 = .recv room →
-      0 < room ∧ (step ad s e).1.buf.size + room = inCap := by
+    (step ad now s e).2 = .recv room →
+      0 < room ∧ (step ad now s e).1.buf.size + room = inCap := by
   unfold step
   split
   · simp
@@ -324,7 +339,7 @@ theorem step_recv (s : State σ) (e : Event) (room : Nat) :
   · split
     · simp [closeNow]
     · split
-      · exact serve_recv ad _ _ _ _
+      · exact serve_recv ad now _ _ _ _
       · simp [closeNow]
   · split
     · simp [closeNow]
@@ -333,12 +348,12 @@ theorem step_recv (s : State σ) (e : Event) (room : Nat) :
       · split
         · simp [closeNow]
         · split
-          · exact serve_recv ad _ _ _ _
+          · exact serve_recv ad now _ _ _ _
           · intro h
             simp only [Action.recv.injEq] at h
             subst h
             simp_all [inCap, maxHeadBytes, maxBodyBytes]
-  · intro h; exact absurd h (resume_recv ad _ _ _)
+  · intro h; exact absurd h (resume_recv ad now _ _ _)
   · simp [closeNow]
 
 theorem startSend_send (p : σ) (buf out data : ByteArray) (next : Next) (off : Nat) :
@@ -347,14 +362,14 @@ theorem startSend_send (p : σ) (buf out data : ByteArray) (next : Next) (off : 
   · rename_i h; simp only [Action.send.injEq]; rintro ⟨rfl, rfl⟩; omega
   · simp [closeNow]
 
-theorem resume_send (buf data : ByteArray) (a : Await (ByteArray × Bool)) (off : Nat) :
-    (resume ad buf a).2 = .send data off → off < data.size := by
+theorem resume_send (buf data : ByteArray) (a : Await Dated) (off : Nat) :
+    (resume ad now buf a).2 = .send data off → off < data.size := by
   match a with
-  | .done (out, close) => exact startSend_send ad _ _ _ _ _ _
+  | .done f => exact startSend_send ad _ _ _ _ _ _
   | .query q k => simp [resume]
 
 theorem serve_send (c : Bool) (p : σ) (buf data : ByteArray) (off : Nat) :
-    (serve ad c p buf).2 = .send data off → off < data.size := by
+    (serve ad now c p buf).2 = .send data off → off < data.size := by
   unfold serve
   split
   · unfold wait; split <;> simp [closeNow]
@@ -362,15 +377,15 @@ theorem serve_send (c : Bool) (p : σ) (buf data : ByteArray) (off : Nat) :
     · unfold wait; split <;> simp [closeNow]
     · exact startSend_send ad _ _ _ _ _ _
   · split
-    · exact resume_send ad _ _ _ _
+    · exact resume_send ad now _ _ _ _
     · simp [closeNow]
   · split
-    · exact resume_send ad _ _ _ _
+    · exact resume_send ad now _ _ _ _
     · simp [closeNow]
 
 /-- Every send starts inside its data, so it has at least one byte to write. -/
 theorem step_send (s : State σ) (e : Event) (data : ByteArray) (off : Nat) :
-    (step ad s e).2 = .send data off → off < data.size := by
+    (step ad now s e).2 = .send data off → off < data.size := by
   unfold step
   split
   · simp
@@ -379,7 +394,7 @@ theorem step_send (s : State σ) (e : Event) (data : ByteArray) (off : Nat) :
   · split
     · simp [closeNow]
     · split
-      · exact serve_send ad _ _ _ _ _
+      · exact serve_send ad now _ _ _ _ _
       · simp [closeNow]
   · split
     · simp [closeNow]
@@ -388,20 +403,20 @@ theorem step_send (s : State σ) (e : Event) (data : ByteArray) (off : Nat) :
       · split
         · simp [closeNow]
         · split
-          · exact serve_send ad _ _ _ _ _
+          · exact serve_send ad now _ _ _ _ _
           · simp
-  · exact resume_send ad _ _ _ _
+  · exact resume_send ad now _ _ _ _
   · simp [closeNow]
 
-theorem resume_query (buf : ByteArray) (a : Await (ByteArray × Bool)) (q : Query) :
-    (resume ad buf a).2 = .query q → ∃ k, (resume ad buf a).1.phase = .querying k := by
+theorem resume_query (buf : ByteArray) (a : Await Dated) (q : Query) :
+    (resume ad now buf a).2 = .query q → ∃ k, (resume ad now buf a).1.phase = .querying k := by
   match a with
-  | .done (out, close) =>
+  | .done f =>
     intro h; simp only [resume, startSend] at h; split at h <;> simp [closeNow] at h
   | .query q' k => intro _; exact ⟨k, rfl⟩
 
 theorem serve_query (c : Bool) (p : σ) (buf : ByteArray) (q : Query) :
-    (serve ad c p buf).2 = .query q → ∃ k, (serve ad c p buf).1.phase = .querying k := by
+    (serve ad now c p buf).2 = .query q → ∃ k, (serve ad now c p buf).1.phase = .querying k := by
   unfold serve
   split
   · unfold wait; split <;> simp [closeNow]
@@ -409,10 +424,10 @@ theorem serve_query (c : Bool) (p : σ) (buf : ByteArray) (q : Query) :
     · unfold wait; split <;> simp [closeNow]
     · unfold startSend; split <;> simp [closeNow]
   · split
-    · exact resume_query ad _ _ _
+    · exact resume_query ad now _ _ _
     · simp [closeNow]
   · split
-    · exact resume_query ad _ _ _
+    · exact resume_query ad now _ _ _
     · simp [closeNow]
 
 /-- A query is asked for only together with the phase that waits for its
@@ -422,7 +437,7 @@ file's header, which the loop checks at run time, `serve.zig` `answered`),
 a connection has at most one query outstanding and that event finds its
 continuation. -/
 theorem step_query (s : State σ) (e : Event) (q : Query) :
-    (step ad s e).2 = .query q → ∃ k, (step ad s e).1.phase = .querying k := by
+    (step ad now s e).2 = .query q → ∃ k, (step ad now s e).1.phase = .querying k := by
   unfold step
   split
   · simp
@@ -431,7 +446,7 @@ theorem step_query (s : State σ) (e : Event) (q : Query) :
   · split
     · simp [closeNow]
     · split
-      · exact serve_query ad _ _ _ _
+      · exact serve_query ad now _ _ _ _
       · simp [closeNow]
   · split
     · simp [closeNow]
@@ -440,15 +455,15 @@ theorem step_query (s : State σ) (e : Event) (q : Query) :
       · split
         · simp [closeNow]
         · split
-          · exact serve_query ad _ _ _ _
+          · exact serve_query ad now _ _ _ _
           · simp
-  · exact resume_query ad _ _ _
+  · exact resume_query ad now _ _ _
   · simp [closeNow]
 
 /-- The interim response is sent at most once per request: serving a request
 for which `100 Continue` was already sent never starts another interim send. -/
 theorem serve_continued (p : σ) (buf : ByteArray) (out : ByteArray) (off : Nat)
-    (h : (serve ad true p buf).1.phase = .writing out off (.read true)) : False := by
+    (h : (serve ad now true p buf).1.phase = .writing out off (.read true)) : False := by
   revert h
   unfold serve
   split
@@ -485,9 +500,9 @@ theorem startSend_fed (p : σ) (buf out : ByteArray) (next : Next) (h : ad.Fed p
   · exact h
   · exact closeNow_fed ad
 
-theorem resume_fed (buf : ByteArray) (a : Await (ByteArray × Bool)) : FedInv ad (resume ad buf a).1 := by
+theorem resume_fed (buf : ByteArray) (a : Await Dated) : FedInv ad (resume ad now buf a).1 := by
   match a with
-  | .done (out, close) => exact startSend_fed ad _ _ _ _ (.init _)
+  | .done f => exact startSend_fed ad _ _ _ _ (.init _)
   | .query q k => exact .init _
 
 /-- What `handle` kept for `buf` while it waited is fed for `buf`. -/
@@ -496,7 +511,7 @@ theorem Fed.kept {p : σ} {buf : ByteArray} (h : ad.Fed p buf) (w : (ad.handle p
   have := Adapter.Fed.more (ad := ad) ByteArray.empty h w
   rwa [ByteArray.append_empty] at this
 
-theorem serve_fed (c : Bool) (p : σ) (buf : ByteArray) (h : ad.Fed p buf) : FedInv ad (serve ad c p buf).1 := by
+theorem serve_fed (c : Bool) (p : σ) (buf : ByteArray) (h : ad.Fed p buf) : FedInv ad (serve ad now c p buf).1 := by
   unfold serve
   split
   · rename_i hr; exact wait_fed ad _ _ _ (Fed.kept ad h (by rw [hr]; rfl))
@@ -506,14 +521,14 @@ theorem serve_fed (c : Bool) (p : σ) (buf : ByteArray) (h : ad.Fed p buf) : Fed
     · exact wait_fed ad _ _ _ hk
     · exact startSend_fed ad _ _ _ _ hk
   · split
-    · exact resume_fed ad _ _
+    · exact resume_fed ad now _ _
     · exact closeNow_fed ad
   · split
-    · exact resume_fed ad _ _
+    · exact resume_fed ad now _ _
     · exact closeNow_fed ad
 
 /-- Every step keeps the adapter's state fed for the buffer. -/
-theorem step_fed (s : State σ) (e : Event) (hs : FedInv ad s) : FedInv ad (step ad s e).1 := by
+theorem step_fed (s : State σ) (e : Event) (hs : FedInv ad s) : FedInv ad (step ad now s e).1 := by
   unfold step
   split
   · exact hs
@@ -522,7 +537,7 @@ theorem step_fed (s : State σ) (e : Event) (hs : FedInv ad s) : FedInv ad (step
   · split
     · exact closeNow_fed ad
     · split
-      · exact serve_fed ad _ _ _ (hs.extend ad _)
+      · exact serve_fed ad now _ _ _ (hs.extend ad _)
       · exact closeNow_fed ad
   · split
     · exact closeNow_fed ad
@@ -531,10 +546,26 @@ theorem step_fed (s : State σ) (e : Event) (hs : FedInv ad s) : FedInv ad (step
       · split
         · exact closeNow_fed ad
         · split
-          · exact serve_fed ad _ _ _ hs
+          · exact serve_fed ad now _ _ _ hs
           · exact hs
-  · exact resume_fed ad _ _
+  · exact resume_fed ad now _ _
   · exact closeNow_fed ad
+
+/-- The state after the events `es`, each reported at its own wall clock. -/
+def run (s : State σ) : List (Nat × Event) → State σ
+  | [] => s
+  | (t, e) :: es => run (step ad t s e).1 es
+
+/-- Successive steps keep the length bound and the adapter's fed state,
+whatever wall clock each event is reported at. With `initial`, which no clock
+reaches, every state the transport holds keeps both. -/
+theorem run_inv (es : List (Nat × Event)) : ∀ (s : State σ), Inv s → FedInv ad s → Inv (run ad s es) ∧ FedInv ad (run ad s es) := by
+  induction es with
+  | nil => intro s hi hf; exact ⟨hi, hf⟩
+  | cons x es ih => intro s hi hf; exact ih _ (step_inv ad x.1 s x.2 hi) (step_fed ad x.1 s x.2 hf)
+
+theorem initial_inv : Inv (initial ad) ∧ FedInv ad (initial ad) :=
+  ⟨⟨Nat.zero_le _, by simp [initial]⟩, .init _⟩
 
 /-- What a step leaves observable: the buffer, the phase and the action; the
 adapter's state is left out, since only the adapter reads it. -/
@@ -550,7 +581,7 @@ theorem startSend_view (p p' : σ) (buf out : ByteArray) (next : Next) :
 /-- Two states of the adapter fed for the same buffer serve it alike, when
 the adapter keeps its law. -/
 theorem serve_congr (hI : ad.Incremental) (c : Bool) (p p' : σ) (buf : ByteArray)
-    (h : ad.Fed p buf) (h' : ad.Fed p' buf) : view (serve ad c p buf) = view (serve ad c p' buf) := by
+    (h : ad.Fed p buf) (h' : ad.Fed p' buf) : view (serve ad now c p buf) = view (serve ad now c p' buf) := by
   have e : (ad.handle p buf).2 = (ad.handle p' buf).2 := by rw [hI _ _ h, hI _ _ h']
   unfold serve
   rw [e]
@@ -565,8 +596,8 @@ theorem serve_congr (hI : ad.Incremental) (c : Bool) (p p' : σ) (buf : ByteArra
 /-- A receive answered with another receive leaves the connection reading,
 with the received bytes appended to its buffer. -/
 theorem step_received_recv (s : State σ) (c : Bool) (hr : s.phase = .reading c) (d : ByteArray) (room : Nat)
-    (h : (step ad s (.received d)).2 = .recv room) :
-    (step ad s (.received d)).1.buf = s.buf ++ d ∧ (step ad s (.received d)).1.phase = .reading c := by
+    (h : (step ad now s (.received d)).2 = .recv room) :
+    (step ad now s (.received d)).1.buf = s.buf ++ d ∧ (step ad now s (.received d)).1.phase = .reading c := by
   revert h
   unfold step
   rw [hr]
@@ -581,22 +612,22 @@ theorem step_received_recv (s : State σ) (c : Bool) (hr : s.phase = .reading c)
         · rename_i hc; unfold wait; split <;> simp [closeNow, hc]
         · intro h; exact absurd h (startSend_recv ad _ _ _ _ _)
       · split
-        · intro h; exact absurd h (resume_recv ad _ _ _)
+        · intro h; exact absurd h (resume_recv ad now _ _ _)
         · simp [closeNow]
       · split
-        · intro h; exact absurd h (resume_recv ad _ _ _)
+        · intro h; exact absurd h (resume_recv ad now _ _ _)
         · simp [closeNow]
     · simp [closeNow]
 
-/-- Receiving `d₁` and then `d₂` ends as receiving `d₁ ++ d₂` at once, when
-the first receive was answered with another receive. -/
+/-- Receiving `d₁` at `t₁` and then `d₂` at `t₂` ends as receiving `d₁ ++ d₂`
+at once at `t₂`, when the first receive was answered with another receive. -/
 theorem step_split (hI : ad.Incremental) (s : State σ) (hs : FedInv ad s) (c : Bool) (hr : s.phase = .reading c)
-    (d₁ d₂ : ByteArray) (h₁ : 0 < d₁.size) (h₂ : 0 < d₂.size) (room : Nat)
-    (hrecv : (step ad s (.received d₁)).2 = .recv room) :
-    view (step ad (step ad s (.received d₁)).1 (.received d₂)) = view (step ad s (.received (d₁ ++ d₂))) := by
-  obtain ⟨hb, hp⟩ := step_received_recv ad s c hr d₁ room hrecv
-  have hf := step_fed ad s (.received d₁) hs
-  generalize step ad s (.received d₁) = r at hb hp hf
+    (t₁ t₂ : Nat) (d₁ d₂ : ByteArray) (h₁ : 0 < d₁.size) (h₂ : 0 < d₂.size) (room : Nat)
+    (hrecv : (step ad t₁ s (.received d₁)).2 = .recv room) :
+    view (step ad t₂ (step ad t₁ s (.received d₁)).1 (.received d₂)) = view (step ad t₂ s (.received (d₁ ++ d₂))) := by
+  obtain ⟨hb, hp⟩ := step_received_recv ad t₁ s c hr d₁ room hrecv
+  have hf := step_fed ad t₁ s (.received d₁) hs
+  generalize step ad t₁ s (.received d₁) = r at hb hp hf
   obtain ⟨⟨buf, p, phase⟩, a⟩ := r
   simp only at hb hp hf
   subst hb hp
@@ -610,59 +641,66 @@ theorem step_split (hI : ad.Incremental) (s : State σ) (hs : FedInv ad s) (c : 
   · rw [ByteArray.append_assoc]
     have hp' : ad.Fed p (s.buf ++ (d₁ ++ d₂)) := by
       have := hf.extend ad d₂; simpa [ByteArray.append_assoc] using this
-    exact serve_congr ad hI _ _ _ _ hp' (hs.extend ad (d₁ ++ d₂))
+    exact serve_congr ad t₂ hI _ _ _ _ hp' (hs.extend ad (d₁ ++ d₂))
   · rfl
 
 /-- The bytes of `ds` in order. -/
 def concat (ds : List ByteArray) : ByteArray := ds.foldr (· ++ ·) ByteArray.empty
 
-/-- Receives each of `ds` in turn; the last step's result, when every receive
-before it was answered with another receive. -/
-def receiveAll (s : State σ) : List ByteArray → Option (State σ × Action)
+/-- Receives each of `ds` in turn, each fragment at its own wall clock; the
+last step's result, when every receive before it was answered with another
+receive. -/
+def receiveAll (s : State σ) : List (Nat × ByteArray) → Option (State σ × Action)
   | [] => none
-  | [d] => some (step ad s (.received d))
-  | d :: ds =>
-    match step ad s (.received d) with
+  | [(t, d)] => some (step ad t s (.received d))
+  | (t, d) :: ds =>
+    match step ad t s (.received d) with
     | (s', .recv _) => receiveAll s' ds
     | _ => none
 
-/-- A request split into any fragments ends as it does in one receive: for
-an adapter that keeps its law, receiving the nonempty fragments `ds` one after
-another, while each but the last is answered with another receive, leaves the
-same buffer and phase and asks for the same action as receiving their
-concatenation at once. A split across which the connection sends (the interim
-`100 Continue`, or a response before pipelined bytes) is not covered here;
-there `step_fed` still gives every call of the adapter a `Fed` state, so the
-adapter answers each buffer as from `init`. -/
-theorem fragments (hI : ad.Incremental) (ds : List ByteArray) (hne : ∀ d ∈ ds, 0 < d.size) :
+/-- A request split into any fragments, received at any times, ends as it
+does in one receive at the time of the last: for an adapter that keeps its
+law, receiving the nonempty fragments `ds` one after another, while each but
+the last is answered with another receive, leaves the same buffer and phase
+and asks for the same action as receiving their concatenation at once. A
+split across which the connection sends (the interim `100 Continue`, or a
+response before pipelined bytes) is not covered here; there `step_fed` still
+gives every call of the adapter a `Fed` state, so the adapter answers each
+buffer as from `init`. -/
+theorem fragments (hI : ad.Incremental) (ds : List (Nat × ByteArray)) (hne : ∀ x ∈ ds, 0 < x.2.size) :
     ∀ (s : State σ), FedInv ad s → ∀ (c : Bool), s.phase = .reading c →
-      ∀ r, receiveAll ad s ds = some r → view r = view (step ad s (.received (concat ds))) := by
+      ∀ r t d, receiveAll ad s ds = some r → ds.getLast? = some (t, d) →
+        view r = view (step ad t s (.received (concat (ds.map (·.2))))) := by
   induction ds with
-  | nil => intro s _ c _ r h; simp [receiveAll] at h
-  | cons d ds ih =>
-    intro s hs c hr r h
-    match ds, ih, hne, h with
-    | [], _, _, h =>
+  | nil => intro s _ c _ r t d h; simp [receiveAll] at h
+  | cons x ds ih =>
+    obtain ⟨t₁, d₁⟩ := x
+    intro s hs c hr r t d h hl
+    match ds, ih, hne, h, hl with
+    | [], _, _, h, hl =>
       simp only [receiveAll, Option.some.injEq] at h
+      simp only [List.getLast?_singleton, Option.some.injEq, Prod.mk.injEq] at hl
+      obtain ⟨rfl, rfl⟩ := hl
       subst h
       simp [concat, ByteArray.append_empty]
-    | d₂ :: ds', ih, hne, h =>
+    | x₂ :: ds', ih, hne, h, hl =>
       simp only [receiveAll] at h
-      generalize hstep : step ad s (.received d) = st at h
+      generalize hstep : step ad t₁ s (.received d₁) = st at h
       obtain ⟨s', a⟩ := st
       cases a with
       | recv room =>
         simp only at h
-        have hrecv : (step ad s (.received d)).2 = .recv room := by rw [hstep]
-        obtain ⟨-, hp⟩ := step_received_recv ad s c hr d room hrecv
-        have hf := step_fed ad s (.received d) hs
+        have hrecv : (step ad t₁ s (.received d₁)).2 = .recv room := by rw [hstep]
+        obtain ⟨-, hp⟩ := step_received_recv ad t₁ s c hr d₁ room hrecv
+        have hf := step_fed ad t₁ s (.received d₁) hs
         rw [hstep] at hp hf
-        have hne' : ∀ x ∈ d₂ :: ds', 0 < x.size := fun x hx => hne x (List.mem_cons_of_mem _ hx)
-        rw [ih hne' s' hf c hp r h]
-        have hrest : 0 < (concat (d₂ :: ds')).size := by
-          simp only [concat, List.foldr_cons, ByteArray.size_append]
-          have := hne d₂ (by simp); omega
-        have := step_split ad hI s hs c hr d (concat (d₂ :: ds')) (hne d (by simp)) hrest room hrecv
+        have hne' : ∀ x ∈ x₂ :: ds', 0 < x.2.size := fun x hx => hne x (List.mem_cons_of_mem _ hx)
+        rw [List.getLast?_cons_cons] at hl
+        rw [ih hne' s' hf c hp r t d h hl]
+        have hrest : 0 < (concat ((x₂ :: ds').map (·.2))).size := by
+          simp only [concat, List.map_cons, List.foldr_cons, ByteArray.size_append]
+          have := hne x₂ (by simp); omega
+        have := step_split ad hI s hs c hr t₁ t d₁ (concat ((x₂ :: ds').map (·.2))) (hne (t₁, d₁) (by simp)) hrest room hrecv
         rw [hstep] at this
         simpa [concat] using this
       | _ => simp at h

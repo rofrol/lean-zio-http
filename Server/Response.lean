@@ -202,15 +202,16 @@ application's response (`render`; no body for HEAD), except that CONNECT gets
 501 without reaching the application. A 2xx answer to CONNECT turns the
 connection into a tunnel (RFC 9110 9.3.6), which this server does not
 implement, so no `Response` may stand for one. The Date header is the time
-the request was framed. -/
-def answer (own : OwnFields) (now : Nat) (app : Handler) (req : Request) (close : Bool) : Await (ByteArray × Bool) :=
-  if req.method == "CONNECT" then .done (error own now 501, true)
-  else (app req).map fun r => render own now r close (req.method == "HEAD")
+of the event that sends the response (`Dated`): the receive that completed the
+request, or the answer of its last query. -/
+def answer (own : OwnFields) (app : Handler) (req : Request) (close : Bool) : Await Dated :=
+  if req.method == "CONNECT" then .done fun now => (error own now 501, true)
+  else (app req).map fun r now => render own now r close (req.method == "HEAD")
 
 /-- The adapter's reply for a framed request of `consumed` bytes: the response
 at once, or the query it waits for. -/
-def reply (consumed : Nat) : Await (ByteArray × Bool) → Reply
-  | .done (bytes, close) => .respond consumed bytes close
+def reply (consumed : Nat) : Await Dated → Reply
+  | .done response => .respond consumed response
   | .query q k => .await consumed q k
 
 end Server.Response

@@ -86,7 +86,7 @@ def fragmented {σ : Type} (ad : Adapter σ) (k : Nat) (b : ByteArray) : Option 
   let mut s := Conn.initial ad
   let mut off := 0
   while off < b.size do
-    let (s', a) := Conn.step ad s (.received (b.extract off (min b.size (off + k))))
+    let (s', a) := Conn.step ad 0 s (.received (b.extract off (min b.size (off + k))))
     off := off + k
     match a with
     | .recv _ => s := s'

@@ -31,7 +31,7 @@ open Server
 
 /-- Bytes the request consumes plus the response's size, or 0 when it needs more; also forces the result. -/
 def consumedOf : Reply → Nat
-  | .respond n r _ => n + r.size
+  | .respond n f => n + (f 0).1.size
   | _ => 0
 
 /-- Prints a line and flushes it, so that each row appears as it is measured. -/
@@ -76,8 +76,8 @@ def fragmentedSize {σ : Type} (ad : Adapter σ) (k : Nat) (b : ByteArray) : Nat
   ((Corpus.fragmented ad k b).map (·.size)).getD 0
 
 def main : IO Unit := do
-  let hand := HandParser.adapter {} App.Hello.app 0
-  let h1 := H1Adapter.adapter {} App.Hello.app 0
+  let hand := HandParser.adapter {} App.Hello.app
+  let h1 := H1Adapter.adapter {} App.Hello.app
   -- Each parser in one call, and a request fed through `Conn.step` in receives of `k` bytes.
   let adapters : List (String × (ByteArray → Nat) × (ByteArray → Reply) × (Nat → ByteArray → Nat)) :=
     [("hand-written", Corpus.handParse, (fun b => (hand.handle hand.init b).2), (fragmentedSize hand)),

@@ -46,7 +46,7 @@ imports it must report.
 | module | role | may import |
 |---|---|---|
 | `Server.Query` | a database query and its result as values, and `Await`, a computation that may wait for queries | nothing |
-| `Server.Wire` | the limits, `Server.Reply` (the adapter's answer to the bytes buffered on a connection) and `Server.Adapter`, the adapter's state kept between receives and the law `Adapter.Incremental` it keeps | `Server.Query` |
+| `Server.Wire` | the limits, `Server.Reply` (the adapter's answer to the bytes buffered on a connection, its responses functions of the clock, `Server.Dated`) and `Server.Adapter`, the adapter's state kept between receives and the law `Adapter.Incremental` it keeps | `Server.Query` |
 | `Server.Handler` | the interface the application implements: `Request → Await Response` | `Server.Query` |
 | `Server.Conn` | a connection's lifecycle: one state type and a pure `step` over the loop's events, with theorems | `Server.Wire` |
 | `Server.Transport` | the loop's Lean side: `ekk_serve`, the command line, the `server_exports` command that exports the loop's entry points | `Server.Wire`, `Server.Conn` |

@@ -172,20 +172,19 @@ def toRequest (buf : ByteArray) (h : Request.Head) (body : ByteArray) : Server.R
 
 /-- Answers the bytes buffered on a connection with the application's `app`,
 given the parser state `p` kept for them; the responses the server writes
-itself carry `own`'s fields. `now` is the wall clock in Unix seconds, for the
-Date header. -/
-def handle (own : Server.Response.OwnFields) (app : Handler) (now : Nat) (p : Parser) (buf : ByteArray) :
+itself carry `own`'s fields. The clock reaches only the responses (`Dated`). -/
+def handle (own : Server.Response.OwnFields) (app : Handler) (p : Parser) (buf : ByteArray) :
     Parser × Reply :=
   let (p, parsed) := p.parse buf
   (p, match parsed with
     | .needMore => .needMore
     | .awaitingBody => .continue Server.Response.continueBytes
-    | .bad status => .respond buf.size (Server.Response.error own now status) true
+    | .bad status => .respond buf.size fun now => (Server.Response.error own now status, true)
     | .ok h body consumed close =>
-      Server.Response.reply consumed (Server.Response.answer own now app (toRequest buf h body) close))
+      Server.Response.reply consumed (Server.Response.answer own app (toRequest buf h body) close))
 
 /-- The adapter the transport drives: `server_exports (Server.H1Adapter.adapter own app)`. -/
-def adapter (own : Server.Response.OwnFields) (app : Handler) (now : Nat) : Server.Adapter Parser :=
-  { init := {}, handle := handle own app now }
+def adapter (own : Server.Response.OwnFields) (app : Handler) : Server.Adapter Parser :=
+  { init := {}, handle := handle own app }
 
 end Server.H1Adapter

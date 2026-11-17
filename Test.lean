@@ -27,15 +27,15 @@ response, 4 waits for a query. -/
 def resultKind : Reply → UInt8
   | .needMore => 0
   | .continue _ => 3
-  | .respond _ _ close => if close then 2 else 1
+  | .respond _ f => if (f 0).2 then 2 else 1
   | .await .. => 4
 
 def consumed : Reply → Nat
-  | .respond n _ _ => n
+  | .respond n _ => n
   | _ => 0
 
 def responseOf : Reply → String
-  | .respond _ r _ => String.fromUTF8! r
+  | .respond _ f => String.fromUTF8! (f 0).1
   | .continue r => String.fromUTF8! r
   | .needMore | .await .. => ""
 
@@ -64,11 +64,11 @@ def splitHead : String :=
 structure Adapter where
   name : String
   σ : Type
-  make : Response.OwnFields → Handler → Nat → Server.Adapter σ
+  make : Response.OwnFields → Handler → Server.Adapter σ
 
 /-- The adapter's answer to `buf` in one call, from its initial state. -/
-def Adapter.handle (ad : Adapter) (own : Response.OwnFields) (app : Handler) (now : Nat) (buf : ByteArray) : Reply :=
-  let a := ad.make own app now
+def Adapter.handle (ad : Adapter) (own : Response.OwnFields) (app : Handler) (buf : ByteArray) : Reply :=
+  let a := ad.make own app
   (a.handle a.init buf).2
 
 def h1 : Adapter := { name := "H1", σ := H1Adapter.Parser, make := H1Adapter.adapter }
@@ -194,46 +194,46 @@ def expectClose (what : String) (a : Conn.Action) : Check Unit :=
 partial send, the rest of the send, the peer closing, and an event after
 close. -/
 def connScenario (ad : Adapter) : Check Unit := do
-  let h := ad.make {} App.Hello.app 0
+  let h := ad.make {} App.Hello.app
   let w := s!"conn {ad.name}"
   let part1 := bytes "GET / HTTP/1.1\r\nHo"
-  let (s1, a1) := Conn.step h (Conn.initial h) (.received part1)
+  let (s1, a1) := Conn.step h 0 (Conn.initial h) (.received part1)
   expectRecv w a1 (inCap - part1.size)
-  let (s2, a2) := Conn.step h s1 (.received (bytes "st: a\r\n\r\n"))
+  let (s2, a2) := Conn.step h 0 s1 (.received (bytes "st: a\r\n\r\n"))
   let some (resp, off) ← expectSend s!"{w}: a complete request" a2 | return
   if off != 0 then fail s!"{w}: the response starts at {off}"
   if s2.buf.size != 0 then fail s!"{w}: the request was not consumed"
-  let (s3, a3) := Conn.step h s2 (.sent 10)
+  let (s3, a3) := Conn.step h 0 s2 (.sent 10)
   match a3 with
   | .send d 10 => if d.size != resp.size then fail s!"{w}: the rest is another response"
   | _ => fail s!"{w}: a partial send did not continue at offset 10"
-  let (s4, a4) := Conn.step h s3 (.sent (resp.size - 10))
+  let (s4, a4) := Conn.step h 0 s3 (.sent (resp.size - 10))
   expectRecv s!"{w}: after the response" a4 inCap
-  let (s5, a5) := Conn.step h s4 (.received ByteArray.empty)
+  let (s5, a5) := Conn.step h 0 s4 (.received ByteArray.empty)
   expectClose s!"{w}: the peer closing" a5
-  match (Conn.step h s5 (.sent 1)).2 with
+  match (Conn.step h 0 s5 (.sent 1)).2 with
   | .none => pure ()
   | _ => fail s!"{w}: an event after close was acted on"
-  expectClose s!"{w}: a send report while reading" (Conn.step h (Conn.initial h) (.sent 1)).2
+  expectClose s!"{w}: a send report while reading" (Conn.step h 0 (Conn.initial h) (.sent 1)).2
 
 /-- `Expect: 100-continue` through `Conn.step` with H1: the interim response is
 sent once, also across a partial send and a body arriving in two parts, and
 the final response follows the body. -/
 def continueScenario : Check Unit := do
-  let h := H1Adapter.adapter {} App.Fixture.app 0
+  let h := H1Adapter.adapter {} App.Fixture.app
   let head := bytes "POST /echo HTTP/1.1\r\nHost: a\r\nExpect: 100-continue\r\nContent-Length: 5\r\n\r\n"
-  let (s1, a1) := Conn.step h (Conn.initial h) (.received head)
+  let (s1, a1) := Conn.step h 0 (Conn.initial h) (.received head)
   let some (interim, _) ← expectSend "100-continue: the head" a1 | return
   if interim != Response.continueBytes then fail "100-continue: the first send is not the interim response"
-  let (s2, a2) := Conn.step h s1 (.sent 5)
+  let (s2, a2) := Conn.step h 0 s1 (.sent 5)
   match a2 with
   | .send _ 5 => pure ()
   | _ => fail "100-continue: a partial interim send did not continue"
-  let (s3, a3) := Conn.step h s2 (.sent (interim.size - 5))
+  let (s3, a3) := Conn.step h 0 s2 (.sent (interim.size - 5))
   expectRecv "100-continue: after the interim response" a3 (inCap - head.size)
-  let (s4, a4) := Conn.step h s3 (.received (bytes "he"))
+  let (s4, a4) := Conn.step h 0 s3 (.received (bytes "he"))
   expectRecv "100-continue: part of the body" a4 (inCap - head.size - 2)
-  let (_, a5) := Conn.step h s4 (.received (bytes "llo"))
+  let (_, a5) := Conn.step h 0 s4 (.received (bytes "llo"))
   let some (final, _) ← expectSend "100-continue: the body" a5 | return
   let text := String.fromUTF8! final
   if !text.startsWith "HTTP/1.1 200 OK" || !text.endsWith "\r\n\r\nhello" then
@@ -243,12 +243,12 @@ def continueScenario : Check Unit := do
 head over `maxHeadBytes` followed by the largest body, in receives of 1460
 bytes, is answered with 431 before the buffer fills, not closed silently. -/
 def limitScenario (ad : Adapter) : Check Unit := do
-  let h := ad.make {} App.Hello.app 0
+  let h := ad.make {} App.Hello.app
   let b := bytes (splitHead ++ big maxBodyBytes)
   let mut s := (Conn.initial h)
   let mut off := 0
   while off < b.size do
-    let (s', a) := Conn.step h s (.received (b.extract off (min b.size (off + 1460))))
+    let (s', a) := Conn.step h 0 s (.received (b.extract off (min b.size (off + 1460))))
     off := off + 1460
     match a with
     | .recv _ => s := s'
@@ -261,10 +261,10 @@ def limitScenario (ad : Adapter) : Check Unit := do
 
 /-- The shutdown: a declined receive closes the connection in every live phase. -/
 def refusedScenario : Check Unit := do
-  let h := H1Adapter.adapter {} App.Hello.app 0
-  expectClose "refused while reading" (Conn.step h (Conn.initial h) .refused).2
-  let (s, _) := Conn.step h (Conn.initial h) (.received (bytes "GET / HTTP/1.1\r\nHo"))
-  expectClose "refused with a partial request" (Conn.step h s .refused).2
+  let h := H1Adapter.adapter {} App.Hello.app
+  expectClose "refused while reading" (Conn.step h 0 (Conn.initial h) .refused).2
+  let (s, _) := Conn.step h 0 (Conn.initial h) (.received (bytes "GET / HTTP/1.1\r\nHo"))
+  expectClose "refused with a partial request" (Conn.step h 0 s .refused).2
 
 def expectQuery (what : String) (a : Conn.Action) (sql : String) (params : Array (Option String)) : Check Unit :=
   match a with
@@ -279,34 +279,65 @@ then sends the response; a request pipelined behind it waits in the buffer
 (no receive while querying) and is answered right after. A lost connection
 answers 503; a failure report while querying closes. -/
 def queryScenario : Check Unit := do
-  let h := H1Adapter.adapter {} App.Db.app 0
+  let h := H1Adapter.adapter {} App.Db.app
   let req := "GET /chain HTTP/1.1\r\nHost: a\r\n\r\n"
   let next := "GET / HTTP/1.1\r\nHost: a\r\n\r\n"
-  let (s1, a1) := Conn.step h (Conn.initial h) (.received (bytes (req ++ next)))
+  let (s1, a1) := Conn.step h 0 (Conn.initial h) (.received (bytes (req ++ next)))
   expectQuery "query: the first query" a1 "SELECT 1" #[]
   if s1.buf != bytes next then fail "query: the request was not consumed, or the pipelined one was"
-  let (s2, a2) := Conn.step h s1 (.answered (.rows #["?column?"] #[#[some "1"]]))
+  let (s2, a2) := Conn.step h 0 s1 (.answered (.rows #["?column?"] #[#[some "1"]]))
   expectQuery "query: the second query" a2 "SELECT $1::int + 1" #[some "1"]
-  let (s3, a3) := Conn.step h s2 (.answered (.rows #["?column?"] #[#[some "2"]]))
+  let (s3, a3) := Conn.step h 0 s2 (.answered (.rows #["?column?"] #[#[some "2"]]))
   let some (resp, _) ← expectSend "query: the response" a3 | return
   let text := String.fromUTF8! resp
   if statusLine resp != "HTTP/1.1 200 OK" || !text.endsWith "\r\n\r\n2" then fail s!"query: answered {repr text}"
-  let (s4, a4) := Conn.step h s3 (.sent resp.size)
+  let (s4, a4) := Conn.step h 0 s3 (.sent resp.size)
   let some (resp2, _) ← expectSend "query: the pipelined request" a4 | return
   if statusLine resp2 != "HTTP/1.1 200 OK" then fail "query: the pipelined request was not answered"
   if s4.buf.size != 0 then fail "query: the pipelined request was not consumed"
   -- A lost connection: 503, and the connection goes on.
-  let (s5, _) := Conn.step h (Conn.initial h) (.received (bytes "GET /db?id=42 HTTP/1.1\r\nHost: a\r\n\r\n"))
-  let (_, a6) := Conn.step h s5 (.answered (.error "08006" "lost"))
+  let (s5, _) := Conn.step h 0 (Conn.initial h) (.received (bytes "GET /db?id=42 HTTP/1.1\r\nHost: a\r\n\r\n"))
+  let (_, a6) := Conn.step h 0 s5 (.answered (.error "08006" "lost"))
   let some (resp3, _) ← expectSend "query: a lost connection" a6 | return
   if statusLine resp3 != "HTTP/1.1 503 Service Unavailable" then fail s!"query: a lost connection answered {statusLine resp3}"
-  expectClose "query: a failure while querying" (Conn.step h s5 .failed).2
+  expectClose "query: a failure while querying" (Conn.step h 0 s5 .failed).2
   -- An answer out of place (no query asked) closes.
-  expectClose "query: an answer while reading" (Conn.step h (Conn.initial h) (.answered (.rows #[] #[]))).2
+  expectClose "query: an answer while reading" (Conn.step h 0 (Conn.initial h) (.answered (.rows #[] #[]))).2
+
+/-- Clocks at which two responses (`Dated`) are compared: the epoch and the
+widest Date (the year 9999). -/
+def clocks : List Nat := [0, 253402300799]
+
+def sameDated (a b : Dated) : Bool := clocks.all fun t => a t == b t
+
+/-- The clock reaches a response only at the event that sends it, through one
+adapter value: a request completed by its second receive carries that
+receive's Date, not the first's; a request pipelined behind it, answered when
+the response before it is sent, carries that send's Date; a response that
+waited for a query carries the answer's Date, not the receive's. -/
+def clockScenario : Check Unit := do
+  let h := H1Adapter.adapter {} App.Db.app
+  let hasDate (what : String) (d : ByteArray) (t : Nat) : Check Unit := do
+    let want := "\r\nDate: " ++ String.fromUTF8! (Response.pushDate ByteArray.empty t) ++ "\r\n"
+    let text := String.fromUTF8! d
+    if (text.splitOn want).length ≤ 1 then fail s!"clock: {what}: no {repr want} in {repr text}"
+  let req := "GET / HTTP/1.1\r\nHost: a\r\n\r\n"
+  let (s1, a1) := Conn.step h 951782400 (Conn.initial h) (.received (bytes "GET / HTTP/1.1\r\nHo"))
+  expectRecv "clock: the first part" a1 (inCap - 18)
+  let (s2, a2) := Conn.step h 1767225599 s1 (.received (bytes ("st: a\r\n\r\n" ++ req)))
+  let some (r2, _) ← expectSend "clock: the completed request" a2 | return
+  hasDate "the completing receive" r2 1767225599
+  let (_, a3) := Conn.step h 1793580020 s2 (.sent r2.size)
+  let some (r3, _) ← expectSend "clock: the pipelined request" a3 | return
+  hasDate "the send before a pipelined request" r3 1793580020
+  let (s4, _) := Conn.step h 951782400 (Conn.initial h) (.received (bytes "GET /db?id=42 HTTP/1.1\r\nHost: a\r\n\r\n"))
+  let (_, a5) := Conn.step h 1793580020 s4 (.answered (.error "08006" "lost"))
+  let some (r5, _) ← expectSend "clock: the answered query" a5 | return
+  hasDate "the query's answer" r5 1793580020
 
 /-- Two continuations' first steps alike: the same response, or the same query. -/
-def sameStep : Await (ByteArray × Bool) → Await (ByteArray × Bool) → Bool
-  | .done (a, c), .done (b, d) => a == b && c == d
+def sameStep : Await Dated → Await Dated → Bool
+  | .done a, .done b => sameDated a b
   | .query q _, .query r _ => q.sql == r.sql && q.params == r.params
   | _, _ => false
 
@@ -316,7 +347,7 @@ first step on a row, on no rows and on an error. -/
 def sameReply : Reply → Reply → Bool
   | .needMore, .needMore => true
   | .continue a, .continue b => a == b
-  | .respond n a c, .respond m b d => n == m && a == b && c == d
+  | .respond n a, .respond m b => n == m && sameDated a b
   | .await n q k, .await m r l =>
     n == m && q.sql == r.sql && q.params == r.params &&
       [Query.Result.rows #["id", "randomnumber"] #[#[some "42", some "7"]], .rows #[] #[], .error "08006" "lost"].all
@@ -327,7 +358,7 @@ def sameReply : Reply → Reply → Bool
 each call with the state the previous one kept while its answer waited (as
 `Conn` does), answers every prefix as one call from the initial state does. -/
 def lawFor (ad : Adapter) (app : Handler) (what : String) (b : ByteArray) (k : Nat) : Check Unit := do
-  let a := ad.make {} app 0
+  let a := ad.make {} app
   let mut p := a.init
   let mut e := 0
   while e < b.size do
@@ -358,7 +389,7 @@ def corpusScenario : Check Unit := do
     if Corpus.handParse b != Corpus.h1Parse b then
       fail s!"corpus {name}: hand-written consumes {Corpus.handParse b}, H1 {Corpus.h1Parse b}"
   for ad in [h1, hand] do
-    let a := ad.make {} App.Hello.app 0
+    let a := ad.make {} App.Hello.app
     for (name, req) in Corpus.fragmentCorpus do
       let b := bytes req
       let some whole := Corpus.fragmented a b.size b
@@ -376,7 +407,7 @@ def lawCases (ad : Adapter) : Check Unit := do
     -- Every split in two (the second call extends the first's buffer).
     for i in [1:b.size] do
       if b.size ≤ 600 then
-        let a := ad.make {} c.app 0
+        let a := ad.make {} c.app
         let (p, r) := a.handle a.init (b.extract 0 i)
         if r.waits then
           let r2 := (a.handle p b).2
@@ -389,7 +420,7 @@ def lawCases (ad : Adapter) : Check Unit := do
 
 def adapterCases (ad : Adapter) : Check Unit := do
   for c in cases do
-    let r := ad.handle {} c.app 0 (bytes c.request)
+    let r := ad.handle {} c.app (bytes c.request)
     let (kind, status) := if ad.name == hand.name then c.hand.getD (c.kind, c.status) else (c.kind, c.status)
     let want := c.consumes.getD (if kind == 0 then 0 else (bytes c.request).size)
     if resultKind r != kind || statusOf r != status || consumed r != want then
@@ -397,10 +428,10 @@ def adapterCases (ad : Adapter) : Check Unit := do
   for req in framed do
     let b := bytes req
     for k in [0:b.size] do
-      if resultKind (ad.handle {} App.Hello.app 0 (b.extract 0 k)) != 0 then
+      if resultKind (ad.handle {} App.Hello.app (b.extract 0 k)) != 0 then
         fail s!"{ad.name} prefix {k} of {repr req} did not ask for more bytes"
   -- HEAD: the GET's Content-Length, no body.
-  let r := responseOf (ad.handle {} App.Hello.app 0 (bytes "HEAD / HTTP/1.1\r\nHost: a\r\n\r\n"))
+  let r := responseOf (ad.handle {} App.Hello.app (bytes "HEAD / HTTP/1.1\r\nHost: a\r\n\r\n"))
   if !r.endsWith "\r\nContent-Length: 13\r\n\r\n" then fail s!"{ad.name} HEAD: {repr r}"
 
 /-! ## Header fields on the server's own responses (`Response.OwnFields`) -/
@@ -421,9 +452,9 @@ def ownFieldCases (ad : Adapter) : Check Unit := do
   let lines := String.join (own.fields.toList.map fun (n, v) => s!"{n}: {v}\r\n")
   let ct := "Content-Type: text/plain; charset=utf-8\r\n"
   for c in cases do
-    let r0 := responseOf (ad.handle {} c.app 0 (bytes c.request))
-    let r1 := responseOf (ad.handle own c.app 0 (bytes c.request))
-    let status := ((statusOf (ad.handle {} c.app 0 (bytes c.request))).splitOn " ")[1]?.getD ""
+    let r0 := responseOf (ad.handle {} c.app (bytes c.request))
+    let r1 := responseOf (ad.handle own c.app (bytes c.request))
+    let status := ((statusOf (ad.handle {} c.app (bytes c.request))).splitOn " ")[1]?.getD ""
     let want := if ownStatuses.contains status then r0.replace ct (ct ++ lines) else r0
     if ownStatuses.contains status && !r0.contains ct then fail s!"{ad.name} {c.name}: no Content-Type in {repr r0}"
     if r1 != want then fail s!"{ad.name} own fields, {c.name}: {repr r1}, want {repr want}"
@@ -431,8 +462,8 @@ def ownFieldCases (ad : Adapter) : Check Unit := do
   for status in [400, 500, 501] do
     let app : Handler := fun _ => .done { status, headers := #[Response.contentType], body := "x".toUTF8 }
     let req := bytes "GET / HTTP/1.1\r\nHost: a\r\n\r\n"
-    let r0 := responseOf (ad.handle {} app 0 req)
-    let r1 := responseOf (ad.handle own app 0 req)
+    let r0 := responseOf (ad.handle {} app req)
+    let r1 := responseOf (ad.handle own app req)
     if !r0.startsWith s!"HTTP/1.1 {status} " || !r0.endsWith "\r\n\r\nx" || r1 != r0 then
       fail s!"{ad.name} own fields, the application's {status}: {repr r1}"
 
@@ -662,6 +693,7 @@ def main : IO UInt32 := do
     continueScenario
     refusedScenario
     queryScenario
+    clockScenario
     corpusScenario
     for (secs, want) in dates do
       let got := String.fromUTF8! (Response.pushDate ByteArray.empty secs)
