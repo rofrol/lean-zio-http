@@ -1,9 +1,9 @@
 ## Next, in order
 
-53rwgc Linux acceptance runs for the Lean HTTP server
 ogcdwm Should the transport tests run on Linux, so the Unix-domain parked-send test is checked on epoll and io_uring?
 ncvxfx Should a query whose deadline expires during the statement Close keep its known error?
 im7c5q Should dusty-hello give dusty the real zio module instead of its stub?
+53rwgc Linux acceptance runs for the Lean HTTP server
 
 ## Proposed
 
