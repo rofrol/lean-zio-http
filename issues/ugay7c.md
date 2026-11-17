@@ -1,0 +1,3 @@
+Pin the HttpArena containers' debian:trixie base image by digest
+
+Seen while doing zg4hrz, which pinned only linux/Dockerfile: `bench/arena/local.Dockerfile:4` still has `FROM debian:trixie`, and `bench/arena/build.sh:98` runs `debian:trixie` unpinned, so a rebuild of the arena images may use another Debian point release than the Linux validation container (linux/Dockerfile pins `debian:trixie@sha256:9c6e3814...` as of 2026-11-18). Question for the owner: pin them to the same digest (one place to update, noted with its date), or leave them unpinned because they build benchmark images, not validation evidence?
