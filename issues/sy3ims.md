@@ -1,0 +1,5 @@
+Decide whether to report upstream that Std.Http's H1 reparses an unfinished line from its start on every call
+
+Seen while doing daaqgn (commit a7d6c0b on rr2/daaqgn). The H1 adapter now keeps the H1 machine between receives, but the toolchain's `parseWith` (Std/Http/Protocol/H1.lean, nightly-2026-11-14, around line 646) leaves its input where it was when a line has not ended, so a line is parsed again from its start on every call. CPU stays quadratic in the longest line: the corpus's largest head (almost all one header line) in 1-byte receives costs 182 ms with H1 against 116 ms with the hand-written parser (`lsrv-bench`, M1 2026-11-17, README "Fragmented requests"); bounded by maxHeadBytes. The same `needMore` path also pushes a `needMoreData` event on every call, which the adapter now drops (`takeEvents`).
+
+Question for the owner: is this a bug against H1's documented contract (then fork with a regression test and a PR, per AGENTS.md Rule 6) or a limitation to accept? No local workaround was added.

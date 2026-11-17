@@ -1,6 +1,5 @@
 ## Next, in order
 
-daaqgn Keep the H1 parser's state across receives instead of reparsing the whole buffer
 p5pyti The servers exit silently when their port is taken, and the checks share 127.0.0.1:8083 with ekklesiai.org's
 6zs4mr check.sh still takes about nine minutes: lsrv-bench, not the load measurements, holds most of it
 i35sos Invalidate the per-connection statement cache after a schema change
@@ -10,6 +9,10 @@ tc5rsx Bound the memory of a PostgreSQL result before it is fully received
 u4moqo Move the toolchain to the first nightly with lean4 PR 16417 (Std.Http RFC fixes)
 
 ## Proposed
+
+sxrhgm Bound or measure the worst case of the adapter state a connection retains
+kvnm3u Decide whether the type, not a comment, should keep the clock out of the adapter's kept state
+sy3ims Decide whether to report upstream that Std.Http's H1 reparses an unfinished line from its start on every call
 
 ## Needs a decision
 
