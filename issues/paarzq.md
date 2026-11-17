@@ -9,3 +9,5 @@ Options:
 2. Keep one send per response; pipelined throughput stays bounded by the send's cost. The tail is fixed by the accept proposal alone.
 
 Recommendation: decide after the accept fix and a re-measurement, since the arena's current figures cover only half the connections.
+
+Considered 2026-11-17 by the coordinating session with sol (consult call 36443c1b): later, third, after remeasurement. A change to the core's step contract needs tests of ordering, partial writes, bounded buffers and backpressure.
