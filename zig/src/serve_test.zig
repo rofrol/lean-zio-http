@@ -684,6 +684,96 @@ test "the shutdown cancels each receive in flight without calling back into the 
     }
 }
 
+test "startLoop joins its loop to no LoopGroup: the loop alone services its sockets" {
+    // The loops share one listening socket, which is safe only while no zio
+    // LoopGroup joins them (serve.zig, the comment above
+    // `for (loops) |*lp| lp.* = .{ .lfd = lfd };` in `ekk_serve`). Checked
+    // on the state `loop.init` left, not on how its options are spelled: in
+    // the pinned zio (830564437b2c) a loop given no `loop_group` uses its own
+    // `internal_loop_group`, and every loop of a group counts in its `loops`
+    // (src/ev/loop.zig:515-516, 559-563, 574); the registration table its
+    // sockets park on is that group's (loop.zig:582). Recheck at each update
+    // of zio, with `pg.ownLoop`, the runtime backstop in every callback.
+    var s: Single = undefined;
+    try s.init(64);
+    defer s.deinit();
+    try std.testing.expect(s.lp.loop.loop_group == &s.lp.loop.internal_loop_group);
+    try std.testing.expectEqual(@as(u32, 1), s.lp.loop.internal_loop_group.loops.load(.monotonic));
+    s.lp.stop.notify();
+    try s.finish();
+}
+
+/// Whether `name`, the value of an identifier or a string literal, is one
+/// of zio's names for grouping loops.
+fn namesLoopGroup(name: []const u8) bool {
+    return std.mem.eql(u8, name, "loop_group") or std.mem.eql(u8, name, "LoopGroup");
+}
+
+/// The value of a string literal token (quotes included), escapes decoded.
+fn literalValue(text: []const u8) ![]u8 {
+    return std.zig.string_literal.parseAlloc(std.testing.allocator, text);
+}
+
+test "the transport's Zig sources never name zio's loop grouping" {
+    // The test above checks the loop `startLoop` sets up; this one reads the
+    // transport's Zig sources for a grouping spelled anywhere else (a second
+    // `loop.init`, an options value built elsewhere). It is lexical: no
+    // identifier (plain or `@"..."`), string literal (as in
+    // `@field(options, "...")`) or line of a multiline string has the value
+    // `loop_group` or `LoopGroup`, escapes decoded. Comments, which name the
+    // rule, are ignored. Every `@import` must name `std`, `zio` or a file
+    // scanned here, so a new module of the transport fails until it is
+    // added; Zig takes `@import`'s operand only as a string literal (Zig
+    // 0.17.1: "@import operand must be a string literal", also for
+    // `@import(("..."))`), so each is read as `@import("...")`. It does not
+    // evaluate code: a name computed at comptime is not seen, nor zio's own
+    // `Runtime`, which groups its executors' loops itself
+    // (src/runtime.zig:702, 1807 at the pin); a callback run on another
+    // loop still meets `pg.ownLoop`.
+    const sources = [_]struct { name: []const u8, text: [:0]const u8 }{
+        .{ .name = "serve.zig", .text = @embedFile("serve.zig") },
+        .{ .name = "pg.zig", .text = @embedFile("pg.zig") },
+    };
+    const a = std.testing.allocator;
+    for (sources) |src| {
+        var tokens = std.zig.Tokenizer.init(src.text);
+        // The tokens still owed by an `@import`: its parenthesis, its path.
+        var import_step: enum { none, paren, path } = .none;
+        while (true) {
+            const t = tokens.next();
+            if (t.tag == .eof) break;
+            const text = src.text[t.loc.start..t.loc.end];
+            const value: ?[]u8 = switch (t.tag) {
+                .identifier => if (text[0] == '@') try literalValue(text[1..]) else try a.dupe(u8, text),
+                .string_literal => try literalValue(text),
+                .multiline_string_literal_line => try a.dupe(u8, std.mem.trimEnd(u8, text[2..], "\r\n")),
+                else => null,
+            };
+            defer if (value) |v| a.free(v);
+            if (value) |v| if (namesLoopGroup(v)) {
+                std.debug.print("{s} names {s} at byte {d}\n", .{ src.name, text, t.loc.start });
+                return error.LoopGroupNamed;
+            };
+            switch (import_step) {
+                .none => if (t.tag == .builtin and std.mem.eql(u8, text, "@import")) {
+                    import_step = .paren;
+                },
+                .paren => import_step = .path,
+                .path => {
+                    import_step = .none;
+                    const path = value.?;
+                    var known = std.mem.eql(u8, path, "std") or std.mem.eql(u8, path, "zio");
+                    for (sources) |other| known = known or std.mem.eql(u8, path, other.name);
+                    if (!known) {
+                        std.debug.print("{s} imports {s}, which this test does not scan\n", .{ src.name, path });
+                        return error.UnscannedImport;
+                    }
+                },
+            }
+        }
+    }
+}
+
 test "an accepted connection has TCP_NODELAY, inherited from the listening socket" {
     // serve.zig sets TCP_NODELAY only on the listener (openListener); the
     // kernel copies it to each accepted socket. Checked on macOS; Linux is not

@@ -173,9 +173,10 @@ pub const Arm = struct {
     /// when that head is incomplete and otherwise ends with nothing new
     /// (Conn.step_expired_ahead_partial, step_expired_ahead_complete), and
     /// the send goes on.
-    fn timerCb(_: *ev.Loop, c: *ev.Completion) void {
+    fn timerCb(loop: *ev.Loop, c: *ev.Completion) void {
         const self: *Arm = @ptrCast(@alignCast(c.userdata.?));
         const conn = self.conn;
+        pg.ownLoop(loop, &conn.lp.loop);
         if (self.retired) {
             self.release();
             conn.retired_arms -= 1;
@@ -402,8 +403,9 @@ pub const Conn = struct {
     /// input or an error, which the next receive then reports) while Lean
     /// still watches: reported as `arrived`, which starts the next request's
     /// head budget; the bytes stay in the kernel for that receive.
-    fn pollCb(_: *ev.Loop, c: *ev.Completion) void {
+    fn pollCb(loop: *ev.Loop, c: *ev.Completion) void {
         const self: *Conn = @ptrCast(@alignCast(c.userdata.?));
+        pg.ownLoop(loop, &self.lp.loop);
         if (self.freed or !self.polling) @panic("a poll completion with no poll in flight");
         self.polling = false;
         const stale = self.poll_stale;
@@ -539,9 +541,10 @@ pub const Conn = struct {
         self.lp.loop.add(&op.comp.recv.c);
     }
 
-    fn recvCb(_: *ev.Loop, c: *ev.Completion) void {
+    fn recvCb(loop: *ev.Loop, c: *ev.Completion) void {
         const op: *Op = @ptrCast(@alignCast(c.userdata.?));
         const self = op.conn;
+        pg.ownLoop(loop, &self.lp.loop);
         self.finish(op, c, .recv);
         if (self.closing) return self.close(); // Lean closed on an expiry; the result is not reported
         const n = op.comp.recv.getResult() catch |err| switch (err) {
@@ -567,9 +570,10 @@ pub const Conn = struct {
         self.lp.loop.add(&op.comp.send.c);
     }
 
-    fn sendCb(_: *ev.Loop, c: *ev.Completion) void {
+    fn sendCb(loop: *ev.Loop, c: *ev.Completion) void {
         const op: *Op = @ptrCast(@alignCast(c.userdata.?));
         const self = op.conn;
+        pg.ownLoop(loop, &self.lp.loop);
         self.finish(op, c, .send);
         if (self.closing) return self.close(); // Lean closed on an expiry; the result is not reported
         const n = op.comp.send.getResult() catch return self.fail();
@@ -617,9 +621,10 @@ pub const Conn = struct {
         self.lp.loop.add(&op.comp.close.c);
     }
 
-    fn closeCb(_: *ev.Loop, c: *ev.Completion) void {
+    fn closeCb(loop: *ev.Loop, c: *ev.Completion) void {
         const op: *Op = @ptrCast(@alignCast(c.userdata.?));
         const self = op.conn;
+        pg.ownLoop(loop, &self.lp.loop);
         self.finish(op, c, .close);
         if (self.arm != null or self.ahead_arm != null) @panic("a connection closed with a deadline armed");
         if (self.polling) @panic("a connection closed with its poll in flight");
@@ -701,8 +706,9 @@ pub const LoopCtx = struct {
         if (self.paused) self.armAccept();
     }
 
-    fn acceptCb(_: *ev.Loop, c: *ev.Completion) void {
+    fn acceptCb(loop: *ev.Loop, c: *ev.Completion) void {
         const self: *LoopCtx = @ptrCast(@alignCast(c.userdata.?));
+        pg.ownLoop(loop, &self.loop);
         self.armed = false;
         const fd = self.accept.getResult() catch |err| {
             releaseSlot();
@@ -752,8 +758,9 @@ pub const LoopCtx = struct {
     /// ends by `drain_ms` at the latest, plus a connect in flight that no
     /// query waits for (its own `--pg-connect-ms`). `loop.run` returns once
     /// nothing of this loop is in flight.
-    pub fn stopCb(_: *ev.Loop, c: *ev.Completion) void {
+    pub fn stopCb(loop: *ev.Loop, c: *ev.Completion) void {
         const self: *LoopCtx = @ptrCast(@alignCast(c.userdata.?));
+        pg.ownLoop(loop, &self.loop);
         self.stopping = true;
         if (self.armed) self.loop.cancel(&self.accept.c);
         self.paused = false; // armAccept refuses from now on
@@ -795,8 +802,9 @@ pub const LoopCtx = struct {
     /// gets its connection closed instead of a send (`Conn.apply`), and
     /// every send in flight is canceled and its connection closes
     /// (`Conn.cut`). No send starts after the drain's end.
-    fn drainCb(_: *ev.Loop, c: *ev.Completion) void {
+    fn drainCb(loop: *ev.Loop, c: *ev.Completion) void {
         const self: *LoopCtx = @ptrCast(@alignCast(c.userdata.?));
+        pg.ownLoop(loop, &self.loop);
         self.drain_armed = false;
         self.drained = true;
         self.pool.abort();
@@ -1022,7 +1030,12 @@ export fn ekk_serve(port: u16, threads: u32, maxc: u32, conninfo: *anyopaque, co
     // `internal_loop_group` (src/ev/loop.zig:516, 559-563), so it parks on
     // and services only its own table and poller. Passing a shared
     // `loop_group` to `loop.init` would let `acceptCb` run on another loop's
-    // thread against this loop's state. Recheck at each update of zio.
+    // thread against this loop's state. Checks keep this: serve_test.zig
+    // checks that `startLoop` leaves its loop in the loop's own internal
+    // group and that no identifier or string literal in the transport's Zig
+    // sources is `loop_group` or `LoopGroup`; and every callback panics when
+    // zio calls it with another loop than its own (`pg.ownLoop`). Recheck at
+    // each update of zio.
     for (loops) |*lp| lp.* = .{ .lfd = lfd };
     var ready: [2]std.c.fd_t = undefined;
     var done: [2]std.c.fd_t = undefined;

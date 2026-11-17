@@ -121,6 +121,24 @@ fn due(t: zio.Timestamp, at: zio.Timestamp) bool {
     return t.value <= at.value;
 }
 
+/// Ends the process when a callback runs on a loop other than `own`, the
+/// loop that owns the state it is about to touch. Every callback of the
+/// transport (here and in serve.zig) calls it first. A loop's state is
+/// touched only by that loop's thread, which holds as long as no zio
+/// LoopGroup joins the loops (serve.zig, the comment above
+/// `for (loops) |*lp| lp.* = .{ .lfd = lfd };` in `ekk_serve`; serve_test.zig
+/// checks that `startLoop` joins none). This is the runtime backstop behind
+/// that test: grouped loops complete each other's parked socket ops on the
+/// completing loop's thread, and zio passes that completing loop to the
+/// callback. It relies on zio's callback dispatch at the pin (830564437b2c):
+/// `Completion.call(loop)` calls the callback with the loop whose state
+/// completes it (src/ev/completion.zig:479-483, src/ev/loop.zig:310-362);
+/// recheck at each update of zio. An explicit `@panic`, not
+/// `std.debug.assert`, which ReleaseFast compiles out.
+pub fn ownLoop(got: *const ev.Loop, own: *const ev.Loop) void {
+    if (got != own) @panic("a callback ran on a loop other than the one that owns its state");
+}
+
 /// A slot's lifecycle. `connecting` is the pool's one connect in flight
 /// (`Pool.attempt`), for no query in particular; `busy` runs `waiter`'s
 /// query; `closing` waits for its polls to be retired and its duplicate to be
@@ -202,8 +220,9 @@ pub const Slot = struct {
         self.loop().add(&self.closer.c);
     }
 
-    fn closed(_: *ev.Loop, c: *ev.Completion) void {
+    fn closed(lp: *ev.Loop, c: *ev.Completion) void {
         const self: *Slot = @ptrCast(@alignCast(c.userdata.?));
+        ownLoop(lp, self.loop());
         self.unregistering = false;
         self.fd = -1;
         switch (self.state) {
@@ -296,8 +315,9 @@ pub const Slot = struct {
         }
     }
 
-    fn recvReady(_: *ev.Loop, c: *ev.Completion) void {
+    fn recvReady(lp: *ev.Loop, c: *ev.Completion) void {
         const self: *Slot = @ptrCast(@alignCast(c.userdata.?));
+        ownLoop(lp, self.loop());
         self.rarmed = false;
         const ok = if (self.rpoll.getResult()) |_| true else |_| false;
         switch (self.state) {
@@ -325,8 +345,9 @@ pub const Slot = struct {
         }
     }
 
-    fn sendReady(_: *ev.Loop, c: *ev.Completion) void {
+    fn sendReady(lp: *ev.Loop, c: *ev.Completion) void {
         const self: *Slot = @ptrCast(@alignCast(c.userdata.?));
+        ownLoop(lp, self.loop());
         self.warmed = false;
         const ok = if (self.wpoll.getResult()) |_| true else |_| false;
         switch (self.state) {
@@ -641,8 +662,9 @@ pub const Pool = struct {
     /// Deliveries run from `dispatch`, after the state is repaired; one a
     /// connect's end makes at once (`failWaiting`) may submit, and that
     /// query waits for the `dispatch` below.
-    fn timerCb(_: *ev.Loop, c: *ev.Completion) void {
+    fn timerCb(lp: *ev.Loop, c: *ev.Completion) void {
         const self: *Pool = @ptrCast(@alignCast(c.userdata.?));
+        ownLoop(lp, self.loop);
         self.timer_due = null;
         std.debug.assert(!self.dispatching);
         self.dispatching = true;
