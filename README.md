@@ -519,6 +519,25 @@ macOS (c=64 from 0.86 to 1.07 of Go), and prepared statements (c=1 from
 higher than Go's (3.6 against 2.4 ms): HTTP connections spread unevenly over
 the loops, and each loop's queries wait for that loop's slots only.
 
+One run's ratio does not show whether a change cost throughput: on the
+shared M1 it spreads far wider than the distance to the goal (item fszibv,
+2026-11-17, load average 11 to 63 on 10 cores). Fifteen interleaved rounds
+of lean-db before item 3jnkx5's deadlines (7c89450), lean-db after them and
+go-db, each round's lean-db divided by that round's go-db, gave:
+
+| lean-db | c=1 lowest, median, highest | c=64 lowest, median, highest |
+|---|---|---|
+| before the deadlines | 0.99, 1.10, 2.14 | 0.47, 1.03, 1.44 |
+| with the deadlines | 0.52, 1.08, 4.19 | 0.66, 1.02, 7.83 |
+
+A single `bench.sh` run's 0.74 and 0.83 lie inside both spreads. CPU time
+per request, which another process's load disturbs less, did not move in
+the five rounds that measured it (rounds at a load average above 30 left
+out): lean-db 36 to 39 µs at c=1 before and 37 to 39 after, 41 to 44 µs at
+c=64 before and 40 to 44 after; PostgreSQL's backends 12 to 13 µs at c=1
+and 18 to 20 µs at c=64 for both, so the `statement_timeout` the deadlines
+put in every session's startup options shows no cost there either.
+
 ## Memory
 
 Three kinds of statement, kept apart: lengths that `Conn.step_inv` proves,
