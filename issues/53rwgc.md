@@ -23,3 +23,5 @@ Decided by the user 2026-11-17: option 2, run on vps.frolow.dev. This is the use
 - Never stop, restart or reconfigure the site's own services, database or firewall. Use ports and processes of the run's own, and remove everything the run installed or started when it ends.
 - Stop as soon as the site's responses fail or slow down visibly (check its health URL between runs). Record that and do not resume without the user.
 - Report every figure as measured with the generator on the same 2 vCPUs: a lower bound and a diagnostic, not a clean D2 acceptance. The README says so next to the numbers.
+
+Added 2026-11-17 by the coordinating session with sol (consult call 88b30b66): before the performance runs, run the corrected epoll suite (`zig build test` in zig/, after mzqamr and emb2ob) on the VPS itself and record the result: production conclusions need it. Measure the server on epoll, as mzqamr pins it. Any io_uring figure is an experimental diagnostic only, since its behaviour differs, and it never counts toward acceptance.
