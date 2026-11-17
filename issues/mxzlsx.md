@@ -23,3 +23,6 @@ Options for the owner:
 
 Question: Ask leanprover/lean4 whether H1 is meant to parse a field line incrementally, or approve the supported-subset contract described in option 2?
 Options: ask upstream with the byte-count reproducer (needs your go and the GitHub account) | approve the supported-subset contract next to Server/H1Adapter.lean | both: the contract now, the question upstream too
+
+Decided by the user 2026-11-17: ask upstream. lgxdi7 prepares the reproducer and the draft; this item then posts it on leanprover/lean4 from the user's gh account and waits for a maintainer's answer, which settles bug (fork path) versus limitation (quote it next to Server/H1Adapter.lean).
+Done by: the coordinating session
