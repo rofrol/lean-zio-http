@@ -15,10 +15,17 @@
 # temporary directory, no TCP listener) and runs the database tests against
 # lsrv-db (bench/dbcheck, which restarts and stops that cluster). It needs
 # PostgreSQL's pg_config, initdb, pg_ctl and psql (Homebrew: postgresql@18);
-# pg_config's bindir goes first on PATH.
+# pg_config's bindir goes first on PATH. On Linux the loops run on the backend
+# LSRV_LINUX_BACKEND names, epoll (unless set) or io_uring (lakefile.lean,
+# zig/build.zig; item wi7efy); the servers and zig build test both use it.
 # Any failing test or check stops the script with a nonzero status.
 set -eu
 cd "$(dirname "$0")"
+backend=${LSRV_LINUX_BACKEND-epoll}
+case $backend in
+  epoll|io_uring) ;;
+  *) echo "LSRV_LINUX_BACKEND is $backend: it must be epoll or io_uring"; exit 1 ;;
+esac
 . bench/lib.sh
 # lake builds the Zig library (extern_lib zsrv in lakefile.lean, ZIG_OPTIMIZE
 # picks its optimization) and links it into the servers.
@@ -29,7 +36,7 @@ lake build
 
 .lake/build/bin/lsrv-test
 lean_prefix=$(lean --print-prefix)
-(cd zig && zig build test -Dlean-include="$lean_prefix/include" -Dpq-include="$(pg_config --includedir)" \
+(cd zig && zig build test -Dlinux-backend="$backend" -Dlean-include="$lean_prefix/include" -Dpq-include="$(pg_config --includedir)" \
   -Dlean-lib="$lean_prefix/lib/lean" -Dpq-lib="$(pg_config --libdir)")
 # libzsrv.a for Linux (issue 4n7czb): Lean links a Linux program against the
 # glibc its toolchain ships (lib/glibc/), so lakefile.lean's zsrvTarget builds
@@ -51,7 +58,7 @@ printf 'int main(void) { return 0; }\n' >"$tmp/main.c"
 # some (zig cc lifts ld.lld's default limit of 20 errors: it lists all of them).
 glibc_lacks() {
   out="$tmp/linux-$1"
-  (cd zig && zig build -Dtarget="x86_64-linux-gnu.$1" -Doptimize="${ZIG_OPTIMIZE:-ReleaseSafe}" \
+  (cd zig && zig build -Dtarget="x86_64-linux-gnu.$1" -Doptimize="${ZIG_OPTIMIZE:-ReleaseSafe}" -Dlinux-backend="$backend" \
     -Dlean-include="$lean_prefix/include" -Dpq-include="$(pg_config --includedir)" --prefix "$out")
   for v in "$lean_glibc" "$newest_glibc"; do
     if zig cc -target "x86_64-linux-gnu.$v" "$tmp/main.c" -Wl,--whole-archive "$out/lib/libzsrv.a" \

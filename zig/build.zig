@@ -4,18 +4,18 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const lean_include = b.option([]const u8, "lean-include", "Lean include directory") orelse @panic("-Dlean-include required");
-    // On Linux zio's event loop runs on epoll, never io_uring (decided
-    // 2026-11-17, item mzqamr; README, "Modules", `zig/`). zio's default there,
-    // `.linux` (Backend(.auto), src/ev/backends/linux.zig), prefers io_uring,
-    // which queues a send at `loop.add` without trying the syscall first, so
-    // every send looks parked to serve.zig (`sendParked`): the transport and its
-    // tests assume a readiness backend, and io_uring is unsupported. The pin is
-    // a build option, not a `zio_options` declaration in serve.zig, because a
-    // test binary's root is Zig's test runner: only the build option reaches
-    // the library and every test module alike. serve.zig refuses to compile
-    // on zio's `.linux` or `.io_uring` backend.
+    // On Linux zio's event loop runs on the backend named here, epoll (the
+    // default) or io_uring (`-Dlinux-backend`; README, "Modules", `zig/`;
+    // item wi7efy). Never zio's own default there, `.linux` (Backend(.auto),
+    // src/ev/backends/linux.zig), which picks one at run time: the build and
+    // the tests must know which one runs. The choice is a build option, not a
+    // `zio_options` declaration in serve.zig, because a test binary's root is
+    // Zig's test runner: only the build option reaches the library and every
+    // test module alike. serve.zig refuses to compile on `.linux`.
+    const LinuxBackend = enum { epoll, io_uring };
+    const linux_backend = b.option(LinuxBackend, "linux-backend", "zio's event loop backend on Linux") orelse .epoll;
     const zio = if (target.result.os.tag == .linux)
-        b.dependency("zio", .{ .target = target, .optimize = optimize, .backend = .epoll })
+        b.dependency("zio", .{ .target = target, .optimize = optimize, .backend = linux_backend })
     else
         b.dependency("zio", .{ .target = target, .optimize = optimize });
     const mod = b.createModule(.{
@@ -60,6 +60,10 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     serve_mod.addImport("zio", zio.module("zio"));
+    // The backend the build chose, for the test that checks the loops run on it.
+    const test_options = b.addOptions();
+    test_options.addOption(LinuxBackend, "linux_backend", linux_backend);
+    serve_mod.addOptions("build_options", test_options);
     const serve_tests = b.addTest(.{ .root_module = serve_mod });
     test_step.dependOn(&b.addRunArtifact(serve_tests).step);
 
@@ -74,6 +78,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     controls_mod.addImport("zio", zio.module("zio"));
+    controls_mod.addOptions("build_options", test_options);
     const controls_tests = b.addTest(.{ .root_module = controls_mod });
     controls_step.dependOn(&b.addRunArtifact(controls_tests).step);
 

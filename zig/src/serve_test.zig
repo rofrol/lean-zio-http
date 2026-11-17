@@ -28,19 +28,21 @@
 //! made them.
 //!
 //! These tests and pg_test.zig's run on macOS (kqueue, `./check.sh`) and on
-//! Linux (epoll, `./linux-check.sh`, README "Running"; rerun it at each zio
-//! update and update this record). Last Linux run, 2026-11-17 (item ogcdwm):
-//! OrbStack on the M1, aarch64, kernel 7.2.12-orbstack-00394-gbecdd6130068,
-//! Debian 13.7, Zig 0.17.1, Lean nightly-2026-11-17, libpq 17.12, zio
-//! 830564437b2c, epoll. `./linux-check.sh` exit 0: serve_test 24/24,
-//! pg_test 31/31, pg_glue_test passed, and the rest of `./check.sh`,
-//! bench/dbcheck on the container's private cluster included. With
-//! serve.zig's `expire` not canceling a send (a mutation), 5 tests failed,
-//! among them "a write deadline that ends while its send waits in the
-//! kernel ...". A diagnostic loop of 30 `zig build test` runs: 0 failures.
+//! Linux (epoll and io_uring, `./linux-check.sh`, README "Running"; rerun it
+//! at each zio update and update this record). Last Linux run, 2026-11-17
+//! (item wi7efy): OrbStack on the M1, aarch64, kernel
+//! 7.2.12-orbstack-00394-gbecdd6130068, Debian 13.7, Zig 0.17.1, Lean
+//! nightly-2026-11-17, libpq 17.12, zio 830564437b2c. `./linux-check.sh`
+//! exit 0, on epoll and on io_uring each: serve_test 25/25, pg_test 31/31,
+//! pg_glue_test passed, and the rest of `./check.sh`, bench/dbcheck on the
+//! container's private cluster included. With serve.zig's `startSend` not
+//! trying the send itself (a mutation), 3 tests failed on io_uring, among
+//! them "a response sent at once starts no poll ...". A diagnostic loop of
+//! 30 runs of the serve_test binary on each backend: 0 failures.
 const std = @import("std");
 const zio = @import("zio");
 const ev = zio.ev;
+const build_options = @import("build_options");
 const serve = @import("serve.zig");
 
 const c = std.c;
@@ -792,16 +794,23 @@ test "the transport's Zig sources never name zio's loop grouping" {
     }
 }
 
-test "the loops run on the readiness backend pinned for the OS: kqueue on macOS, epoll on Linux" {
-    // The tests' premises (a send parks only on EAGAIN, `sendParked`) hold
-    // on these two (serve.zig; build.zig pins epoll on Linux, item mzqamr).
-    // A run of these tests on Linux (./linux-check.sh) is a run on epoll.
+test "the loops run on the backend the build chose: kqueue on macOS, epoll or io_uring on Linux" {
+    // A run of these tests on Linux (./linux-check.sh) is a run on the
+    // backend named by -Dlinux-backend (build.zig, item wi7efy).
     switch (@import("builtin").os.tag) {
         .macos => try std.testing.expect(ev.backend == .kqueue),
-        .linux => try std.testing.expect(ev.backend == .epoll),
+        .linux => try std.testing.expectEqualStrings(@tagName(build_options.linux_backend), @tagName(ev.backend)),
         else => return error.UncheckedOs,
     }
 }
+
+/// io_uring, a completion backend: zio queues an operation started in a
+/// callback as an SQE, and the kernel first runs it at the next poll's
+/// `io_uring_enter`, which comes after that poll's timer check
+/// (backends/linux/io_uring.zig `submitInner`; loop.zig `Loop.poll`). On
+/// kqueue and epoll zio tries it at `loop.add` (src/ev/sockreg.zig
+/// `submitIo`). Two receive tests below state what each does.
+const completion_backend = ev.backend == .io_uring;
 
 test "an accepted connection has TCP_NODELAY, inherited from the listening socket" {
     // serve.zig sets TCP_NODELAY only on the listener (openListener); the
@@ -834,27 +843,39 @@ test "a receive whose result is queued when the shutdown cancels it is dispatche
     try s.stepUntil(.open, 1);
     const conn = s.log[0].conn;
     // Both bytes, written at once, are readable at the server's end, and the
-    // stop is notified, before the loop polls again. In that one poll the parked receive returns "a" and the stop
-    // completes, in that order. The callback for "a" starts the next
-    // receive, which finds "b" at once, so its completion is queued with
-    // its result before stopCb runs. The cancel then finds it completed,
-    // which `stop_phases` shows.
+    // stop is notified, before the loop polls again. In that one poll the
+    // parked receive returns "a" and the stop completes, in that order. The
+    // callback for "a" starts the next receive. On kqueue and epoll zio tries
+    // it at once, it finds "b", and its completion is queued with its result
+    // before stopCb runs: the cancel finds it completed, which `stop_phases`
+    // shows. On io_uring it is an SQE not yet submitted (still running) when
+    // stopCb cancels it; the next enter submits both, and the receive is
+    // dispatched once, with "b" or as canceled, as the kernel orders them.
     try send(cl, "ab");
     awaitReadable(s.lp.head.?.fd);
     s.lp.stop.notify();
     try s.stepUntil(.free, 1);
     try s.finish();
     try std.testing.expectEqual(@as(usize, 1), stop_nphases);
-    try std.testing.expectEqual(ev.Completion.State.Phase.completed, stop_phases[0]);
+    const phase: ev.Completion.State.Phase = if (completion_backend) .running else .completed;
+    try std.testing.expectEqual(phase, stop_phases[0]);
     // "b" arrives as received (not error.Canceled); the receive asked after it
     // is declined (refused) because the shutdown has begun.
-    const want = [_]struct { kind: Kind, byte: u8 = 0 }{
+    const Want = struct { kind: Kind, byte: u8 = 0 };
+    const received = [_]Want{
         .{ .kind = .open },
         .{ .kind = .recv, .byte = 'a' },
         .{ .kind = .recv, .byte = 'b' },
         .{ .kind = .refused },
         .{ .kind = .free },
     };
+    // The canceled receive is not reported: the connection closes.
+    const canceled = [_]Want{
+        .{ .kind = .open },
+        .{ .kind = .recv, .byte = 'a' },
+        .{ .kind = .free },
+    };
+    const want: []const Want = if (completion_backend and s.n == canceled.len) &canceled else &received;
     if (s.n != want.len) {
         s.dump();
         return error.UnexpectedEvents;
@@ -987,10 +1008,19 @@ test "a receive the loop runs before a due expiry wins: that expiry is stale and
     // completion runs before the next timer check, so "b" is reported and
     // generation 1's due timer is replaced by generation 2's, whose expiry
     // the fake checks is current.
+    //
+    // On io_uring that next receive is an SQE the next poll submits only
+    // after its timer check (`completion_backend`), so generation 1's expiry
+    // runs first: it is current, it closes, and "b" is not reported.
     try send(cl, "ab");
     awaitReadable(s.lp.head.?.fd);
     try s.stepUntil(.free, 1);
-    try expectLog(&s, &.{
+    if (completion_backend) try expectLog(&s, &.{
+        .{ .kind = .open },
+        .{ .kind = .recv, .n = 1, .byte = 'a' },
+        .{ .kind = .expired, .n = 1, .byte = idle_code },
+        .{ .kind = .free },
+    }) else try expectLog(&s, &.{
         .{ .kind = .open },
         .{ .kind = .recv, .n = 1, .byte = 'a' },
         .{ .kind = .recv, .n = 1, .byte = 'b' },
@@ -1279,6 +1309,37 @@ test "a response sent at once starts no poll, and the receive after it reports w
     try s.finish();
 }
 
+test "a write deadline that ends while a send the loop performed waits for its turn closes, and the send is not reported" {
+    var s: Single = undefined;
+    try s.init(64);
+    defer s.deinit();
+    respond_on_open = 16;
+    const cl = try s.listener.connect();
+    defer _ = c.close(cl);
+    awaitReadable(s.listener.fd);
+    try s.stepUntil(.open, 1);
+    // The open's callback started the response; serve.zig's own try of its
+    // send wrote it (16 bytes fit the socket buffer), and its result waits
+    // in the loop's ready list for the next turn (`Conn.startSend`). That
+    // turn checks the timers first (`dueNow`): the expiry finds a send that
+    // has completed, so it cancels nothing, and the result's delivery closes.
+    const conn = s.lp.head.?;
+    try std.testing.expect(conn.cur.?.kind == .wrote);
+    try std.testing.expectEqual(@as(?usize, 16), conn.cur.?.wrote);
+    try std.testing.expect(s.lp.ready_head == conn);
+    try std.testing.expectEqual(@as(u64, 0), conn.polls);
+    dueNow(&s);
+    try s.stepUntil(.free, 1);
+    try expectLog(&s, &.{
+        .{ .kind = .open },
+        .{ .kind = .expired, .n = 0, .byte = write_code },
+        .{ .kind = .free },
+    });
+    try std.testing.expect(s.lp.ready_head == null);
+    s.lp.stop.notify();
+    try s.finish();
+}
+
 test "over TCP, a response larger than the send buffer reaches a reading client whole, through a parked send" {
     // The TCP counterpart of the Unix-domain tests of parked and partial
     // sends below (item emb2ob): a Unix-domain pair makes those tests'
@@ -1385,8 +1446,8 @@ test "a send that fails while the poll beside it is in flight closes only after 
 
 // ---- a write deadline against a partial send ----
 
-/// The send in flight, which waits in the kernel (zio parked it: its
-/// buffer was full when it was submitted).
+/// The send in flight, which waits in the kernel: serve.zig's own try of it
+/// returned EAGAIN, and it handed it to zio (`startSend`).
 fn expectParkedSend(conn: *serve.Conn) !void {
     const op = conn.cur orelse return error.NoOperation;
     try std.testing.expect(op.kind == .send);
@@ -1707,16 +1768,11 @@ test "a write deadline that ends while its send waits in the kernel cancels that
     awaitReadable(s.listener.fd);
     try s.stepUntil(.open, 1);
     // The fake starts the response at the open. Its sends complete at once
-    // until the socket is full; the one whose syscall returns EAGAIN is
-    // parked, registered for writability, inside `loop.add` (zio
-    // 830564437b2c, src/ev/sockreg.zig `submitIo` and `park`, which both
-    // readiness backends' `submit` call for a send: backends/kqueue.zig and
-    // backends/linux/epoll.zig, the ones it runs on, kqueue on macOS and
-    // epoll on Linux, as "the loops run on the readiness backend ..."
-    // checks; a send's `checkCompletion` asks to park only on
-    // error.WouldBlock, epoll.zig:904 and kqueue.zig's `.net_send`), and serve.zig
-    // starts the readiness poll only beside a send so parked (`sendParked`).
-    // The poll in flight is the event that this send waits in the kernel.
+    // until the socket is full; serve.zig tries each itself, and hands the
+    // one whose syscall returns EAGAIN to zio, which waits for writability
+    // (`startSend`), on every backend. serve.zig starts the readiness poll
+    // only beside a send so parked (`sendParked`). The poll in flight is the
+    // event that this send waits in the kernel.
     try stepUntilPolling(&s);
     const conn = s.lp.head.?;
     try spyOnSend(conn);

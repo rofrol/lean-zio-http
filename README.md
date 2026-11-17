@@ -95,16 +95,23 @@ only `Server.Query` values.
   (pinned 830564437b2c, `src/ev/loop.zig` `finishCompletion`): the completion is
   marked dead before its callback runs, and for a completion without a group
   owner the callback is the last thing the loop does with it. The loops run
-  on zio's readiness backends: kqueue on macOS and, on Linux, epoll, pinned
-  in `zig/build.zig` (decided 2026-11-17, item mzqamr). zio's Linux default
-  prefers io_uring, which submits a send to the kernel without first trying
-  the syscall, so each send would look parked to the loop and start the
-  readiness poll beside it, a cost the loop otherwise pays only for a send
-  that waits (section "Deadlines"), and the transport's tests that assume a
-  send completes at once fail under it.
-  io_uring is unsupported: `zig/src/serve.zig` does not compile on zio's
-  `.linux` or `.io_uring` backend, and measurements on Linux count only on epoll (an
-  io_uring figure is experimental). Each loop
+  on kqueue on macOS and, on Linux, on the backend the build names: epoll
+  (the default) or io_uring, chosen by `LSRV_LINUX_BACKEND` for `lake build`
+  (`-Dlinux-backend` of `zig/build.zig`; item wi7efy, which superseded
+  mzqamr's epoll-only pin). `zig/src/serve.zig` does not compile on zio's
+  `.linux` backend, which picks one at run time. The transport submits
+  sends, and decides when to poll beside one, the same way on all three
+  (the order in which zio runs other operations still differs between
+  readiness and completion backends): it tries each send itself (`send`
+  with `MSG_DONTWAIT`) and reports a result to Lean on the loop's next
+  turn (a per-loop ready
+  list woken by a zio `Async`), and hands zio only a send that returned
+  EAGAIN, which zio then waits on; so a send is parked, and the readiness
+  poll starts beside it (section "Deadlines"), only after the kernel said
+  EAGAIN, whatever the backend. zio's io_uring backend would otherwise queue
+  every send untried, and each would look parked. The deployed server runs
+  on epoll until item 53rwgc's measurements on its host choose otherwise.
+  Each loop
   also owns a PostgreSQL pool (`src/pg.zig`, section "PostgreSQL"). The
   library needs libpq's headers (`-Dpq-include`) and the servers link
   `-lpq`: libpq 17 or later (pipeline mode, and its chunked-rows mode,
@@ -201,9 +208,9 @@ only `Server.Query` values.
   waits on the kernel, keeps a readiness poll on the socket beside the send
   and reports `Event.arrived` when the socket becomes readable (the bytes
   stay in the kernel; a peer's end of input counts too, and the receive
-  after the response reports it). A send the kernel takes whole at its
-  submission starts no poll: the loop goes on at once with the response's
-  next send, which gets the poll if it waits, or with the receive that sees
+  after the response reports it). A send the kernel takes (in whole or
+  in part) at the loop's first try starts no poll: the loop goes on at
+  once with the response's next send, which gets the poll if it waits, or with the receive that sees
   what arrived, so that head's budget starts late by at most the server's
   own work in between. The poll costs a probe and a
   registration (section "PostgreSQL" measures that cost on macOS), which a
@@ -913,15 +920,17 @@ Debian trixie image of `linux/Dockerfile` (Zig, the Lean toolchain of
 the base image as Debian's archive has them at the build)
 with this machine's `docker` (on the M1, OrbStack) and runs the whole
 `./check.sh` in it on a copy of the working tree: the transport's and the
-pool's tests (`zig build test`) on epoll, which serve_test.zig checks is the
-backend in use, the database checks on the container's own private
+pool's tests (`zig build test`), once on epoll and once on io_uring
+(`LSRV_LINUX_BACKEND`; that run turns the container's seccomp filter off,
+as docker's default profile refuses `io_uring_setup`), which serve_test.zig
+checks is the backend in use, the database checks on the container's own private
 cluster, and every other check. It prints the architecture, kernel, Debian,
 Zig, Lean, Go, libpq, PostgreSQL and zio versions first. It needs network access and
 docker; `./check.sh` does not depend on it. Run it at each update of zio and
 record its result in the commit. It is development evidence on the host's
 architecture and the container runtime's kernel, not production
 qualification: x86_64, kernel 6.12 and Debian 13's own kernel are not
-covered by an OrbStack run, and the deployed server's epoll suite runs on
+covered by an OrbStack run, and the deployed server's suite runs on
 its own host (item 53rwgc). Its last recorded result is in
 `zig/src/serve_test.zig`'s header.
 

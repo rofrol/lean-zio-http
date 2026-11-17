@@ -21,14 +21,14 @@ const os = zio.os;
 const net = os.net;
 const pg = @import("pg.zig");
 
-// The transport assumes a readiness backend: a send is tried at once and only
-// one that would block waits in the loop (`sendParked`). On Linux that is
-// epoll, pinned in build.zig; io_uring, zio's Linux default, is unsupported
-// (item mzqamr). `.linux` and `.io_uring` are the backends that may run on
-// io_uring.
+// The transport runs the same on kqueue, epoll and io_uring: it tries each
+// send itself and gives zio only a send the kernel refused with EAGAIN
+// (`Conn.startSend`, item wi7efy). On Linux build.zig names the backend
+// (`-Dlinux-backend`, epoll by default); zio's `.linux` picks io_uring or
+// epoll at run time, so a run would not say which it measured.
 comptime {
-    if (ev.backend == .linux or ev.backend == .io_uring)
-        @compileError("serve.zig does not support zio's io_uring-capable backend ." ++ @tagName(ev.backend) ++ " (build.zig pins epoll on Linux)");
+    if (ev.backend == .linux)
+        @compileError("serve.zig needs the Linux backend named (build.zig: -Dlinux-backend=epoll|io_uring), not zio's run-time choice ." ++ @tagName(ev.backend));
 }
 
 /// Conn.Action as decoded by glue.c.
@@ -219,8 +219,10 @@ fn same(a: *const Arm, kind: u8, gen: Gen) bool {
     return kind != 0 and kind == a.kind and ekk_gen_eq(a.gen, gen) != 0;
 }
 /// A query has no completion of its own: it is the connection's operation in
-/// flight until the pool delivers its result.
-const OpKind = enum { recv, send, close, query };
+/// flight until the pool delivers its result. `wrote` is a send the loop
+/// performed itself (`Conn.startSend`): its result waits in the loop's ready
+/// list for a later turn (`LoopCtx.readyCb`), as zio's own completion would.
+const OpKind = enum { recv, send, wrote, close, query };
 
 /// One submitted operation: its completion, stamped with its number on the
 /// connection. Untraced, every operation of a connection reuses the slot
@@ -232,6 +234,8 @@ const Op = struct {
     kind: OpKind = .recv,
     id: u64,
     conn: *Conn,
+    /// `wrote`: the bytes the send wrote, or null if it failed.
+    wrote: ?usize = null,
 };
 
 pub const Conn = struct {
@@ -266,6 +270,8 @@ pub const Conn = struct {
     arm: ?*Arm = null,
     /// The timer of the head budget beside a send (Conn.Phase.ahead), if any.
     ahead_arm: ?*Arm = null,
+    /// The next connection in the loop's ready list (`LoopCtx.ready_head`).
+    ready_next: ?*Conn = null,
     /// The readiness poll beside a send: in flight while `polling`. It is
     /// wanted (`watching`) while Lean's state watches and the send waits in
     /// the kernel (`sendParked`); one canceled because it is no longer
@@ -325,9 +331,14 @@ pub const Conn = struct {
     /// Accepts the completion `c` of `op` only if it is the outstanding
     /// operation's own completion; ends the process otherwise.
     fn finish(self: *Conn, op: *Op, c: *ev.Completion, comptime kind: std.meta.FieldEnum(Comp)) void {
+        if (c != &@field(op.comp, @tagName(kind)).c) @panic("completion of no outstanding operation");
+        self.finishOp(op);
+    }
+
+    /// `finish` for an operation with no zio completion (`wrote`).
+    fn finishOp(self: *Conn, op: *Op) void {
         if (self.freed) @panic("completion after the connection was freed");
-        if (self.started != self.done + 1 or self.cur != op or op.id != self.started or
-            c != &@field(op.comp, @tagName(kind)).c) @panic("completion of no outstanding operation");
+        if (self.started != self.done + 1 or self.cur != op or op.id != self.started) @panic("completion of no outstanding operation");
         self.done += 1;
         self.cur = null;
     }
@@ -438,8 +449,10 @@ pub const Conn = struct {
 
     /// Lean closed on an expiry: the other timer and the readiness poll are
     /// taken off, the receive or send in flight is canceled, and its
-    /// completion closes. A query has no deadline (Conn.Phase.deadline), and
-    /// a close is preceded by disarming.
+    /// completion closes. A send the loop performed itself has completed
+    /// already, like a zio operation canceled too late: its delivery closes.
+    /// A query has no deadline (Conn.Phase.deadline), and a close is
+    /// preceded by disarming.
     fn expire(self: *Conn) void {
         const op = self.cur orelse @panic("an expiry with no operation in flight");
         self.disarm();
@@ -448,6 +461,7 @@ pub const Conn = struct {
         switch (op.kind) {
             .recv => self.lp.loop.cancel(&op.comp.recv.c),
             .send => self.lp.loop.cancel(&op.comp.send.c),
+            .wrote => {},
             .query, .close => @panic("a deadline expired while querying or closing"),
         }
     }
@@ -462,17 +476,16 @@ pub const Conn = struct {
         if (self.closing or self.close_pending) return;
         const op = self.cur orelse @panic("a connection with no operation in flight at the drain's end");
         switch (op.kind) {
-            .send => self.expire(),
+            .send, .wrote => self.expire(),
             .recv, .close => {},
             .query => @panic("a query in flight after the pool's abort"),
         }
     }
 
-    /// Whether the operation in flight is a send that zio could not
-    /// complete when it was submitted: zio tries the syscall at once and
-    /// parks the send only when the socket's buffer is full (sockreg.zig,
-    /// `submitIo`), queuing a completed one's callback for later in the
-    /// same poll (`defer_callback`).
+    /// Whether the operation in flight is a send that waits in the kernel:
+    /// the loop gives zio a send only after its own attempt got EAGAIN
+    /// (`startSend`), and one zio has completed since (a readiness
+    /// backend's own attempt at `loop.add` found room) no longer waits.
     fn sendParked(self: *const Conn) bool {
         const op = self.cur orelse return false;
         return op.kind == .send and op.comp.send.c.loadState().phase == .running;
@@ -482,9 +495,9 @@ pub const Conn = struct {
     /// deadlines of Lean's new state; during shutdown a receive is declined
     /// and reported as `refused` instead. While Lean's state watches, the
     /// readiness poll runs only beside a send that waits in the kernel: a
-    /// send completed at submission is reported later in the same poll and
-    /// followed at once by the response's next send (which gets the poll if
-    /// it waits) or by the receive that finds any byte that arrived
+    /// send that completed at once is reported on a later turn of the loop
+    /// and followed at once by the response's next send (which gets the
+    /// poll if it waits) or by the receive that finds any byte that arrived
     /// meanwhile, so the poll would only cost a poll(2) probe and a
     /// registration per response (README, "PostgreSQL", measured that
     /// probe's cost).
@@ -572,9 +585,26 @@ pub const Conn = struct {
         self.apply(act);
     }
 
+    /// Tries the send at once (send(2) with MSG_DONTWAIT, zio's `os.net.send`
+    /// with `dontwait`: "Fail with `error.WouldBlock` instead of blocking"),
+    /// on every backend. Its result, bytes written or an error other than
+    /// EAGAIN, is kept in the operation (`wrote`) and reported on a later
+    /// turn of the loop (`LoopCtx.readyCb`), as zio reports a completion, so
+    /// a long response takes turns with the loop's other work. Only a send
+    /// the kernel refused with EAGAIN goes to zio, which waits for room: a
+    /// send zio holds waited in the kernel (`sendParked`). zio itself tries
+    /// a send at `loop.add` on kqueue and epoll (src/ev/sockreg.zig
+    /// `submitIo`) but documents no such thing, and on io_uring it queues
+    /// every send untried (backends/linux/io_uring.zig `submitInner`), so
+    /// every send would look parked (item wi7efy).
     fn startSend(self: *Conn) void {
         const op = self.begin(.send);
-        op.comp = .{ .send = ev.NetSend.init(self.fd, .fromSlice(self.out[0..self.out_len], &self.send_iov), .{}) };
+        const bytes = self.out[0..self.out_len];
+        self.send_iov[0] = os.iovecConstFromSlice(bytes);
+        if (net.send(self.fd, &self.send_iov, .{ .dontwait = true })) |n| {
+            return self.lp.ready(op, n);
+        } else |err| if (err != error.WouldBlock) return self.lp.ready(op, null);
+        op.comp = .{ .send = ev.NetSend.init(self.fd, .fromSlice(bytes, &self.send_iov), .{}) };
         op.comp.send.c.callback = sendCb;
         op.comp.send.c.userdata = op;
         self.lp.loop.add(&op.comp.send.c);
@@ -585,8 +615,20 @@ pub const Conn = struct {
         const self = op.conn;
         pg.ownLoop(loop, &self.lp.loop);
         self.finish(op, c, .send);
+        self.sent(op.comp.send.getResult() catch null);
+    }
+
+    /// The send the loop performed itself completed: its turn came.
+    fn wroteDone(self: *Conn, op: *Op) void {
+        if (op.kind != .wrote) @panic("a ready connection with no performed send");
+        self.finishOp(op);
+        self.sent(op.wrote);
+    }
+
+    /// Reports the result of the send that completed (null: it failed).
+    fn sent(self: *Conn, result: ?usize) void {
         if (self.closing) return self.close(); // Lean closed on an expiry; the result is not reported
-        const n = op.comp.send.getResult() catch return self.fail();
+        const n = result orelse return self.fail();
         if (n > self.out_len) @panic("send reported more bytes than given");
         crashPoint(&send_ok, testing.crash_after_send, "send", self.id, n);
         if (injectFailure(&send_count)) {
@@ -682,6 +724,54 @@ pub const LoopCtx = struct {
     head: ?*Conn = null,
     /// The loop's PostgreSQL connections (pg.zig).
     pool: pg.Pool = undefined,
+    /// The connections whose send the loop performed itself, oldest first,
+    /// each waiting for its turn to report it (`Conn.startSend`). The list
+    /// is the record; `wake`, in the loop while `wake_armed`, only brings
+    /// the turn that takes it (`readyCb`).
+    ready_head: ?*Conn = null,
+    ready_tail: ?*Conn = null,
+    wake: ev.Async = undefined,
+    wake_armed: bool = false,
+
+    /// Keeps the result of the send `op` performed (null: it failed) and
+    /// puts its connection at the end of the ready list.
+    fn ready(self: *LoopCtx, op: *Op, wrote: ?usize) void {
+        op.kind = .wrote;
+        op.wrote = wrote;
+        const conn = op.conn;
+        if (conn.ready_next != null or self.ready_tail == conn) @panic("a connection already in the ready list");
+        if (self.ready_tail) |t| t.ready_next = conn else self.ready_head = conn;
+        self.ready_tail = conn;
+        if (self.wake_armed) return;
+        self.wake_armed = true;
+        self.loop.add(&self.wake.c);
+        self.wake.notify();
+    }
+
+    /// A later turn of the loop: reports the send of every connection in
+    /// the ready list as it was when the turn began. A connection that
+    /// performs its next send meanwhile joins a new list, taken by the
+    /// next turn, so one connection's response does not hold the loop.
+    /// zio documents what this relies on (830564437b2c, src/ev/completion.zig,
+    /// `Async.Pending`): a handle is out of the loop from when the loop
+    /// completes it until the next `add`, and a notify of a handle in the
+    /// loop completes it at the loop's next check of its handles, so
+    /// `ready` may add and notify it again from this callback; and a
+    /// completion queued while the loop runs callbacks waits for the next
+    /// tick (src/ev/loop.zig, `processCompletions`).
+    fn readyCb(loop: *ev.Loop, c: *ev.Completion) void {
+        const self: *LoopCtx = @ptrCast(@alignCast(c.userdata.?));
+        pg.ownLoop(loop, &self.loop);
+        self.wake_armed = false;
+        var it = self.ready_head;
+        self.ready_head = null;
+        self.ready_tail = null;
+        while (it) |conn| {
+            it = conn.ready_next;
+            conn.ready_next = null;
+            conn.wroteDone(conn.cur orelse @panic("a ready connection with no operation in flight"));
+        }
+    }
 
     fn link(self: *LoopCtx, conn: *Conn) void {
         conn.next = self.head;
@@ -783,7 +873,7 @@ pub const LoopCtx = struct {
                     receives += 1;
                     self.loop.cancel(&op.comp.recv.c);
                 },
-                .send => sends += 1,
+                .send, .wrote => sends += 1,
                 .close, .query => {},
             };
         }
@@ -867,6 +957,10 @@ pub fn startLoop(lp: *LoopCtx) bool {
     lp.stop.c.callback = LoopCtx.stopCb;
     lp.stop.c.userdata = lp;
     lp.loop.add(&lp.stop.c);
+    // Added only while the ready list holds a connection (`LoopCtx.ready`).
+    lp.wake = ev.Async.init();
+    lp.wake.c.callback = LoopCtx.readyCb;
+    lp.wake.c.userdata = lp;
     lp.armAccept();
     return true;
 }

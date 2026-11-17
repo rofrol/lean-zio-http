@@ -76,7 +76,9 @@ reads from them (every file of the Lean include directory's `lean/`,
 (`zsrvTarget`) change. Other system headers and the Zig compiler's own files are
 traced only through those versions. `ZIG_OPTIMIZE` picks the build of the loop and zio:
 ReleaseSafe (bounds and overflow checks) unless set; it measured no slower
-than ReleaseFast. -/
+than ReleaseFast. `LSRV_LINUX_BACKEND` picks zio's event loop backend on Linux,
+`epoll` (unless set) or `io_uring` (`-Dlinux-backend`, zig/build.zig; item
+wi7efy); it is traced too, and ignored on macOS (kqueue). -/
 extern_lib zsrv (pkg) := do
   let zigDir := pkg.dir / "zig"
   let srcs ← inputDir zigDir (text := true) fun p =>
@@ -87,6 +89,9 @@ extern_lib zsrv (pkg) := do
   let leanInclude ← getLeanIncludeDir
   let pqInclude : FilePath := (← captureProc { cmd := "pg_config", args := #["--includedir"] }).trimAscii.toString
   let optimize := (← IO.getEnv "ZIG_OPTIMIZE").getD "ReleaseSafe"
+  let backend := (← IO.getEnv "LSRV_LINUX_BACKEND").getD "epoll"
+  unless backend == "epoll" || backend == "io_uring" do
+    error s!"LSRV_LINUX_BACKEND is {backend}: it must be epoll or io_uring"
   let zigTarget ← zsrvTarget (← getLeanSysroot)
   let zigVersion := (← captureProc { cmd := "zig", args := #["version"] }).trimAscii.toString
   let pqVersion := (← captureProc { cmd := "pg_config", args := #["--version"] }).trimAscii.toString
@@ -99,12 +104,13 @@ extern_lib zsrv (pkg) := do
   for h in headers do
     headerHashes := headerHashes.push s!"{h} {hash (← IO.FS.readBinFile h)}"
   -- Fields joined by NUL, which no path, environment value or version holds.
-  let config := "\x00".intercalate ([leanInclude.toString, pqInclude.toString, optimize,
+  let config := "\x00".intercalate ([leanInclude.toString, pqInclude.toString, optimize, backend,
     zigTarget.getD "native", zigVersion, Lean.versionString, pqVersion] ++ headerHashes.toList)
   let lib := pkg.staticLibDir / nameToStaticLib "zsrv"
   buildFileAfterDep lib srcs (extraDepTrace := pure (BuildTrace.ofHash (Hash.ofString config))) fun _ => do
     proc { cmd := "zig", cwd := zigDir,
-           args := #["build", s!"-Doptimize={optimize}", s!"-Dlean-include={leanInclude}",
+           args := #["build", s!"-Doptimize={optimize}", s!"-Dlinux-backend={backend}",
+                     s!"-Dlean-include={leanInclude}",
                      s!"-Dpq-include={pqInclude}", "--prefix", (pkg.staticLibDir.parent.getD pkg.dir).toString,
                      "--prefix-lib-dir", pkg.staticLibDir.fileName.getD "lib"] ++
                    (zigTarget.map (#[s!"-Dtarget={·}"])).getD #[] }
