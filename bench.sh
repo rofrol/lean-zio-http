@@ -32,42 +32,44 @@ cpu() {
   fi
 }
 
+# measure NAME: the server `start` started last, at $addr.
 measure() {
-  name=$1; port=$2
+  name=$1
   for c in 1 64 256; do
     before=$(cpu "$pid")
-    result=$(bench/load/load -url "http://127.0.0.1:$port/" -c "$c" -d 10s) || { echo "$name c=$c $result"; exit 1; }
+    result=$(bench/load/load -url "http://$addr/" -c "$c" -d 10s) || { echo "$name c=$c $result"; exit 1; }
     after=$(cpu "$pid")
     n=$(echo "$result" | sed -E 's/.* n=([0-9]+).*/\1/')
     echo "$name c=$c $result cpu_us_per_req=$(echo "($after - $before) * 1000000 / $n" | bc)"
   done
 }
 
-start lean-h1 ready .lake/build/bin/lsrv 8
-measure lean-h1 8083
+start lean-h1 ready .lake/build/bin/lsrv 8 --port 0
+measure lean-h1
 stop graceful
 
-start lean-hand ready .lake/build/bin/lsrv-hand 8
-measure lean-hand 8083
+start lean-hand ready .lake/build/bin/lsrv-hand 8 --port 0
+measure lean-hand
 stop graceful
 
 start go ready bench/goserver/server
-measure go 8082
+measure go
 stop
 
 start dusty "Listening on" dusty-hello/zig-out/bin/dhello
-measure dusty 8084
+measure dusty
 stop
 
 pg_start
 
-# measure_db NAME PORT: GET /db?id=42 at 1 and 64 connections; sets rps_1 and
-# rps_64 to the requests per second.
+# measure_db NAME: GET /db?id=42 at 1 and 64 connections on the server
+# `start` started last, at $addr; sets rps_1 and rps_64 to the requests per
+# second.
 measure_db() {
-  name=$1; port=$2
+  name=$1
   for c in 1 64; do
     before=$(cpu "$pid")
-    result=$(bench/load/load -url "http://127.0.0.1:$port/db?id=42" -c "$c" -d 10s -body '{"id":42,"randomNumber":2599}') || { echo "$name c=$c $result"; exit 1; }
+    result=$(bench/load/load -url "http://$addr/db?id=42" -c "$c" -d 10s -body '{"id":42,"randomNumber":2599}') || { echo "$name c=$c $result"; exit 1; }
     after=$(cpu "$pid")
     n=$(echo "$result" | sed -E 's/.* n=([0-9]+).*/\1/')
     echo "$name c=$c $result cpu_us_per_req=$(echo "($after - $before) * 1000000 / $n" | bc)"
@@ -75,11 +77,11 @@ measure_db() {
   done
 }
 # 8 loops with 4 connections each against one pool of 32.
-start lean-db ready .lake/build/bin/lsrv-db 8 --pg "$pg" --pg-conns 4
-measure_db lean-db 8083
+start lean-db ready .lake/build/bin/lsrv-db 8 --port 0 --pg "$pg" --pg-conns 4
+measure_db lean-db
 stop graceful
 lean_1=$rps_1; lean_64=$rps_64
 start go-db ready bench/pgserver/server -pg "$pg" -conns 32
-measure_db go-db 8082
+measure_db go-db
 stop
 echo "lean-db/go-db c=1 $(echo "scale=2; $lean_1 / $rps_1" | bc) c=64 $(echo "scale=2; $lean_64 / $rps_64" | bc) (goal: at least 0.9)"

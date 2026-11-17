@@ -584,9 +584,20 @@ fn awaitReadyThenStop(ready: std.c.fd_t, threads: u32, stop_fd: c_int) void {
     for (loops) |*lp| _ = notifyStop(lp);
 }
 
-/// Serves on 127.0.0.1:port with `threads` loops (the calling thread runs the
-/// last one) and at most `maxc` connections; prints "ready" once every loop
-/// has registered its acceptor. On SIGTERM or SIGINT every loop shuts down
+/// Reports a failed setup call on the listening socket with its errno, for
+/// `ekk_serve` to return 1 (a port another process holds: EADDRINUSE).
+fn setupFailed(what: []const u8, port: u16) u8 {
+    const e = std.c._errno().*;
+    const name = std.enums.tagName(std.c.E, @enumFromInt(e)) orelse "unknown";
+    std.debug.print("cannot {s} 127.0.0.1:{d}: errno {d} ({s})\n", .{ what, port, e, name });
+    return 1;
+}
+
+/// Serves on 127.0.0.1:port (port 0: one the kernel picks) with `threads`
+/// loops (the calling thread runs the last one) and at most `maxc`
+/// connections; once listening, prints "listening on 127.0.0.1:PORT with ..."
+/// with the port it got, then "ready" once every loop has registered its
+/// acceptor. On SIGTERM or SIGINT every loop shuts down
 /// gracefully; once all have, it prints "stopped" and returns 0. Each loop
 /// has at most `conns` PostgreSQL connections to `conninfo` (a Lean String,
 /// kept for the process's life). The rest are the test settings (`Testing`),
@@ -604,12 +615,25 @@ export fn ekk_serve(port: u16, threads: u32, maxc: u32, conninfo: *anyopaque, co
     }
     const stop_fd = ekk_stop_signals();
     if (stop_fd < 0) return 1;
-    const lfd = net.socket(.ipv4, .stream, .ip, .{ .nonblocking = true }) catch return 1;
+    const lfd = net.socket(.ipv4, .stream, .ip, .{ .nonblocking = true }) catch |e| {
+        std.debug.print("cannot open the listening socket: {s}\n", .{@errorName(e)});
+        return 1;
+    };
     const one: c_int = 1;
-    net.setsockopt(lfd, net.SOL.SOCKET, net.SO.REUSEADDR, std.mem.asBytes(&one)) catch return 1;
+    net.setsockopt(lfd, net.SOL.SOCKET, net.SO.REUSEADDR, std.mem.asBytes(&one)) catch |e| {
+        std.debug.print("cannot set SO_REUSEADDR on the listening socket: {s}\n", .{@errorName(e)});
+        return 1;
+    };
+    // bind, listen and getsockname through libc, so a failure reports its errno.
     var sa: net.sockaddr.in = .{ .port = std.mem.nativeToBig(u16, port), .addr = @bitCast([4]u8{ 127, 0, 0, 1 }) };
-    net.bind(lfd, @ptrCast(&sa), @sizeOf(net.sockaddr.in)) catch return 1;
-    net.listen(lfd, 4096) catch return 1;
+    var sa_len: std.c.socklen_t = @sizeOf(net.sockaddr.in);
+    if (std.c.bind(lfd, @ptrCast(&sa), sa_len) != 0) return setupFailed("bind", port);
+    if (std.c.listen(lfd, 4096) != 0) return setupFailed("listen on", port);
+    // With port 0 the kernel picked the port: report the one it gave.
+    if (std.c.getsockname(lfd, @ptrCast(&sa), &sa_len) != 0) return setupFailed("read the address of", port);
+    // The checks read the address from this line (bench/lib.sh, bench/boundary,
+    // bench/dbcheck); it comes only after listen succeeded.
+    std.debug.print("listening on 127.0.0.1:{d} with {d} loops, at most {d} connections\n", .{ std.mem.bigToNative(u16, sa.port), threads, maxc });
 
     loops = alloc.alloc(LoopCtx, threads) catch return 1;
     for (loops) |*lp| lp.* = .{ .lfd = lfd };

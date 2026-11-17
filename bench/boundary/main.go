@@ -63,6 +63,7 @@ const (
 // server is a running server executable and the trace it prints on stderr.
 type server struct {
 	cmd    *exec.Cmd
+	addr   string      // host:port it listens on, from its "listening on" line
 	lines  chan string // stderr lines; closed when the process's stderr ends
 	output []string    // every stderr line read so far, for failure reports
 }
@@ -92,9 +93,10 @@ func (s *server) until(t *trace, done func(*trace) bool) error {
 	return nil
 }
 
-// start runs path with args and returns once it has printed "ready".
+// start runs path with args on a port the kernel picks and returns once it
+// has printed "ready", with the address its "listening on" line reported.
 func start(path string, args ...string) (*server, error) {
-	cmd := exec.Command(path, args...)
+	cmd := exec.Command(path, append(args, "--port", "0")...)
 	cmd.Stdout = io.Discard
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
@@ -115,7 +117,14 @@ func start(path string, args ...string) (*server, error) {
 	}()
 	for line := range s.lines {
 		s.output = append(s.output, line)
+		if a, ok := strings.CutPrefix(line, "listening on "); ok {
+			s.addr = strings.Fields(a)[0]
+		}
 		if line == "ready" {
+			if s.addr == "" {
+				s.stop()
+				return nil, fmt.Errorf("ready without a listening on line: %s", strings.Join(s.output, " | "))
+			}
 			return s, nil
 		}
 	}
@@ -404,11 +413,12 @@ func expectations(addr string) (int64, string, error) {
 // operation, one idle, one with half a request. The response must arrive
 // whole, then every connection must see the server's close with nothing
 // else, and the process must stop gracefully.
-func shutdown(path, addr string) (string, error) {
+func shutdown(path string) (string, error) {
 	s, err := start(path, "1", "--chunk", "7", "--trace")
 	if err != nil {
 		return "", err
 	}
+	addr := s.addr
 	defer s.stop()
 	t := newTrace(false)
 	a, err := dial(addr)
@@ -462,15 +472,15 @@ func shutdown(path, addr string) (string, error) {
 // trace; without the limit it would be accepted while both are open, before
 // the client closes the first). A control run with --max-conns 3 must show
 // that early accept, so the trace order is shown to detect a missing limit.
-func admission(path, addr string) (string, error) {
-	summary, early, err := admit(path, addr, "2")
+func admission(path string) (string, error) {
+	summary, early, err := admit(path, "2")
 	if err != nil {
 		return "", err
 	}
 	if early {
 		return "", fmt.Errorf("the third connection was accepted while two were open")
 	}
-	if _, early, err = admit(path, addr, "3"); err != nil {
+	if _, early, err = admit(path, "3"); err != nil {
 		return "", fmt.Errorf("control run with --max-conns 3: %w", err)
 	}
 	if !early {
@@ -481,11 +491,12 @@ func admission(path, addr string) (string, error) {
 
 // admit runs the admission scenario with `maxConns`; early reports whether
 // the third connection was opened before any connection was freed.
-func admit(path, addr, maxConns string) (string, bool, error) {
+func admit(path, maxConns string) (string, bool, error) {
 	s, err := start(path, "1", "--max-conns", maxConns, "--trace")
 	if err != nil {
 		return "", false, err
 	}
+	addr := s.addr
 	defer s.stop()
 	t := newTrace(false)
 	var cs [3]*net.TCPConn
@@ -533,12 +544,12 @@ func admit(path, addr, maxConns string) (string, bool, error) {
 // records it, and checks what the client saw: at most `most` bytes, a prefix
 // of the response. A fresh server must then serve normally: nothing of the
 // crashed process survives (README, "Production contract").
-func crashPoint(path, addr, crashArg string, n, most int, args ...string) (string, error) {
+func crashPoint(path, crashArg string, n, most int, args ...string) (string, error) {
 	s, err := start(path, append([]string{"1", crashArg, strconv.Itoa(n)}, args...)...)
 	if err != nil {
 		return "", err
 	}
-	c, err := dial(addr)
+	c, err := dial(s.addr)
 	if err != nil {
 		s.stop()
 		return "", err
@@ -551,8 +562,8 @@ func crashPoint(path, addr, crashArg string, n, most int, args ...string) (strin
 	if ws, ok := st.Sys().(syscall.WaitStatus); !ok || !ws.Signaled() || ws.Signal() != syscall.SIGKILL {
 		return "", fmt.Errorf("server ended with %v, not by its SIGKILL: %s", st, tail(s.output))
 	}
-	if len(s.output) != 2 || !strings.HasPrefix(s.output[1], "crash "+kind+" ") {
-		return "", fmt.Errorf("output %q, want ready and one crash %s line", s.output, kind)
+	if len(s.output) != 3 || !strings.HasPrefix(s.output[2], "crash "+kind+" ") {
+		return "", fmt.Errorf("output %q, want listening on, ready and one crash %s line", s.output, kind)
 	}
 	const prefix = "HTTP/1.1 200 OK\r\nContent-Type: "
 	if len(got) > most || !strings.HasPrefix(prefix, string(got)) {
@@ -563,11 +574,11 @@ func crashPoint(path, addr, crashArg string, n, most int, args ...string) (strin
 		return "", fmt.Errorf("restart: %w", err)
 	}
 	defer s2.stop()
-	if err := exchange(addr); err != nil {
+	if err := exchange(s2.addr); err != nil {
 		return "", fmt.Errorf("after the restart: %w", err)
 	}
 	summary, err := s2.account(newTrace(false), 1)
-	return fmt.Sprintf("client saw %d response bytes, %q; restarted server: %s", len(got), s.output[1], summary), err
+	return fmt.Sprintf("client saw %d response bytes, %q; restarted server: %s", len(got), s.output[2], summary), err
 }
 
 // rssKiB is the resident set size of process pid, from ps(1).
@@ -585,7 +596,7 @@ func rssKiB(pid int) (int, error) {
 // the event that shows the server buffered the head and waits. The growth
 // of the resident set per connection must stay within the bound the README
 // states per connection (perConnBound).
-func memory(path, addr string) (string, error) {
+func memory(path string) (string, error) {
 	const n = 1000
 	// README, "Memory": the loop's connection (two 8 KiB buffers and its
 	// fields), the Lean buffer of at most inCap bytes, and a response of at
@@ -596,6 +607,7 @@ func memory(path, addr string) (string, error) {
 		return "", err
 	}
 	defer s.stop()
+	addr := s.addr
 	base, err := rssKiB(s.cmd.Process.Pid)
 	if err != nil {
 		return "", err
@@ -766,7 +778,7 @@ func memSnapshot(pid, conns int) error {
 // held its second part in the loop's receive buffer and no response. The
 // queues show what the sockets hold, not the connection's state; only an
 // acknowledgement from the server would. macOS only (lsof's queue sizes).
-func memoryFull(path, addr string) (string, error) {
+func memoryFull(path string) (string, error) {
 	// 100 connections: the kernel holds hundreds of KB of stalled responses
 	// per connection, and 200 already made macOS deny network memory
 	// ("requests for memory denied" in netstat -m), 1,000 to a failed send.
@@ -781,6 +793,7 @@ func memoryFull(path, addr string) (string, error) {
 		return "", err
 	}
 	defer s.stop()
+	addr := s.addr
 	// The keep-alive response's size on the wire (its head and the fixture's
 	// body), from one exchange before the baseline.
 	c0, err := dial(addr)
@@ -932,7 +945,7 @@ type scenario struct {
 	run func(addr string) (int64, string, error)
 	// custom, when set, replaces args and run: it starts its own servers and
 	// returns a summary.
-	custom func(path, addr string) (string, error)
+	custom func(path string) (string, error)
 	// continues: the scenario needs the server to answer
 	// `Expect: 100-continue`, which the hand-written comparator does not.
 	continues bool
@@ -1025,7 +1038,6 @@ func churn(addr string) (int64, string, error) {
 
 func main() {
 	fixture := flag.String("fixture", ".lake/build/bin/lsrv-fixture", "fixture server executable")
-	addr := flag.String("addr", "127.0.0.1:8083", "address the server listens on")
 	noContinue := flag.Bool("no-continue", false, "the fixture does not answer Expect: 100-continue (lsrv-fixture-hand); skip the scenarios that need it")
 	flag.StringVar(&memSnapDir, "memsnap", "", "directory for the server's allocator statistics (vmmap, heap) at the measurements of the scenario with 100 connections sending responses; macOS only")
 	flag.Parse()
@@ -1037,11 +1049,11 @@ func main() {
 		{"Expect: 100-continue and a response over the bound, operations of at most 7 bytes", []string{"2", "--chunk", "7", "--trace"}, false, false, expectations, nil, true},
 		{"graceful shutdown with a response in flight, an idle and a partial connection", nil, false, false, nil, shutdown, false},
 		{"admission: at most 2 connections", nil, false, false, nil, admission, false},
-		{"crash after the first receive", nil, false, false, nil, func(p, a string) (string, error) {
-			return crashPoint(p, a, "--crash-after-recv", 1, 0)
+		{"crash after the first receive", nil, false, false, nil, func(p string) (string, error) {
+			return crashPoint(p, "--crash-after-recv", 1, 0)
 		}, false},
-		{"crash after the third 7-byte send", nil, false, false, nil, func(p, a string) (string, error) {
-			return crashPoint(p, a, "--crash-after-send", 3, 21, "--chunk", "7")
+		{"crash after the third 7-byte send", nil, false, false, nil, func(p string) (string, error) {
+			return crashPoint(p, "--crash-after-send", 3, 21, "--chunk", "7")
 		}, false},
 		{"memory of 1000 connections holding a head", nil, false, false, nil, memory, true},
 		{"memory of 100 connections each sending a response with a pipelined tail buffered", nil, false, false, nil, memoryFull, false},
@@ -1053,7 +1065,7 @@ func main() {
 			continue
 		}
 		ran++
-		if err := runScenario(*fixture, *addr, sc); err != nil {
+		if err := runScenario(*fixture, sc); err != nil {
 			fmt.Printf("FAIL %s: %v\n", sc.name, err)
 			failed++
 		}
@@ -1064,9 +1076,9 @@ func main() {
 	}
 }
 
-func runScenario(path, addr string, sc scenario) error {
+func runScenario(path string, sc scenario) error {
 	if sc.custom != nil {
-		summary, err := sc.custom(path, addr)
+		summary, err := sc.custom(path)
 		if err == nil && strings.HasPrefix(summary, "skipped: ") {
 			fmt.Printf("skipped %s: %s\n", sc.name, strings.TrimPrefix(summary, "skipped: "))
 		} else if err == nil {
@@ -1079,7 +1091,7 @@ func runScenario(path, addr string, sc scenario) error {
 		return err
 	}
 	defer s.stop()
-	connects, note, err := sc.run(addr)
+	connects, note, err := sc.run(s.addr)
 	if err != nil {
 		s.stop()
 		return fmt.Errorf("%w; server output: %s", err, tail(s.output))

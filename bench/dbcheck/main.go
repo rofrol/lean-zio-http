@@ -49,7 +49,9 @@ var (
 	pgdata   = flag.String("pgdata", "", "the private cluster's data directory, for pg_ctl")
 	pgopts   = flag.String("pgopts", "", "the options pg_ctl starts the cluster with (-o)")
 	pglog    = flag.String("pglog", "", "the cluster's log file")
-	addr     = "http://127.0.0.1:8083"
+	// The running server's base URL, from its "listening on" line; the tests
+	// run one server at a time.
+	addr     = ""
 	failures = 0
 	ctx      = context.Background()
 )
@@ -64,9 +66,10 @@ type srv struct {
 	lines chan string
 }
 
-// start runs lsrv-db with `args` and returns once it has printed "ready".
+// start runs lsrv-db with `args` on a port the kernel picks, sets addr from
+// its "listening on" line, and returns once it has printed "ready".
 func start(args ...string) *srv {
-	cmd := exec.Command(*server, append(args, "--pg", *conninfo+" application_name=lsrv")...)
+	cmd := exec.Command(*server, append(args, "--port", "0", "--pg", *conninfo+" application_name=lsrv")...)
 	cmd.Stdout = io.Discard
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
@@ -84,12 +87,21 @@ func start(args ...string) *srv {
 		}
 		close(s.lines)
 	}()
+	var output []string
+	addr = ""
 	for line := range s.lines {
+		output = append(output, line)
+		if a, ok := strings.CutPrefix(line, "listening on "); ok {
+			addr = "http://" + strings.Fields(a)[0]
+		}
 		if line == "ready" {
+			if addr == "" {
+				panic("lsrv-db printed ready without a listening on line: " + strings.Join(output, " | "))
+			}
 			return s
 		}
 	}
-	panic("lsrv-db exited before it was ready")
+	panic("lsrv-db exited before it was ready: " + strings.Join(output, " | "))
 }
 
 // stop sends SIGTERM and requires "stopped" and exit status 0.

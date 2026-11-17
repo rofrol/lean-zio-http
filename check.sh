@@ -98,12 +98,39 @@ grep -E '^[0-9]+ requests: [0-9]+ verdicts' "$tmp/compare.txt"
 .lake/build/bin/lsrv-bench
 bench/boundary/boundary
 bench/boundary/boundary -no-continue -fixture .lake/build/bin/lsrv-fixture-hand
-start lean-h1 ready .lake/build/bin/lsrv 8
-bench/check/check -addr 127.0.0.1:8083
+# A port another process holds (here a running lsrv's): a server asked for it
+# must say why, with the errno, and exit 1 before "ready"; a server on a port
+# the kernel picks starts beside it and passes the end-to-end checks.
+start holder ready .lake/build/bin/lsrv 1 --port 0
+held=$addr; holder=$pid
+# Its stderr goes through a fifo, so a server that gets the port anyway is
+# seen at its "ready" and stopped instead of serving forever. A last line
+# without a newline is kept too, so it counts as a second line. A server
+# that hangs instead keeps the check quiet, which its runner reports.
+mkfifo "$tmp/taken"
+.lake/build/bin/lsrv 1 --port "${held##*:}" >"$tmp/taken.out" 2>"$tmp/taken" &
+taken_pid=$!
+pids="$pids $taken_pid"
+: >"$tmp/taken.err"
+while IFS= read -r line || [ -n "$line" ]; do
+  printf '%s\n' "$line" >>"$tmp/taken.err"
+  if [ "$line" = ready ]; then kill -TERM "$taken_pid"; fi
+done <"$tmp/taken"
+status=0
+wait "$taken_pid" || status=$?
+if [ "$status" != 1 ] || [ -s "$tmp/taken.out" ] || [ "$(wc -l <"$tmp/taken.err")" -ne 1 ] ||
+   ! grep -Eqx "cannot bind $(printf '%s' "$held" | sed 's/\./\\./g'): errno [0-9]+ \(ADDRINUSE\)" "$tmp/taken.err"; then
+  echo "lsrv on the taken $held exited $status; stdout:"; cat "$tmp/taken.out"; echo "stderr:"; cat "$tmp/taken.err"; exit 1
+fi
+start lean-h1 ready .lake/build/bin/lsrv 8 --port 0
+[ "$addr" != "$held" ] || { echo "lean-h1 got $addr, which holder holds"; exit 1; }
+bench/check/check -addr "$addr"
+stop graceful
+pid=$holder; name=holder
 stop graceful
 
-start lean-hand ready .lake/build/bin/lsrv-hand 8
-bench/check/check -addr 127.0.0.1:8083
+start lean-hand ready .lake/build/bin/lsrv-hand 8 --port 0
+bench/check/check -addr "$addr"
 stop graceful
 
 pg_start

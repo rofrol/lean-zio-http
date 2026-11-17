@@ -20,7 +20,10 @@ trap cleanup EXIT INT TERM
 
 # start NAME READY-TEXT COMMAND...: starts a server and returns once it has
 # printed a line containing READY-TEXT (or fails if its output ends first,
-# which means it exited). Sets $pid.
+# which means it exited, and shows that output). Sets $pid, and $addr to the
+# host:port from the server's "listening on HOST:PORT" (or dusty's "Listening
+# on HOST:PORT") line, which must come first: the servers are started on a
+# port the kernel picks, so concurrent runs of other checks cannot take it.
 start() {
   name=$1; ready=$2; shift 2
   mkfifo "$tmp/$name"
@@ -28,11 +31,15 @@ start() {
   pid=$!
   pids="$pids $pid"
   exec 3<"$tmp/$name"
-  up=no
+  up=no; addr=""; seen=""
   while IFS= read -r line <&3; do
+    seen="$seen$line
+"
+    case $line in *[Ll]"istening on "*) addr=${line#*istening on }; addr=${addr%% *} ;; esac
     case $line in *"$ready"*) up=yes; break ;; esac
   done
-  if [ "$up" != yes ]; then echo "$name exited before it listened"; exit 1; fi
+  if [ "$up" != yes ]; then printf '%s exited before it listened; its output:\n%s' "$name" "$seen"; exit 1; fi
+  if [ -z "$addr" ]; then printf '%s printed no listening address; its output:\n%s' "$name" "$seen"; exit 1; fi
   cat <&3 >/dev/null &   # keep draining its output
   pids="$pids $!"
   exec 3<&-

@@ -65,6 +65,9 @@ macro "server_exports " adapter:term : command => `(
 /-- The loop's settings, passed to `ekk_serve` (zig/src/serve.zig). -/
 structure Options where
   threads : Nat := 8
+  /-- The port on 127.0.0.1; 0 asks the kernel for a free one, which the
+  `listening on` line reports (the checks use that). -/
+  port : Nat := 8083
   /-- Most connections open at once, process-wide; more wait in the kernel's
   listen queue. -/
   maxConns : Nat := 4096
@@ -92,6 +95,7 @@ def parseArgs : List String → Options → Except String Options
     let num := n.toNat?
     match flag, num with
     | "--pg", _ => parseArgs rest { o with pg := n }
+    | "--port", some k => parseArgs rest { o with port := k }
     | "--pg-conns", some k => parseArgs rest { o with pgConns := k }
     | "--max-conns", some k => parseArgs rest { o with maxConns := k }
     | "--chunk", some k => parseArgs rest { o with chunk := k }
@@ -107,10 +111,13 @@ def parseArgs : List String → Options → Except String Options
     | some k => .ok { o with threads := k }
     | none => .error s!"unknown argument: {a}"
 
-/-- `[THREADS] [--max-conns N] [--pg CONNINFO] [--pg-conns N] [--chunk N]
+/-- `[THREADS] [--port N] [--max-conns N] [--pg CONNINFO] [--pg-conns N] [--chunk N]
 [--fail-every N] [--trace] [--crash-after-recv N] [--crash-after-send N]`;
-the last five are the loop's test settings. Serves on 127.0.0.1:8083 until SIGTERM or SIGINT, then
-shuts down gracefully and returns 0 (README, "Production contract"). -/
+the last five are the loop's test settings. Serves on 127.0.0.1:PORT (default
+8083) until SIGTERM or SIGINT, then shuts down gracefully and returns 0
+(README, "Production contract"). Once listening it prints `listening on
+127.0.0.1:PORT ...` to stderr; when the port cannot be had it prints why,
+with the errno, and returns 1. -/
 def main (args : List String) : IO UInt32 := do
   match parseArgs args {} with
   | .error e =>
@@ -120,13 +127,14 @@ def main (args : List String) : IO UInt32 := do
     if o.threads == 0 || o.maxConns == 0 || o.maxConns ≥ 2 ^ 31 then
       IO.eprintln "THREADS and --max-conns must be at least 1"
       return 2
+    if o.port ≥ 2 ^ 16 then
+      IO.eprintln "--port must be below 65536"
+      return 2
     if o.pgConns ≥ 2 ^ 16 || o.pg.contains (Char.ofNat 0) then
       IO.eprintln "--pg-conns must be below 65536 and --pg must hold no NUL"
       return 2
     let pgConns := if o.pg.isEmpty then 0 else o.pgConns
-    IO.println s!"serving on 127.0.0.1:8083 with {o.threads} loops, at most {o.maxConns} connections"
-    (← IO.getStdout).flush
-    return (serve 8083 o.threads.toUInt32 o.maxConns.toUInt32 o.pg pgConns.toUInt32 o.chunk.toUSize o.failEvery.toUInt32
+    return (serve o.port.toUInt16 o.threads.toUInt32 o.maxConns.toUInt32 o.pg pgConns.toUInt32 o.chunk.toUSize o.failEvery.toUInt32
       (if o.trace then 1 else 0) o.crashAfterRecv.toUInt32 o.crashAfterSend.toUInt32).toUInt32
 
 end Server.Transport

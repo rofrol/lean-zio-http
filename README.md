@@ -72,8 +72,15 @@ only `Server.Query` values.
 
 - `zig/` (the transport's loop): a static library, built ReleaseSafe by
   `bench.sh` unless `ZIG_OPTIMIZE` says otherwise. One `zio.ev` loop per
-  thread, all accepting on one listening socket on 127.0.0.1:8083; it prints
-  `ready` once every loop has registered its acceptor. The loop keeps no
+  thread, all accepting on one listening socket on 127.0.0.1:8083 (`--port`
+  picks another; 0 asks the kernel for a free one). Once it listens it prints
+  `listening on 127.0.0.1:PORT with N loops, at most M connections` to
+  stderr, with the port it got, and `ready` once every loop has registered
+  its acceptor. When the socket cannot be had (a port another process holds)
+  it prints the failed call, the address and the errno, such as `cannot bind
+  127.0.0.1:8083: errno 48 (ADDRINUSE)`, and exits 1. The checks and
+  benchmarks start every server on port 0 and read its address from that
+  line, so they share no fixed port with checks running beside them. The loop keeps no
   protocol or buffering state: each connection holds a Lean `Conn.State`,
   reports the outcome of every operation to it through `src/glue.c`, and
   performs the action it answers. Worker threads call
@@ -87,7 +94,7 @@ only `Server.Query` values.
   also owns a PostgreSQL pool (`src/pg.zig`, section "PostgreSQL"). The
   library needs libpq's headers (`-Dpq-include`) and the servers link
   `-lpq`.
-- Command line: `lsrv [THREADS] [--max-conns N] [--pg CONNINFO]
+- Command line: `lsrv [THREADS] [--port N] [--max-conns N] [--pg CONNINFO]
   [--pg-conns N]` (`--pg-conns`, default 4, is per loop; without `--pg` no
   pool is made and every query fails with `08006`), then the test settings:
   `--chunk N` caps every receive and send at N bytes, `--fail-every N`
