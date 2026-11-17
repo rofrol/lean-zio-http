@@ -1,7 +1,7 @@
 ## Next, in order
 
-u4moqo Move the toolchain to the first nightly with lean4 PR 16417 (Std.Http RFC fixes)
 cxhvkb Where an item's time goes: bench.sh's load measurements, not the cold build
+u4moqo Move the toolchain to the first nightly with lean4 PR 16417 (Std.Http RFC fixes)
 daaqgn Keep the H1 parser's state across receives instead of reparsing the whole buffer
 i35sos Invalidate the per-connection statement cache after a schema change
 i2rh6f Behavior of the PostgreSQL pool while the database is down
