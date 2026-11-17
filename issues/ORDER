@@ -11,8 +11,6 @@ u4moqo Move the toolchain to the first nightly with lean4 PR 16417 (Std.Http RFC
 
 ## Proposed
 
-qucxyv lsrv-bench prints nothing for over five minutes, so every ./check.sh run trips rr2's quiet wake
-
 ## Needs a decision
 
 53rwgc Linux acceptance runs for the Lean HTTP server
