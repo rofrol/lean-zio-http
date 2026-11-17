@@ -1,0 +1,6 @@
+Should a failed connect fail queries that a busy connection of the pool could still serve?
+
+Seen in i2rh6f (`zig/src/pg.zig`, `Pool.failWaiting`; README "PostgreSQL", "Results and errors"): with connects coalesced to one per loop, a connect that fails fails every query waiting at that moment with `08006` (503), as the decision of 2026-11-17 states. That includes queries waiting while other connections of the same pool are busy and healthy, for example when PostgreSQL refuses new sessions at `max_connections` but the pool's open sessions work. Before i2rh6f such a query also usually got its own failing connect (any disconnected slot took the queue's head at once), so this is not a regression in practice, but it fails queries a busy connection would have served shortly after. The consult review (round 20261117-040311-2258, sol) called it a change of admission semantics.
+
+Question: When a connect fails while other connections of the pool are open, fail every waiting query (current), or keep them waiting for the open connections and fail them only when the pool has no open connection?
+Options: keep failing every waiting query (documented now) | keep waiters while an open connection exists; start the next connect only on a new submit or a slot that frees, so no reconnect loop arises
