@@ -1,6 +1,7 @@
 ## Next, in order
 
 znorfg Should the transport tests' cleanup and leak report get a committed check of their own?
+53rwgc Linux acceptance runs for the Lean HTTP server
 ogcdwm Should the transport tests run on Linux, so the Unix-domain parked-send test is checked on epoll and io_uring?
 ncvxfx Should a query whose deadline expires during the statement Close keep its known error?
 im7c5q Should dusty-hello give dusty the real zio module instead of its stub?
@@ -11,7 +12,6 @@ q2g4am Act on leanprover/lean4's answers to the Std.Http questions 16522 and 165
 
 ## Needs a decision
 
-53rwgc Linux acceptance runs for the Lean HTTP server
 yvladm Decide whether per-loop PostgreSQL pools should share connections across loops
 rtkla3 Whether a handler's synchronous PostgreSQL error chain needs a scheduling boundary
 kaslrv Run the worst-case memory scenario on Linux
