@@ -88,12 +88,17 @@ static void rowdesc(msgs *m, const char *col) {
 static void datarow(msgs *m, const char *v) {
     size_t a = begin(m, 'D'); put16(m, 1); put32(m, (uint32_t)strlen(v)); memcpy(m->b + m->n, v, strlen(v)); m->n += strlen(v); end(m, a);
 }
-static void errresp(msgs *m, const char *sqlstate, const char *message) {
+/* An ErrorResponse; `routine` (field R, the server function that raised
+   it) is left out when NULL. */
+static void errresp_at(msgs *m, const char *sqlstate, const char *message, const char *routine) {
     size_t a = begin(m, 'E');
     put8(m, 'S'); puts0(m, "ERROR"); put8(m, 'V'); puts0(m, "ERROR");
-    put8(m, 'C'); puts0(m, sqlstate); put8(m, 'M'); puts0(m, message); put8(m, 0);
+    put8(m, 'C'); puts0(m, sqlstate); put8(m, 'M'); puts0(m, message);
+    if (routine) { put8(m, 'R'); puts0(m, routine); }
+    put8(m, 0);
     end(m, a);
 }
+static void errresp(msgs *m, const char *sqlstate, const char *message) { errresp_at(m, sqlstate, message, NULL); }
 static void copy(msgs *m, char t) { size_t a = begin(m, t); put8(m, 0); put16(m, 1); put16(m, 0); end(m, a); }
 
 /* ---- the fake server ---- */
@@ -347,6 +352,109 @@ static void usable_session(enum piece how) {
     fake_close(&f);
 }
 
+#define SQL_C "SELECT 2 AS y"
+#define STALE_PLAN "cached plan must not change result type"
+
+/* `sql` (with no parameter) prepared and executed on its first use,
+   answered with one row of column `col`; checks its new statement name. */
+static void prepare_ok(ekk_pg *p, fake *f, enum piece how, const char *sql, const char *col, unsigned long long name) {
+    send_query(p, f, sql, NULL, "PBDES");
+    msgs m = {0};
+    empty(&m, '1'); empty(&m, '2'); rowdesc(&m, col); datarow(&m, "1"); complete(&m, "SELECT 1"); ready(&m, 'I');
+    lean_object *acc = NULL;
+    CHECK(reply(p, f, &m, how, &acc, 0) == 1, "not complete");
+    expect_rows(acc, col, "1");
+    CHECK(p->prepared > 0 && strcmp(p->sql[p->prepared - 1], sql) == 0 && p->name[p->prepared - 1] == name,
+          "the new entry is not \"%s\" as ekk%llu", sql, name);
+}
+
+/* The cached `sql` executed and failing with `sqlstate` raised by
+   `routine`, the session left in transaction status `status`; returns
+   collect's result and checks the error. */
+static int cached_fails(ekk_pg *p, fake *f, enum piece how, const char *sql, const char *sqlstate,
+                        const char *routine, char status, const char *expected) {
+    send_query(p, f, sql, NULL, "BDES");
+    msgs m = {0};
+    errresp_at(&m, sqlstate, STALE_PLAN, routine); ready(&m, status);
+    lean_object *acc = NULL;
+    int rc = reply(p, f, &m, how, &acc, 0);
+    expect_error(acc, expected);
+    return rc;
+}
+
+/* Cached statements that go stale (pg.c, `invalidated`): the failing
+   query gets the error, the entry is forgotten and its text prepared again
+   under a name never used before; other errors keep the entry. */
+static void stale_statements(enum piece how) {
+    fake f;
+    fake_open(&f);
+    ekk_pg *p = connect_fake(&f);
+
+    current = "stale: prepared";
+    prepare_ok(p, &f, how, SQL_A, "x", 0);
+
+    current = "stale: a schema change altered the result type";
+    CHECK(cached_fails(p, &f, how, SQL_A, "0A000", "RevalidateCachedQuery", 'I', "0A000") == 1, "the session was ended");
+    CHECK(p->prepared == 0 && p->stale == 1, "prepared %d, stale %d", p->prepared, p->stale);
+
+    current = "stale: prepared again under a new name";
+    prepare_ok(p, &f, how, SQL_A, "x", 1);
+
+    current = "stale: another 0A000 keeps the statement";
+    CHECK(cached_fails(p, &f, how, SQL_A, "0A000", "transformStmt", 'I', "0A000") == 1, "the session was ended");
+    CHECK(cached_fails(p, &f, how, SQL_A, "0A000", NULL, 'I', "0A000") == 1, "the session was ended");
+    CHECK(p->prepared == 1 && p->stale == 1, "prepared %d, stale %d", p->prepared, p->stale);
+
+    current = "stale: the statement no longer on the server (26000)";
+    CHECK(cached_fails(p, &f, how, SQL_A, "26000", "FetchPreparedStatement", 'I', "26000") == 1, "the session was ended");
+    CHECK(p->prepared == 0 && p->stale == 2, "prepared %d, stale %d", p->prepared, p->stale);
+
+    current = "stale: the first of two entries forgotten";
+    prepare_ok(p, &f, how, SQL_A, "x", 2);
+    prepare_ok(p, &f, how, SQL_C, "y", 3);
+    CHECK(cached_fails(p, &f, how, SQL_A, "0A000", "RevalidateCachedQuery", 'I', "0A000") == 1, "the session was ended");
+    CHECK(p->prepared == 1 && strcmp(p->sql[0], SQL_C) == 0 && p->name[0] == 3, "the remaining entry moved wrongly");
+
+    current = "stale: an execution right after its Prepare is not a cached one";
+    send_query(p, &f, SQL_B, NULL, "PBDES");
+    msgs m = {0};
+    empty(&m, '1'); errresp_at(&m, "0A000", STALE_PLAN, "RevalidateCachedQuery"); ready(&m, 'I');
+    lean_object *acc = NULL;
+    CHECK(reply(p, &f, &m, how, &acc, 0) == 1, "not complete");
+    expect_error(acc, "0A000");
+    CHECK(p->prepared == 2 && strcmp(p->sql[1], SQL_B) == 0 && p->stale == 3, "prepared %d, stale %d", p->prepared, p->stale);
+
+    current = "stale: the remaining entry still executed by name";
+    send_query(p, &f, SQL_C, NULL, "BDES");
+    m = (msgs){0};
+    empty(&m, '2'); rowdesc(&m, "y"); datarow(&m, "2"); complete(&m, "SELECT 1"); ready(&m, 'I');
+    acc = NULL;
+    CHECK(reply(p, &f, &m, how, &acc, 0) == 1, "not complete");
+    expect_rows(acc, "y", "2");
+
+    current = "stale: in a failed transaction the session is still closed";
+    CHECK(cached_fails(p, &f, how, SQL_C, "0A000", "RevalidateCachedQuery", 'E', "25000") == -1, "the session was kept");
+    CHECK(p->prepared == 1 && strcmp(p->sql[0], SQL_B) == 0, "prepared %d", p->prepared);
+    finish(p, &f);
+    fake_close(&f);
+}
+
+/* A session closes, after the failing query's result, once EKK_STATEMENTS
+   forgotten statements may remain on the server. */
+static void stale_bound(enum piece how) {
+    current = "stale bound";
+    fake f;
+    fake_open(&f);
+    ekk_pg *p = connect_fake(&f);
+    for (int i = 0; i < EKK_STATEMENTS; i++) {
+        prepare_ok(p, &f, how, SQL_C, "y", (unsigned long long)i);
+        int rc = cached_fails(p, &f, how, SQL_C, "0A000", "RevalidateCachedQuery", 'I', "0A000");
+        CHECK(rc == (i + 1 < EKK_STATEMENTS ? 1 : -1), "after %d stale statements collect returned %d", i + 1, rc);
+    }
+    finish(p, &f);
+    fake_close(&f);
+}
+
 /* A query whose reply ends the session: collect returns -1 with `sqlstate`
    at the reply's last byte, then the session is finished. */
 static void ending(enum piece how, const char *name, const char *sql, char last, const char *sqlstate) {
@@ -400,6 +508,8 @@ int main(void) {
     lean_initialize_runtime_module();
     for (enum piece how = WHOLE; how <= BYTE; how++) {
         usable_session(how);
+        stale_statements(how);
+        stale_bound(how);
         ending(how, "COPY TO STDOUT", "COPY t TO STDOUT", 'H', "0A000");
         ending(how, "COPY FROM STDIN", "COPY t FROM STDIN", 'G', "0A000");
         ending(how, "a transaction left open", "BEGIN", 'T', "25000");

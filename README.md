@@ -254,10 +254,15 @@ else meanwhile; the loop serves its other connections (`Conn.step_query`,
   `Query.sql` on its first use (one round trip: Prepare, execute and Sync in
   libpq's pipeline mode) and executes it by name after that, as pgx does;
   past 64 statements on a connection further texts run unnamed. So a query
-  must not deallocate statements (`DEALLOCATE`, `DISCARD ALL`), and a
-  statement whose result type changes after a schema change fails until the
-  connection is replaced. Parameters and results are text; one statement per
-  query.
+  must not deallocate statements (`DEALLOCATE`, `DISCARD ALL`). A cached
+  statement that went stale (its result type changed after a schema change:
+  `0A000` raised by PostgreSQL's `RevalidateCachedQuery`; or the server no
+  longer has it: `26000`) fails that query with PostgreSQL's error, which is
+  not resent, and is forgotten: the text's next use prepares it again, under
+  a name the connection never used, so it cannot collide with the statement
+  the server still holds. A connection closes after the query that leaves 64
+  such forgotten statements, which bounds what it keeps on the server.
+  Parameters and results are text; one statement per query.
 - **Results and errors.** Every query is answered exactly once: rows (text
   values, `none` for NULL, invalid UTF-8 replaced), PostgreSQL's error with
   its SQLSTATE, or a pool error: `08006` when the connection could not be
@@ -297,7 +302,11 @@ else meanwhile; the loop serves its other connections (`Conn.step_query`,
   `src/pg_glue_test.c` runs `pg.c` and the real libpq against a fake
   PostgreSQL server on a Unix socket, each reply delivered whole, a message
   at a time and a byte at a time: command boundaries and Sync, errors,
-  COPY in and out, a transaction left open, a connection lost mid-reply.
+  COPY in and out, a transaction left open, a connection lost mid-reply,
+  cached statements going stale (`0A000` from `RevalidateCachedQuery` and
+  `26000` forget the statement, another `0A000` keeps it, a failed
+  transaction still closes the session, 64 stale statements close it).
+  `bench/dbcheck` changes a column's type under a cached statement and back.
   A chain of queries that fail synchronously, each asked again from its
   error, runs entirely inside the `submit` that started it: the loop serves
   nothing else until the chain ends.

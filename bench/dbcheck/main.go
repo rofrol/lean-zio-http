@@ -17,6 +17,10 @@
 //   - errors: on one slot, a query PostgreSQL cannot prepare, a cached
 //     statement that fails when executed, and a query leaving a transaction
 //     open each answer 500, and the slot then answers the next query;
+//   - schema change: on one slot, a cached statement whose result type an
+//     ALTER TABLE changed answers 500 with 0A000 once, then 200 on the same
+//     backend, twice (the type changed and changed back), so preparing the
+//     text again does not collide with the statements left on the server;
 //   - database down: queries answer 503 while it is stopped, 200 once started;
 //   - shutdown: SIGTERM with a query waiting lets it finish, then the server
 //     exits with status 0 after printing "stopped".
@@ -348,6 +352,33 @@ func testErrors() {
 	s.stop("errors")
 }
 
+// backendPid returns the pid of lsrv's one backend.
+func backendPid(c *pgx.Conn) int {
+	var pid int
+	if err := c.QueryRow(ctx,
+		"SELECT pid FROM pg_stat_activity WHERE application_name = 'lsrv'").Scan(&pid); err != nil {
+		panic(err)
+	}
+	return pid
+}
+
+func testSchemaChange() {
+	s := start("1", "--pg-conns", "1")
+	c := connect()
+	expect("schema change: the statement prepared", get("/db?id=42"), 200, world42)
+	pid := backendPid(c)
+	for _, typ := range []string{"bigint", "int"} {
+		run(c, "ALTER TABLE world ALTER COLUMN randomnumber TYPE "+typ)
+		expect("schema change to "+typ+": the cached statement", get("/db?id=42"), 500, "database error 0A000\n")
+		expect("schema change to "+typ+": prepared again", get("/db?id=42"), 200, world42)
+		if p := backendPid(c); p != pid {
+			fail("schema change to %s: backend %d, want the same session's %d", typ, p, pid)
+		}
+	}
+	c.Close(ctx)
+	s.stop("schema change")
+}
+
 func testDown() {
 	s := start("1", "--pg-conns", "2")
 	expect("down: before", get("/db?id=42"), 200, world42)
@@ -388,7 +419,8 @@ func main() {
 		run  func()
 	}{
 		{"results", testResults}, {"slow query", testSlowQuery}, {"exhaustion", testExhaustion},
-		{"restart", testRestart}, {"errors", testErrors}, {"down", testDown}, {"shutdown", testShutdown},
+		{"restart", testRestart}, {"errors", testErrors},
+		{"schema change", testSchemaChange}, {"down", testDown}, {"shutdown", testShutdown},
 	} {
 		before := failures
 		t.run()

@@ -273,8 +273,8 @@ pub const Slot = struct {
         self.acc = null;
         self.waiter = null;
         if (rc < 0) {
-            // COPY, a transaction left open or a lost connection: the
-            // session cannot serve another query.
+            // COPY, a transaction left open, a lost connection or too many
+            // stale statements (pg.c): the session serves no other query.
             self.teardown();
         } else {
             self.state = .idle;

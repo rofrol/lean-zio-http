@@ -31,17 +31,31 @@ lean_object *ekk_pg_error(const char *sqlstate, const char *message) {
    and the statements prepared on it. Each Query.sql gets a named statement
    on its first use on the connection (Prepare, then its execution, in one
    pipeline with one Sync: one round trip) and is executed by name after
-   that, as pgx's statement cache does; once EKK_STATEMENTS are prepared,
+   that, as pgx's statement cache does; once EKK_STATEMENTS are cached,
    further SQL texts run as unnamed statements. A Query must therefore not
    deallocate statements (DEALLOCATE, DISCARD ALL). One query is in flight
-   per session (pg.zig). */
+   per session (pg.zig).
+
+   A cached statement whose execution fails because its plan went stale
+   (`invalidated`: a schema change altered its result type, or the server
+   no longer has it) is forgotten, and that query is answered with the
+   error, never sent again; the text's next use prepares it afresh. Names
+   come from a counter and are never reused within a session, so preparing
+   cannot collide with a forgotten statement the server still holds; those
+   are counted in `stale`, and a session that reaches EKK_STATEMENTS of them
+   is closed after the query's result, which bounds what it leaves on the
+   server. */
 #define EKK_STATEMENTS 64
 
 typedef struct {
     PGconn *c;
-    char *sql[EKK_STATEMENTS]; /* sql[i] is prepared as statement "ekk<i>" */
-    int prepared;
+    char *sql[EKK_STATEMENTS];       /* sql[i] is prepared as "ekk<name[i]>" */
+    unsigned long long name[EKK_STATEMENTS];
+    int prepared;                    /* entries in sql and name */
+    unsigned long long next_name;    /* the next statement's name; never reused */
+    int stale;                       /* forgotten statements perhaps still on the server */
     int preparing; /* the query in flight prepares sql[prepared - 1] first */
+    int cached;    /* the query in flight executes the entry prepared before, or -1 */
     int last_null; /* PQgetResult's last return was NULL */
 } ekk_pg;
 
@@ -107,6 +121,7 @@ int ekk_pg_send(ekk_pg *p, lean_object *q, lean_object **err) {
     const char *text = cstr(sql);
     *err = NULL;
     p->preparing = 0;
+    p->cached = -1;
     p->last_null = 0;
     if (text == NULL || n > 65535) {
         *err = ekk_pg_error("54000", text == NULL ? "a NUL character in the SQL" : "more than 65535 parameters");
@@ -125,12 +140,15 @@ int ekk_pg_send(ekk_pg *p, lean_object *q, lean_object **err) {
     }
     int k = 0;
     while (k < p->prepared && strcmp(p->sql[k], text) != 0) k++;
-    char name[16];
-    snprintf(name, sizeof name, "ekk%d", k);
+    char name[32];
     int ok;
     if (k < p->prepared) {
+        snprintf(name, sizeof name, "ekk%llu", p->name[k]);
+        p->cached = k;
         ok = PQsendQueryPrepared(p->c, name, (int)n, vals, NULL, NULL, 0);
     } else if (k < EKK_STATEMENTS && (p->sql[k] = strdup(text)) != NULL) {
+        p->name[k] = p->next_name++;
+        snprintf(name, sizeof name, "ekk%llu", p->name[k]);
         p->prepared++;
         p->preparing = 1;
         ok = PQsendPrepare(p->c, name, text, (int)n, NULL)
@@ -185,6 +203,30 @@ static lean_object *rows_of(PGresult *r) {
     return res;
 }
 
+/* Forgets cache entry k, keeping the others in order. */
+static void forget(ekk_pg *p, int k) {
+    free(p->sql[k]);
+    p->prepared--;
+    memmove(p->sql + k, p->sql + k + 1, (size_t)(p->prepared - k) * sizeof p->sql[0]);
+    memmove(p->name + k, p->name + k + 1, (size_t)(p->prepared - k) * sizeof p->name[0]);
+}
+
+/* An execution of a cached statement failed because the statement went
+   stale: 0A000 raised by RevalidateCachedQuery, PostgreSQL's "cached plan
+   must not change result type" (the routine, field R, is sent with every
+   error and is not translated as the message is; PostgreSQL 14 to 18
+   raise it there, recheck when that changes), or 26000, no such prepared
+   statement. A 26000 may also come from a statement that runs EXECUTE
+   itself; forgetting the entry then costs only a fresh Prepare under a new
+   name, and the count in `stale`. */
+static int invalidated(PGresult *r) {
+    const char *st = PQresultErrorField(r, PG_DIAG_SQLSTATE);
+    const char *fn = PQresultErrorField(r, PG_DIAG_SOURCE_FUNCTION);
+    if (st == NULL) return 0;
+    if (strcmp(st, "26000") == 0) return 1;
+    return strcmp(st, "0A000") == 0 && fn != NULL && strcmp(fn, "RevalidateCachedQuery") == 0;
+}
+
 static lean_object *error_of(PGresult *r) {
     const char *st = PQresultErrorField(r, PG_DIAG_SQLSTATE);
     return ekk_pg_error(st ? st : "XX000", PQresultErrorMessage(r));
@@ -194,10 +236,12 @@ static lean_object *error_of(PGresult *r) {
    query's Sync. *acc holds the query's Result: its last result (a later
    error wins over earlier rows), or the error of preparing its statement
    (which is then forgotten, and the execution PostgreSQL skipped is
-   ignored). 1 when the Sync arrived (*acc is complete), 0 when more input is
-   needed, -1 when the connection failed, the statement started COPY, which
-   this pool does not speak, or it left a transaction open: the connection
-   must be closed (*acc holds an error). */
+   ignored). A cached statement that went stale is forgotten (`invalidated`).
+   1 when the Sync arrived (*acc is complete), 0 when more input is needed,
+   -1 when the session must be closed, with *acc the query's result: an
+   error when the connection failed, the statement started COPY, which this
+   pool does not speak, or it left a transaction open; the query's own
+   result when the session holds EKK_STATEMENTS stale statements. */
 int ekk_pg_collect(ekk_pg *p, lean_object **acc) {
     while (!PQisBusy(p->c)) {
         PGresult *r = PQgetResult(p->c);
@@ -226,7 +270,7 @@ int ekk_pg_collect(ekk_pg *p, lean_object **acc) {
                 *acc = ekk_pg_error("25000", "the query left a transaction open; it was rolled back");
                 return -1;
             }
-            return 1;
+            return p->stale >= EKK_STATEMENTS ? -1 : 1;
         case PGRES_PIPELINE_ABORTED:
             break; /* skipped after the error already in *acc */
         case PGRES_COMMAND_OK:
@@ -245,10 +289,14 @@ int ekk_pg_collect(ekk_pg *p, lean_object **acc) {
             break;
         default:
             if (p->preparing) {
-                /* Preparing failed: forget the statement. */
+                /* Preparing failed: forget the statement, which the server
+                   does not hold. */
                 p->preparing = 0;
-                p->prepared--;
-                free(p->sql[p->prepared]);
+                forget(p, p->prepared - 1);
+            } else if (p->cached >= 0 && invalidated(r)) {
+                forget(p, p->cached);
+                p->cached = -1;
+                p->stale++;
             }
             v = error_of(r);
         }
