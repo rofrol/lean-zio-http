@@ -13,8 +13,6 @@ ogcdwm Should the transport tests run on Linux, so the Unix-domain parked-send t
 
 ## Proposed
 
-mbiztc Should bench.sh fail when lean-db/go-db falls below its 0.9 goal?
-
 ## Needs a decision
 
 53rwgc Linux acceptance runs for the Lean HTTP server
