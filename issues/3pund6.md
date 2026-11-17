@@ -17,3 +17,5 @@ Related gap in another repository: ekklesiai.org's decision record 0001 (docs/de
 Recommendation (consult round 20261116-183449-f682, sol, under the user's delegation of 2026-11-16): do not close it as settled; the kernel evidence narrows reachability but settles neither zio's contract nor security modules' hooks. Keep today's exit, keep the finding, and ask upstream only with your go.
 Question: What follows from the classification?
 Options: keep exiting and keep the item open as a bounded finding | ask zio upstream (b) | close it (a)
+
+Checked 2026-11-17 with sol (consult round 20261117-011832-74e7) under the user's delegation: deferred: keep today's exit and the bounded kernel finding; asking zio upstream needs the user's go. No local workaround.
