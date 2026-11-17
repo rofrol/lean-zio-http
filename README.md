@@ -116,7 +116,9 @@ only `Server.Query` values.
   EAGAIN, whatever the backend. zio's io_uring backend would otherwise queue
   every send untried, and each would look parked. The deployed server runs
   on epoll: item 53rwgc's measurements on its host resolved no difference
-  between the two backends (section "HttpArena on the VPS").
+  between the two backends (section "HttpArena on the VPS"), but those
+  figures are invalid for lsrv-arena (item sakmfp), so the comparison
+  between the backends is open again.
   Each loop
   also owns a PostgreSQL pool (`src/pg.zig`, section "PostgreSQL"). The
   library needs libpq's headers (`-Dpq-include`) and the servers link
@@ -239,7 +241,16 @@ only `Server.Query` values.
   accept only with a free slot, and an accepted connection keeps the slot
   until its close; a loop that finds none pauses its acceptor and re-arms it
   when one of its connections closes (the liveness argument is next to
-  `slots_used` in `zig/src/serve.zig`). At startup the soft `RLIMIT_NOFILE`
+  `slots_used` in `zig/src/serve.zig`). The accept's callback then takes
+  further pending connections itself with `accept(2)`, each with a slot
+  reserved first, up to 64 in one callback with the one its completion
+  returned, and stops earlier at `EAGAIN` or when no slot is free; it then
+  re-arms (or pauses) once. zio runs the completion of an accept added from
+  its own callback only on the loop's next turn, so with one connection per
+  callback a loop admitted one per turn (item sakmfp; "The over-5 s tail",
+  below). The bound keeps one callback's work finite, so the loop's
+  established connections and the other loop get their turn while a
+  backlog is taken. At startup the soft `RLIMIT_NOFILE`
   is raised to fit `--max-conns` plus a reserve, or the server refuses to
   start.
 - **Accept errors.** Errors of the one pending connection (`ECONNABORTED`,
@@ -301,7 +312,18 @@ only `Server.Query` values.
   closing loop has acknowledged that the close finished), each loop
   acknowledges a snapshot of its own admission state, so the test sees both acceptors
   pause when the server is full, a connection wait in the listen queue,
-  and the loop whose connection closed re-arm and take it. (4) The loop
+  and the loop whose connection closed re-arm and take it. Taking a
+  backlog (item sakmfp; clients on a Unix-domain socket, whose connect
+  returns once the connection is queued, all connected before the loop is
+  polled): connections pending when the accept's callback runs are all
+  opened in that callback, within the batch, which then re-arms at
+  `EAGAIN`; a larger backlog is opened at most a batch per turn while an
+  established connection's byte is reported before the last is opened;
+  when the slots run out the callback stops and admission pauses until a
+  close releases one; a direct accept that fails (injected,
+  `fail_accept_every`) gives its slot back and the callback goes on; and
+  two loops started on a pending backlog take it up to the slots, both
+  pause, and a released slot takes one more. (4) The loop
   does not take its stop while the stop's notifier is still waking it.
   zio 9bef33d's `Async.notify` could let the loop take the stop, end and
   close its poller in `deinit` before notify's own wake syscall, which then
@@ -983,6 +1005,19 @@ Linux are in "HttpArena on the VPS".
 
 ## HttpArena on the VPS (item 53rwgc)
 
+**lsrv-arena's figures below and every comparison drawn from them are
+invalid** (decided 2026-11-17, item sakmfp). They were taken with a
+transport that accepted one connection per loop turn: in a local
+reproduction of the baseline and pipelined profiles about half of the
+4,096 connections were not accepted during the load, and gcannon counts
+only answered requests, so its throughput, latency and CPU per response
+for lsrv-arena covered only the connections accepted ("The over-5 s tail:
+connections accepted late", below). That cause is verified locally; its
+size on the VPS was not measured, as the VPS harness traces no accepts.
+The fix (item sakmfp) has not been measured on the VPS; the Go entries'
+figures are unaffected. The rest of this section is kept as the record of
+that run.
+
 **These figures are a diagnostic, not a clean acceptance of ekklesiai.org's
 speed requirement D2.** The load generator ran on the same 2 vCPUs as the
 server, as the owner approved for this run (2026-11-17): throughput is a
@@ -1081,7 +1116,8 @@ each run reached 99.2-99.5 % of the rate; no errors):
 | go-stdlib | 5 | 9,939 (9,925-9,944) | 18.8 (12.3-66.8) | 75 (73-78) | 45 (44-47) | 0 |
 | go-fasthttp | 5 | 9,946 (9,934-9,951) | 5.3 (4.5-9.5) | 50 (48-52) | 31 (31-33) | 0 |
 
-Read with the caveat above:
+Read with the caveat above, and void for lsrv-arena (the notice at the
+top of this section):
 - Against the floor: lsrv-arena on io_uring answers more baseline and
   limited-conn requests per second than go-stdlib (ranges apart); on epoll
   the ranges overlap go-stdlib's. In pipelined the three are level. Its
@@ -1096,10 +1132,10 @@ Read with the caveat above:
 - In pipelined and baseline, lsrv-arena's tail is long: responses over 5 s
   in every pipelined sample (about 120 per sample of some 220,000) and in
   every baseline sample (7 to 14), which neither Go entry has in baseline.
-  Its cause is that the loops accept one connection per turn, so in a
-  local reproduction about half of the 4,096 connections were never
-  accepted during the load and gcannon's figures for lsrv-arena cover only
-  the others ("The over-5 s tail: connections accepted late", below).
+  Its cause was that the loops accepted one connection per turn (fixed in
+  item sakmfp, not re-measured here), so in a local reproduction about
+  half of the 4,096 connections were never accepted during the load and
+  gcannon's figures for lsrv-arena covered only the others ("The over-5 s tail: connections accepted late", below).
 - epoll against io_uring: the throughput, p99 and CPU ranges overlap in
   every profile, so no difference in them is resolved; only latency-10k's
   peak memory is (34 MB on epoll, 33 on io_uring).
@@ -1170,7 +1206,8 @@ served connections: it is the accept path.
   baseline and two pipelined samples, and p99.9 fell to 0.19-0.22 s
   (baseline) and 0.69 s (pipelined); the median rose (about 35 ms baseline,
   390-410 ms pipelined), as twice the connections then share the same two
-  CPUs. That change is a proposal for the owner, not part of this item.
+  CPUs. Item sakmfp made that change (`LoopCtx.acceptMore`; "Production
+  contract", "Admission"); its own run is below.
 - io_uring was not traced locally; its completions take the same deferred
   path in zio's loop, and the VPS counts for it are the same.
 - go-stdlib's pipelined samples also accepted slowly (up to 3 s) and
@@ -1201,6 +1238,28 @@ by H1 and a send of its own, where go-fasthttp writes 16 responses with one
 send. Server CPU per response here: 9.2 µs pipelined, 15.2 µs baseline
 (go-stdlib 7.4 and 11.3, go-fasthttp 0.8 and 6.2), whole-run CPU over the 5 s
 window's responses.
+
+After the fix (item sakmfp, 2026-11-17): the same script, two rounds, with
+lsrv-arena built from the committed `acceptMore` (each accept callback
+takes up to 64 connections). Every lsrv-arena sample accepted all 4,096
+connections during the load, none after 1 s, and no response took over
+5 s (gcannon printed no overflow line); each of its responses was 2xx,
+and each of its servers printed `stopped` at its SIGTERM.
+
+| server | profile | responses in 5 s | over 5 s | p50 / p99.9 | accepted during the load | slowest accept |
+|---|---|---:|---:|---|---:|---:|
+| lsrv-arena | baseline | 556,431; 521,054 | 0; 0 | 35-37 ms / 0.24-0.25 s | 4,096; 4,096 | 0.31-0.32 s |
+| go-stdlib | baseline | 632,402; 616,999 | 0; 0 | 37-38 ms / 0.17-0.31 s | 4,096 | 0.13-0.34 s |
+| go-fasthttp | baseline | 932,112; 1,023,968 | 0; 0 | 22-25 ms / 0.10-0.12 s | 4,096 | 0.06-0.09 s |
+| lsrv-arena | pipelined | 747,171; 766,901 | 0; 0 | 421-432 ms / 0.74-0.76 s | 4,096; 4,096 | 0.42-0.45 s |
+| go-stdlib | pipelined | 900,174; 1,045,860 | 1,155; 0 | 0.15 ms / 2.6-5.0 s | 4,096 | 2.6-4.9 s |
+| go-fasthttp | pipelined | 9,085,952; 7,779,648 | 0; 0 | 42-46 ms / 0.16 s | 4,096 | 0.07-0.18 s |
+
+lsrv-arena's responses now cover every connection, so they are not
+comparable with the first table of this section, taken before the fix,
+when about half the connections were accepted during the load; the median
+rose as in the diagnostic build, since twice the connections share the two
+CPUs. The VPS figures are not re-measured.
 
 ## `Std.Http.Protocol.H1` compared with the hand-written parser (item 7bccgi)
 

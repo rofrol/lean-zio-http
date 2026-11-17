@@ -99,8 +99,13 @@ const Testing = struct {
     /// hears of it: the point where an effect precedes its record.
     crash_after_recv: u32 = 0,
     crash_after_send: u32 = 0,
+    /// Every this-many-th connection an accept callback takes itself
+    /// (`LoopCtx.acceptOne`, counted across loops) is closed and reported as
+    /// an accept error when nonzero. Set only by the transport's tests.
+    fail_accept_every: u32 = 0,
 };
 pub var testing: Testing = .{};
+var accept_count = std.atomic.Value(u32).init(0);
 var recv_count = std.atomic.Value(u32).init(0);
 var send_count = std.atomic.Value(u32).init(0);
 var recv_ok = std.atomic.Value(u32).init(0);
@@ -135,14 +140,31 @@ fn fatal(comptime fmt: []const u8, args: anytype) noreturn {
 /// Admission: slots taken by open connections and by armed accepts together,
 /// never more than `max_conns`. A loop arms its accept only with a slot; the
 /// accepted connection keeps that slot until its close, which releases it.
+/// The accept's callback takes more pending connections itself, each with a
+/// slot reserved before its `accept(2)` and released if that returns none
+/// (`LoopCtx.acceptMore`).
 /// Liveness: a loop that finds no free slot pauses its acceptor and re-arms it
 /// when one of its own connections closes; it pauses only when every slot is
 /// taken, and then at least one slot is held by a connection whose loop will
 /// see its close (a slot held by an armed accept becomes a connection or is
-/// released on that loop), so whenever a slot is free some acceptor is armed
-/// or is about to re-arm.
+/// released on that loop; one reserved for a direct accept is, within the
+/// same callback), so whenever a slot is free some acceptor is armed or is
+/// about to re-arm.
 pub var slots_used = std.atomic.Value(u32).init(0);
 pub var max_conns: u32 = 0;
+
+/// The most connections one accept callback opens, counting the one its
+/// completion returned (item sakmfp). zio queues the completion of an accept
+/// added from its own callback for the loop's next turn (53ed3c377317,
+/// src/ev/loop.zig, `processCompletions`: "Drain only what was queued at
+/// entry ... The rest runs next tick"), so one connection per callback
+/// admitted one per turn, and under HttpArena's 4,096 connections about half
+/// were not accepted during a 5 s load (README, "The over-5 s tail"). The
+/// bound keeps a callback's work finite, so the loop's established
+/// connections and the other loops sharing the listener get their turn
+/// while a backlog is taken. The tests (serve_test.zig) lower it.
+pub const default_accept_batch: u32 = 64;
+pub var accept_batch: u32 = default_accept_batch;
 
 fn reserveSlot() bool {
     var used = slots_used.load(.monotonic);
@@ -822,31 +844,40 @@ pub const LoopCtx = struct {
         if (self.paused) self.armAccept();
     }
 
+    /// Classifies an accept error other than a cancel: an error of the one
+    /// pending connection, or a spurious EAGAIN, returns (the caller goes
+    /// on accepting); every other ends the process.
+    fn acceptFailed(err: net.AcceptError) void {
+        switch (err) {
+            // Errors of the one pending connection (accept(2) on Linux:
+            // "treat them like EAGAIN by retrying"), and a spurious wake.
+            error.WouldBlock, error.ConnectionAborted, error.ProtocolFailure, error.BlockedByFirewall, error.NetworkDown => {},
+            // Out of descriptors or memory: --max-conns is checked against
+            // RLIMIT_NOFILE at startup, so this is pressure from outside the
+            // server; nothing of ours waits for it to end (README).
+            error.ProcessFdQuotaExceeded, error.SystemFdQuotaExceeded, error.SystemResources => fatal("accept: {}", .{err}),
+            // An error of the listening socket itself, or one zio does not
+            // name (Unexpected), or a cancel, which only the shutdown makes
+            // and only of the armed accept: fatal. Linux's other
+            // pending-connection errnos in accept(2) (ENETUNREACH,
+            // EHOSTUNREACH, EHOSTDOWN, ENONET, ENOPROTOOPT, EOPNOTSUPP) would
+            // reach here too, as the pinned zio maps them to Unexpected or
+            // OperationNotSupported (src/os/net.zig, errnoToAcceptError); the
+            // Linux sources read do not return them from TCP's accept
+            // (README, "Production contract", "Accept errors").
+            else => fatal("accept: {}", .{err}),
+        }
+    }
+
     fn acceptCb(loop: *ev.Loop, c: *ev.Completion) void {
         const self: *LoopCtx = @ptrCast(@alignCast(c.userdata.?));
         pg.ownLoop(loop, &self.loop);
         self.armed = false;
         const fd = self.accept.getResult() catch |err| {
             releaseSlot();
-            switch (err) {
-                // Errors of the one pending connection (accept(2) on Linux:
-                // "treat them like EAGAIN by retrying"), and a spurious wake.
-                error.WouldBlock, error.ConnectionAborted, error.ProtocolFailure, error.BlockedByFirewall, error.NetworkDown => {},
-                error.Canceled => if (!self.stopping) fatal("accept canceled outside the shutdown", .{}),
-                // Out of descriptors or memory: --max-conns is checked against
-                // RLIMIT_NOFILE at startup, so this is pressure from outside the
-                // server; nothing of ours waits for it to end (README).
-                error.ProcessFdQuotaExceeded, error.SystemFdQuotaExceeded, error.SystemResources => fatal("accept: {}", .{err}),
-                // An error of the listening socket itself, or one zio does not
-                // name (Unexpected): fatal. Linux's other pending-connection
-                // errnos in accept(2) (ENETUNREACH, EHOSTUNREACH, EHOSTDOWN,
-                // ENONET, ENOPROTOOPT, EOPNOTSUPP) would reach here too, as the
-                // pinned zio maps them to Unexpected or OperationNotSupported
-                // (src/os/net.zig, errnoToAcceptError); the Linux sources read
-                // do not return them from TCP's accept (README, "Production
-                // contract", "Accept errors").
-                else => fatal("accept: {}", .{err}),
-            }
+            if (err == error.Canceled) {
+                if (!self.stopping) fatal("accept canceled outside the shutdown", .{});
+            } else acceptFailed(err);
             return self.armAccept();
         };
         if (self.stopping) {
@@ -855,6 +886,47 @@ pub const LoopCtx = struct {
             releaseSlot();
             return;
         }
+        self.open(fd);
+        self.acceptMore();
+        self.armAccept();
+    }
+
+    /// Takes more pending connections with `accept(2)` on the nonblocking
+    /// listener, up to `accept_batch` in the callback with the one its
+    /// completion returned, each with a slot reserved first. It stops at
+    /// EAGAIN (the queue is empty, or another loop took the rest) and when
+    /// no slot is free; `armAccept` then re-arms, or pauses until a slot of
+    /// this loop's is released. The flags are those of zio's `NetAccept`
+    /// (nonblocking and close-on-exec, src/ev/completion.zig), so a
+    /// connection is the same whichever path accepted it.
+    fn acceptMore(self: *LoopCtx) void {
+        var taken: u32 = 1;
+        while (taken < accept_batch) : (taken += 1) {
+            if (!reserveSlot()) return;
+            const fd = acceptOne(self.lfd) catch |err| {
+                releaseSlot();
+                if (err == error.WouldBlock) return;
+                acceptFailed(err);
+                continue;
+            };
+            self.open(fd);
+        }
+    }
+
+    /// One direct accept. With `testing.fail_accept_every`, every that-many-th
+    /// connection it takes (counted across loops) is closed and reported as
+    /// `ConnectionAborted`, an error of the one pending connection.
+    fn acceptOne(lfd: ev.Backend.NetHandle) net.AcceptError!ev.Backend.NetHandle {
+        const fd = try net.accept(lfd, null, null, .{ .nonblocking = true });
+        if (testing.fail_accept_every != 0 and (accept_count.fetchAdd(1, .monotonic) + 1) % testing.fail_accept_every == 0) {
+            net.close(fd);
+            return error.ConnectionAborted;
+        }
+        return fd;
+    }
+
+    /// Opens the connection `fd` accepted, with the slot it holds.
+    fn open(self: *LoopCtx, fd: ev.Backend.NetHandle) void {
         // TCP_NODELAY comes from the listener (openListener).
         const conn = alloc.create(Conn) catch fatal("no memory for a connection", .{});
         conn.* = .{ .fd = fd, .lp = self, .id = conn_ids.fetchAdd(1, .monotonic) };
@@ -863,7 +935,6 @@ pub const LoopCtx = struct {
         var act: Action = undefined;
         ekk_open(&conn.state, &conn.out, out_cap, &act);
         conn.apply(act);
-        self.armAccept();
     }
 
     /// The shutdown, on the loop's own thread: no more accepts, and every

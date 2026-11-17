@@ -30,11 +30,11 @@
 //! These tests and pg_test.zig's run on macOS (kqueue, `./check.sh`) and on
 //! Linux (epoll and io_uring, `./linux-check.sh`, README "Running"; rerun it
 //! at each zio update and update this record). Last Linux run, 2026-11-17
-//! (item uwrdc2): OrbStack on the M1, aarch64, kernel
-//! 7.2.12-orbstack-00394-gbecdd6130068, Debian 13.7, Zig 0.17.1, Lean
-//! nightly-2026-11-17, libpq 17.12, zio 53ed3c377317. `./linux-check.sh`
-//! exit 0, on epoll and on io_uring each: `zig build test` passed
-//! (serve_test's 25 tests, pg_test's 31), pg_glue_test passed, and the rest
+//! (item sakmfp, after its five accept tests were added): OrbStack on the
+//! M1, aarch64, kernel 7.2.12-orbstack-00394-gbecdd6130068, Debian 13.7,
+//! Zig 0.17.1, Lean nightly-2026-11-17, libpq 17.12, zio 53ed3c377317.
+//! `./linux-check.sh` exit 0, on epoll and on io_uring each: `zig build
+//! test` passed (serve_test's 30 tests, pg_test's 31), pg_glue_test passed, and the rest
 //! of `./check.sh`, bench/dbcheck on the container's private cluster
 //! included. On the production host, 2026-11-17 (item 53rwgc, README
 //! "HttpArena on the VPS"): x86_64, 2 vCPU, kernel 6.12.74+deb13+1-amd64,
@@ -550,6 +550,7 @@ pub const Single = struct {
         due_on_sent = null;
         due_injected = null;
         serve.testing = .{};
+        serve.accept_batch = serve.default_accept_batch;
         serve.budget_ms = .{ never, never, never, never };
         serve.drain_ms = never;
         stops = 0;
@@ -1845,6 +1846,190 @@ test "a timer whose callback is already on its way when its arm is replaced is r
     try s.finish();
 }
 
+// ---- taking a backlog of connections in one accept callback (item sakmfp) ----
+//
+// The clients connect over a Unix-domain stream socket: its connect(2)
+// returns once the kernel has queued the connection on the listener, so
+// when the test polls the loop, every client it connected is pending
+// (a TCP client's connect returns when its own side of the handshake is
+// done, not when the server's kernel has queued it). The loop runs on the
+// test's thread, so no callback is dispatched before that poll.
+
+/// Connects every client in `clients` to `s`'s listener.
+fn connectAll(s: *const Single, clients: []c.fd_t) !void {
+    for (clients) |*cl| cl.* = try s.listener.connect();
+}
+
+fn closeAll(clients: []const c.fd_t) void {
+    for (clients) |cl| _ = c.close(cl);
+}
+
+/// The open connections of the loop.
+fn openConns(s: *const Single) u32 {
+    var n: u32 = 0;
+    var it = s.lp.head;
+    while (it) |conn| : (it = conn.next) n += 1;
+    return n;
+}
+
+test "connections pending when the accept's callback runs are all opened in that callback, within the batch" {
+    var s: Single = undefined;
+    try s.initOn(64, .unix);
+    defer s.deinit();
+    var clients: [5]c.fd_t = undefined;
+    try connectAll(&s, &clients);
+    defer closeAll(&clients);
+    // The poll that dispatches the accept opens all five: the one its
+    // completion returned and four taken directly, until EAGAIN. Before
+    // item sakmfp it opened one and the next accept's completion waited for
+    // the loop's next turn.
+    try s.stepUntil(.open, 1);
+    try std.testing.expectEqual(@as(usize, 5), s.count(.open));
+    // EAGAIN ended the batch with slots free: the accept is armed again,
+    // holding one slot beside the five connections'.
+    try std.testing.expect(s.lp.armed);
+    try std.testing.expect(!s.lp.paused);
+    try std.testing.expectEqual(@as(u32, 6), serve.slots_used.load(.monotonic));
+    // And it takes a client that comes later.
+    const late = try s.listener.connect();
+    defer _ = c.close(late);
+    try s.stepUntil(.open, 6);
+    s.lp.stop.notify();
+    try s.stepUntil(.free, 6);
+    try s.finish();
+}
+
+test "a backlog larger than the batch is opened over several turns, and an established connection is served meanwhile" {
+    var s: Single = undefined;
+    try s.initOn(64, .unix);
+    defer s.deinit();
+    serve.max_conns = 16;
+    serve.accept_batch = 3;
+    const est = try s.listener.connect();
+    defer _ = c.close(est);
+    try s.stepUntil(.open, 1);
+    const est_conn = s.log[0].conn;
+    const est_fd = s.lp.head.?.fd;
+    // The established connection's byte is readable before the loop's next
+    // poll. Its receive has not consumed it: on kqueue and epoll zio tried
+    // it at `loop.add` (EAGAIN) and parked it; on io_uring it is an SQE
+    // the kernel first sees at the next poll, so the test polls no more
+    // before this wait (a receive in the kernel could take the byte first,
+    // and the wait would never end).
+    try send(est, "x");
+    awaitReadable(est_fd);
+    var clients: [7]c.fd_t = undefined;
+    try connectAll(&s, &clients);
+    defer closeAll(&clients);
+    // Each poll opens at most the batch: the callback stops after three and
+    // re-adds its accept, whose completion runs on a later turn (zio's
+    // `processCompletions`, cited at `serve.accept_batch`). The seven take
+    // at least three accept callbacks, so three turns, while the byte's
+    // receive is ready at the first: it is reported before the last open
+    // because the batch is bounded.
+    var opened: usize = 1;
+    var step: usize = 0;
+    while (opened < 8) : (step += 1) {
+        if (step == max_steps) {
+            s.dump();
+            return error.EventNeverCame;
+        }
+        try s.lp.loop.poll(.zero);
+        s.collect();
+        const now = s.count(.open);
+        if (now - opened > serve.accept_batch) {
+            s.dump();
+            return error.BatchExceeded;
+        }
+        // The first poll takes a full batch: the backlog is pending.
+        if (opened == 1 and now > 1) try std.testing.expectEqual(@as(usize, 4), now);
+        opened = now;
+    }
+    // The established connection's byte was reported before the backlog's
+    // last connection was opened.
+    var recv_at: ?usize = null;
+    var last_open: usize = 0;
+    for (s.log[0..s.n], 0..) |e, i| switch (e.kind) {
+        .recv => if (e.conn == est_conn and e.n == 1 and recv_at == null) {
+            recv_at = i;
+        },
+        .open => last_open = i,
+        else => {},
+    };
+    if (recv_at == null or recv_at.? > last_open) {
+        s.dump();
+        return error.EstablishedNotServed;
+    }
+    try std.testing.expectEqual(@as(u32, 8), openConns(&s));
+    s.lp.stop.notify();
+    try s.stepUntil(.free, 8);
+    try s.finish();
+}
+
+test "when the slots run out the callback stops, admission pauses, and a released slot resumes it" {
+    var s: Single = undefined;
+    try s.initOn(64, .unix);
+    defer s.deinit();
+    serve.max_conns = 3;
+    var clients: [5]c.fd_t = undefined;
+    try connectAll(&s, &clients);
+    defer closeAll(&clients);
+    // Three slots: the armed accept's connection and two taken directly;
+    // no slot is left to re-arm, so the acceptor pauses with two clients
+    // still in the listen queue.
+    try s.stepUntil(.open, 1);
+    try std.testing.expectEqual(@as(usize, 3), s.count(.open));
+    try std.testing.expect(!s.lp.armed);
+    try std.testing.expect(s.lp.paused);
+    try std.testing.expectEqual(@as(u32, 3), serve.slots_used.load(.monotonic));
+    // The first client hangs up: its close releases a slot, the acceptor
+    // re-arms with it and opens one more, then finds no slot again.
+    _ = c.close(clients[0]);
+    clients[0] = -1;
+    try s.stepUntil(.free, 1);
+    try s.stepUntil(.open, 4);
+    try s.lp.loop.poll(.zero);
+    s.collect();
+    try std.testing.expectEqual(@as(usize, 4), s.count(.open));
+    try std.testing.expect(!s.lp.armed);
+    try std.testing.expect(s.lp.paused);
+    try std.testing.expectEqual(@as(u32, 3), serve.slots_used.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 3), openConns(&s));
+    s.lp.stop.notify();
+    try s.stepUntil(.free, 4);
+    try s.finish();
+}
+
+test "a direct accept that fails releases its slot, and the callback goes on with the next connection" {
+    var s: Single = undefined;
+    try s.initOn(64, .unix);
+    defer s.deinit();
+    // Every connection the callback takes itself is closed and reported as
+    // ConnectionAborted, an error of the one pending connection.
+    serve.testing.fail_accept_every = 1;
+    var clients: [3]c.fd_t = undefined;
+    try connectAll(&s, &clients);
+    defer closeAll(&clients);
+    try s.stepUntil(.open, 1);
+    try s.lp.loop.poll(.zero);
+    s.collect();
+    // Only the completion's connection opened; both failed accepts gave
+    // their slots back, and the accept is armed again.
+    try std.testing.expectEqual(@as(usize, 1), s.count(.open));
+    try std.testing.expect(s.lp.armed);
+    try std.testing.expectEqual(@as(u32, 2), serve.slots_used.load(.monotonic));
+    // The two failed connections were taken from the queue and closed:
+    // their clients read the end of input at once (a client still queued,
+    // or served, would find nothing to read: -1, EAGAIN).
+    for (clients[1..]) |cl| {
+        var b: [1]u8 = undefined;
+        try std.testing.expectEqual(@as(isize, 0), c.recv(cl, &b, 1, c.MSG.DONTWAIT));
+    }
+    s.lp.stop.notify();
+    try s.stepUntil(.free, 1);
+    try s.finish();
+}
+
 // ---- admission across loops, each on its own thread ----
 
 const nloops = 2;
@@ -2061,6 +2246,139 @@ test "admission across two loops: a full server pauses both acceptors, and the l
     // the stop notification can wake a loop.
     for (&m.lps) |*lp| lp.stop.notify();
     for (0..nloops) |_| _ = try expectEvent(.done);
+    for (m.threads) |t| t.join();
+    try std.testing.expectEqual(@as(u32, 0), serve.slots_used.load(.monotonic));
+}
+
+/// Where a client's connection was opened: its conn and loop, learned from
+/// the byte it sent ('a' + its index), which the loop reported.
+const Placed = struct { conn: u32, loop: u8 };
+
+test "a backlog pending when two loops start is taken by the two up to the slots, and a released slot takes one more" {
+    // Item sakmfp: each accept callback takes pending connections itself
+    // while slots are free. The seven clients connect (over a Unix-domain
+    // socket, queued when connect returns) and each sends its byte before
+    // either loop starts, so both loops find the backlog at their first
+    // turn. Five slots: five open, how many on each loop is not assumed
+    // (one loop may take all five before the other starts), and both
+    // acceptors pause with two clients still queued.
+    errdefer @panic("the multi-loop backlog test failed");
+    try std.testing.expectEqual(@as(u32, 0), serve.slots_used.load(.monotonic));
+    try openEvents();
+    defer closeEvents();
+    room = 64;
+    serve.max_conns = 5;
+    serve.accept_batch = serve.default_accept_batch;
+    serve.testing = .{};
+    open_dl = none_code;
+    recv_dl = none_code;
+    var listener = try Listener.openUnix();
+    defer listener.close();
+    var clients: [7]c.fd_t = undefined;
+    for (&clients, 0..) |*cl, i| {
+        cl.* = try listener.connect();
+        try send(cl.*, &.{@as(u8, @intCast('a' + i))});
+    }
+    defer for (clients) |cl| {
+        _ = c.close(cl);
+    };
+    var m: Multi = .{};
+    multi = &m;
+    for (&m.lps) |*lp| lp.* = .{ .lfd = listener.fd };
+    for (&m.threads, 0..) |*t, i| t.* = try std.Thread.spawn(.{}, loopThread, .{@as(u8, @intCast(i))});
+
+    // Two ready, five opens and the five bytes, in any order across loops.
+    var placed: [7]?Placed = @splat(null);
+    var readies: usize = 0;
+    var opens: usize = 0;
+    var bytes: usize = 0;
+    while (readies + opens + bytes < 2 + 5 + 5) {
+        const e = readEvent();
+        switch (e.kind) {
+            .ready => readies += 1,
+            .open => opens += 1,
+            .recv => {
+                const i = e.byte -% 'a';
+                if (e.n != 1 or i >= clients.len or placed[i] != null) return error.UnexpectedEvent;
+                placed[i] = .{ .conn = e.conn, .loop = e.loop };
+                bytes += 1;
+            },
+            else => {
+                printEvent(e);
+                return error.UnexpectedEvent;
+            },
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 5), opens);
+    var s = try snapshots();
+    try expectLoop(s[0], false, true, s[0].n);
+    try expectLoop(s[1], false, true, s[1].n);
+    try std.testing.expectEqual(@as(u32, 5), s[0].n + s[1].n);
+
+    // An opened client hangs up: its loop X re-arms with the released slot
+    // and opens one of the two queued, whose byte it then reports; then it
+    // pauses again.
+    const k = for (placed, 0..) |p, i| {
+        if (p != null) break i;
+    } else unreachable;
+    const x = placed[k].?.loop;
+    _ = c.close(clients[k]);
+    clients[k] = -1;
+    var freed = false;
+    var opened = false;
+    var reported = false;
+    while (!(freed and opened and reported)) {
+        const e = readEvent();
+        if (e.loop != x) {
+            printEvent(e);
+            return error.UnexpectedEvent;
+        }
+        switch (e.kind) {
+            .recv => if (e.n == 0) {
+                try std.testing.expectEqual(placed[k].?.conn, e.conn);
+            } else {
+                const i = e.byte -% 'a';
+                if (i >= clients.len or placed[i] != null) return error.UnexpectedEvent;
+                placed[i] = .{ .conn = e.conn, .loop = e.loop };
+                reported = true;
+            },
+            .free => {
+                try std.testing.expectEqual(placed[k].?.conn, e.conn);
+                freed = true;
+            },
+            .open => {
+                if (opened) return error.TwoOpens;
+                opened = true;
+            },
+            else => {
+                printEvent(e);
+                return error.UnexpectedEvent;
+            },
+        }
+    }
+    s = try snapshots();
+    try expectLoop(s[0], false, true, s[0].n);
+    try expectLoop(s[1], false, true, s[1].n);
+    try std.testing.expectEqual(@as(u32, 5), s[0].n + s[1].n);
+
+    // The shutdown: every open connection's receive is canceled and it
+    // closes; the client still queued is never accepted.
+    for (&m.lps) |*lp| lp.stop.notify();
+    var dones: usize = 0;
+    var frees: usize = 0;
+    while (dones < nloops) {
+        const e = readEvent();
+        switch (e.kind) {
+            .done => dones += 1,
+            .free => frees += 1,
+            .refused => {},
+            else => {
+                printEvent(e);
+                return error.UnexpectedEvent;
+            },
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 5), frees);
     for (m.threads) |t| t.join();
     try std.testing.expectEqual(@as(u32, 0), serve.slots_used.load(.monotonic));
 }
