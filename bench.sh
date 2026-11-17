@@ -1,50 +1,21 @@
 #!/bin/sh
-# Builds the servers, the checks and the load generator; runs the Lean unit
-# tests (lsrv-test), the PostgreSQL pool's and the transport's tests (zig
-# build test, which need no database), a check that zig/ built for Linux at
-# the Lean toolchain's glibc calls nothing that glibc lacks, the module boundary check (lsrv-arch), the Zig/Lean
-# boundary tests (bench/boundary, which start the fixture servers themselves)
-# and the end-to-end checks against the Lean server, each twice: with the
-# toolchain's Std.Http.Protocol.H1 behind Server.H1Adapter (lsrv, decision
-# D1) and with the hand-written comparator (lsrv-hand); compares the two
-# parsers' verdicts (lsrv-compare), their cost per request and on fragmented
-# requests (lsrv-bench); then measures
-# each server: requests per second, latency, and server CPU time per request
-# at 1, 64 and 256 keep-alive connections, 10 s per run, all on this machine.
-# Then it creates a private PostgreSQL cluster (its own data directory and
-# Unix socket under a temporary directory, no TCP listener), runs the
-# database tests against lsrv-db (bench/dbcheck, which restarts and stops
-# that cluster) and measures lsrv-db against Go with pgx (bench/pgserver) on
-# GET /db?id=42 at 1 and 64 connections, printing lean's throughput as a
-# share of Go's. It needs PostgreSQL's pg_config, initdb, pg_ctl and psql
-# (Homebrew: postgresql@18); pg_config's bindir goes first on PATH.
+# Every item's integration gate: runs ./check.sh (the builds, tests and
+# correctness checks, which also runs on its own while editing), then the
+# load measurements. It measures each server: requests per second, latency,
+# and server CPU time per request at 1, 64 and 256 keep-alive connections,
+# 10 s per run, all on this machine. Then it creates a fresh private
+# PostgreSQL cluster (bench/lib.sh, pg_start) and measures lsrv-db against
+# Go with pgx (bench/pgserver) on GET /db?id=42 at 1 and 64 connections,
+# printing lean's throughput as a share of Go's.
 # Any failing test, check or load run stops the script with a nonzero status.
 set -eu
 cd "$(dirname "$0")"
-PATH="$(pg_config --bindir):$PATH"
-# lake links the servers with -lpq from pg_config's libdir.
-LIBRARY_PATH="$(pg_config --libdir)${LIBRARY_PATH:+:$LIBRARY_PATH}"
-export PATH LIBRARY_PATH
-# lake builds the Zig library (extern_lib zsrv in lakefile.lean, ZIG_OPTIMIZE
-# picks its optimization) and links it into the servers.
-lake build
+./check.sh
+. bench/lib.sh
 (cd dusty-hello && zig build -Doptimize=ReleaseFast)
 (cd bench/load && go build -o load .)
-(cd bench/check && go build -o check .)
-(cd bench/boundary && go build -o boundary .)
 (cd bench/goserver && go build -o server .)
 (cd bench/pgserver && go build -o server .)
-(cd bench/dbcheck && go build -o dbcheck .)
-
-tmp=$(mktemp -d)
-pids=""
-pgdata=""
-cleanup() {
-  for p in $pids; do kill -TERM "$p" 2>/dev/null || true; done
-  if [ -n "$pgdata" ]; then pg_ctl -D "$pgdata" -m immediate stop >/dev/null 2>&1 || true; fi
-  rm -rf "$tmp"
-}
-trap cleanup EXIT INT TERM
 
 # Server CPU time (user + system) in seconds: /proc on Linux, ps on macOS,
 # whose TIME column is [[dd-]hh:]mm:ss.ss.
@@ -61,35 +32,6 @@ cpu() {
   fi
 }
 
-# start NAME READY-TEXT COMMAND...: starts a server and returns once it has
-# printed a line containing READY-TEXT (or fails if its output ends first,
-# which means it exited). Sets $pid.
-start() {
-  name=$1; ready=$2; shift 2
-  mkfifo "$tmp/$name"
-  "$@" >"$tmp/$name" 2>&1 &
-  pid=$!
-  pids="$pids $pid"
-  exec 3<"$tmp/$name"
-  up=no
-  while IFS= read -r line <&3; do
-    case $line in *"$ready"*) up=yes; break ;; esac
-  done
-  if [ "$up" != yes ]; then echo "$name exited before it listened"; exit 1; fi
-  cat <&3 >/dev/null &   # keep draining its output
-  pids="$pids $!"
-  exec 3<&-
-}
-
-# stop [graceful]: SIGTERM; with `graceful`, the server must exit with status
-# 0 (the Lean servers' shutdown, README "Production contract").
-stop() {
-  kill -TERM "$pid"
-  status=0
-  wait "$pid" 2>/dev/null || status=$?
-  if [ "${1:-}" = graceful ] && [ "$status" != 0 ]; then echo "$name exited with $status after SIGTERM"; exit 1; fi
-}
-
 measure() {
   name=$1; port=$2
   for c in 1 64 256; do
@@ -101,85 +43,11 @@ measure() {
   done
 }
 
-.lake/build/bin/lsrv-test
-lean_prefix=$(lean --print-prefix)
-(cd zig && zig build test -Dlean-include="$lean_prefix/include" -Dpq-include="$(pg_config --includedir)" \
-  -Dlean-lib="$lean_prefix/lib/lean" -Dpq-lib="$(pg_config --libdir)")
-# libzsrv.a for Linux (issue 4n7czb): Lean links a Linux program against the
-# glibc its toolchain ships (lib/glibc/), so lakefile.lean's zsrvTarget builds
-# zig/ for that glibc, and the archive must reference no libc symbol it lacks.
-# This machine's toolchain may ship no glibc, so the version is stated: 2.26,
-# the highest GLIBC_2.* version lib/glibc/libc.so of Lean's x86_64 Linux
-# release nightly-2026-11-14 defines (checked 2026-11-16); recheck it at each
-# update of lean-toolchain.
-lean_glibc=2.26
-# The newest glibc Zig knows: its stubs define every libc symbol Zig's std may call.
-newest_glibc=$(zig targets | sed -n '/^ *\.glibc = \.{/,/}/p' | sed -n 's/^ *"\([0-9.]*\)",$/\1/p' | tail -n 1)
-[ -n "$newest_glibc" ] || { echo "zig targets lists no glibc version"; exit 1; }
-printf 'int main(void) { return 0; }\n' >"$tmp/main.c"
-# glibc_lacks GLIBC: builds zig/ for x86_64 Linux with glibc GLIBC and writes
-# to $tmp/linux-GLIBC/lacks the symbols libzsrv.a references that glibc
-# $lean_glibc lacks: those a link against $lean_glibc's stubs leaves undefined
-# and one against $newest_glibc's does not (the Lean and libpq symbols stay
-# undefined in both). Each link must fail with undefined symbols only, and
-# some (zig cc lifts ld.lld's default limit of 20 errors: it lists all of them).
-glibc_lacks() {
-  out="$tmp/linux-$1"
-  (cd zig && zig build -Dtarget="x86_64-linux-gnu.$1" -Doptimize="${ZIG_OPTIMIZE:-ReleaseSafe}" \
-    -Dlean-include="$lean_prefix/include" -Dpq-include="$(pg_config --includedir)" --prefix "$out")
-  for v in "$lean_glibc" "$newest_glibc"; do
-    if zig cc -target "x86_64-linux-gnu.$v" "$tmp/main.c" -Wl,--whole-archive "$out/lib/libzsrv.a" \
-        -Wl,--no-whole-archive -o "$out/a.out" >"$out/link-$v.txt" 2>&1 ||
-       grep -v -e '^$' -e '^>>> ' -e '^ld\.lld: error: undefined symbol: ' "$out/link-$v.txt" | grep -q .; then
-      echo "linking libzsrv.a (glibc $1) against glibc $v did not fail with undefined symbols only:"
-      cat "$out/link-$v.txt"; exit 1
-    fi
-    sed -n 's/^ld\.lld: error: undefined symbol: //p' "$out/link-$v.txt" | sort -u >"$out/undefined-$v"
-    [ -s "$out/undefined-$v" ] || { echo "linking libzsrv.a (glibc $1) against glibc $v reported no undefined symbol"; exit 1; }
-  done
-  comm -23 "$out/undefined-$lean_glibc" "$out/undefined-$newest_glibc" >"$out/lacks"
-}
-glibc_lacks "$lean_glibc"
-if [ -s "$tmp/linux-$lean_glibc/lacks" ]; then
-  echo "libzsrv.a for glibc $lean_glibc references symbols glibc $lean_glibc lacks:"; cat "$tmp/linux-$lean_glibc/lacks"; exit 1
-fi
-# The check must also fail where it should: built for Debian 13's glibc 2.41,
-# where the link failed, the archive references copy_file_range and statx.
-glibc_lacks 2.41
-if ! grep -qx copy_file_range "$tmp/linux-2.41/lacks" || ! grep -qx statx "$tmp/linux-2.41/lacks"; then
-  echo "libzsrv.a for glibc 2.41 should reference copy_file_range and statx, which glibc $lean_glibc lacks; it references:"
-  cat "$tmp/linux-2.41/lacks"; exit 1
-fi
-.lake/build/bin/lsrv-arch
-# The check must also fail where it should: on a fixture package with an
-# application importing the transport and an application no rule names,
-# beside one that keeps its rule. It reports exactly those two.
-arch="$tmp/arch"
-mkdir -p "$arch/App"
-printf 'import Server.Handler\nimport App.Hello\n' >"$arch/App/Db.lean"
-printf 'import Server.Handler\nimport Server.Transport\n' >"$arch/App/Hello.lean"
-printf 'import Server.Handler\n' >"$arch/App/Rogue.lean"
-status=0
-.lake/build/bin/lsrv-arch "$arch" >"$tmp/arch.txt" || status=$?
-expected="FAIL App.Hello imports Server.Transport
-FAIL App.Rogue ($arch/App/Rogue.lean): no boundary rule names this module
-3 modules, 2 violations"
-if [ "$status" != 1 ] || [ "$(cat "$tmp/arch.txt")" != "$expected" ]; then
-  echo "lsrv-arch on its fixture exited $status, printing:"; cat "$tmp/arch.txt"; exit 1
-fi
-.lake/build/bin/lsrv-compare >"$tmp/compare.txt" || { cat "$tmp/compare.txt"; exit 1; }
-sed -n '1,/^## Malformed/p' "$tmp/compare.txt"
-grep -E '^[0-9]+ requests: [0-9]+ verdicts' "$tmp/compare.txt"
-.lake/build/bin/lsrv-bench
-bench/boundary/boundary
-bench/boundary/boundary -no-continue -fixture .lake/build/bin/lsrv-fixture-hand
 start lean-h1 ready .lake/build/bin/lsrv 8
-bench/check/check -addr 127.0.0.1:8083
 measure lean-h1 8083
 stop graceful
 
 start lean-hand ready .lake/build/bin/lsrv-hand 8
-bench/check/check -addr 127.0.0.1:8083
 measure lean-hand 8083
 stop graceful
 
@@ -191,16 +59,7 @@ start dusty "Listening on" dusty-hello/zig-out/bin/dhello
 measure dusty 8084
 stop
 
-# The private cluster: trust authentication on its own Unix socket only.
-pgdata="$tmp/pgdata"
-pgopts="-c listen_addresses= -c unix_socket_directories=$tmp -p 5499 -c max_prepared_transactions=4 -c max_connections=200"
-pg="host=$tmp port=5499 user=postgres dbname=postgres"
-initdb -D "$pgdata" -U postgres --auth=trust -E UTF8 --no-locale >"$tmp/initdb.log" 2>&1 || { cat "$tmp/initdb.log"; exit 1; }
-pg_ctl -D "$pgdata" -w -l "$tmp/pg.log" -o "$pgopts" start >/dev/null
-# The rows of world: randomnumber = (id * 7919) mod 10000 + 1 (42 -> 2599).
-psql "$pg" -q -v ON_ERROR_STOP=1 -c "CREATE TABLE world (id int PRIMARY KEY, randomnumber int NOT NULL);
-  INSERT INTO world SELECT i, (i * 7919) % 10000 + 1 FROM generate_series(1, 10000) i; ANALYZE world;"
-bench/dbcheck/dbcheck -pg "$pg" -pgdata "$pgdata" -pgopts "$pgopts" -pglog "$tmp/pg.log"
+pg_start
 
 # measure_db NAME PORT: GET /db?id=42 at 1 and 64 connections; sets rps_1 and
 # rps_64 to the requests per second.

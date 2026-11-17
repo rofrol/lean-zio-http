@@ -55,3 +55,8 @@ PostgreSQL cluster, and the load measurements. Any failure stops it with a
 nonzero status. It takes several minutes: run it as a visible job.
 Measurements are comparative and machine-dependent; a pass/fail verdict comes
 only from the tests and checks.
+
+`./check.sh` runs the same builds, tests and checks without the load
+measurements; `./bench.sh` runs it first. Use `./check.sh` while editing;
+the whole `./bench.sh` stays every item's gate before it ends (decided
+2026-11-17, item cxhvkb).

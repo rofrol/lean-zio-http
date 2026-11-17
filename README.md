@@ -459,6 +459,14 @@ listener; any other PostgreSQL on the machine is not touched), runs
 and every server it started is stopped on exit. A server that stops
 answering keeps it from ending; that is a failure to trace, never a result.
 
+`./bench.sh` first runs `./check.sh`: every build, test and check above,
+without the load measurements (and so without `dusty-hello`, `bench/load`,
+`bench/goserver` and `bench/pgserver`). Run `./check.sh` on its own while
+editing; the whole `./bench.sh`, measurements included, is the gate for
+integrating a change (item cxhvkb). Both scripts share their helpers and the
+private cluster's setup through `bench/lib.sh`; `bench.sh` measures on a
+fresh cluster after `check.sh`'s has been removed.
+
 `bench/boundary` starts the fixture server (`lsrv-fixture`, and
 `lsrv-fixture-hand` with `-no-continue`) with the test settings and checks:
 exact 60,001-byte responses through 7-byte operations, split and pipelined
