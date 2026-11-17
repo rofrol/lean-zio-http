@@ -1,6 +1,5 @@
 ## Next, in order
 
-wi7efy Make serve.zig correct and efficient under io_uring
 uwrdc2 Move the zio pin to 53ed3c3 (zio PRs 929 and 930)
 53rwgc Linux acceptance runs for the Lean HTTP server
 ncvxfx Should a query whose deadline expires during the statement Close keep its known error?
@@ -10,6 +9,8 @@ zg4hrz Pin the Linux validation container's base image and packages
 ## Proposed
 
 q2g4am Act on leanprover/lean4's answers to the Std.Http questions 16522 and 16523
+rqc3ql Install bc in the Linux validation image, so bench.sh reports CPU per request there
+qgrnr3 Backend-independent tests of the transport's completion, cancel and expiry orderings
 
 ## Needs a decision
 
