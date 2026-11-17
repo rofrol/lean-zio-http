@@ -5,6 +5,7 @@ cxhvkb Where an item's time goes: bench.sh's load measurements, not the cold bui
 daaqgn Keep the H1 parser's state across receives instead of reparsing the whole buffer
 i35sos Invalidate the per-connection statement cache after a schema change
 i2rh6f Behavior of the PostgreSQL pool while the database is down
+es53kx Bound the capacity of connection buffers or qualify the memory claim
 
 ## Proposed
 
@@ -16,7 +17,6 @@ ytzycm Per-connection idle, read and write deadlines for the Lean HTTP server
 yvladm Decide whether per-loop PostgreSQL pools should share connections across loops
 tc5rsx Bound the memory of a PostgreSQL result before it is fully received
 rtkla3 Whether a handler's synchronous PostgreSQL error chain needs a scheduling boundary
-es53kx Bound the capacity of connection buffers or qualify the memory claim
 kaslrv Run the worst-case memory scenario on Linux
 3pund6 Decide what follows from the classification of Linux pending-connection accept errnos (xihdtw)
 sa6jpb Decide whether the interim 100 Continue carries the own header fields
