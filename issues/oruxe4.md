@@ -19,3 +19,5 @@ Proposed: a script (or an optional check.sh stage) that builds libpq at the
 lowest supported tag of each line (and the newest of each) into a cache
 directory and runs `zig build test` against each, with the decision of
 whether it is part of every item's gate or run at dependency updates only.
+
+Decided 2026-11-17 by the coordinating session with sol (consult round 20261117-065930-4e87), under the user's delegation of the same day: approved as an opt-in local script, not an every-item gate. It builds libpq at the lowest supported tag and the newest release of each supported line from a PostgreSQL source checkout into a cache directory outside the repository (entries published atomically, so an interrupted build is never used), records the exact versions, checks which library each run loaded, and runs zig build test against each. AGENTS.project.md says to run it for every change to the PostgreSQL glue and at libpq updates. Measure its cold and warm time and disk use and report them; whether it joins the gate is a later decision on that evidence. No Homebrew packages, no CI.
