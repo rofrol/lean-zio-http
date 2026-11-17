@@ -569,9 +569,54 @@ def retainedScenario : Check Unit := do
         | _ => fail s!"retained state, {name}, pieces of {k}: answered at {n} of {b.size} bytes"
       if k == b.size then IO.println s!"retained state, {name} ({b.size} bytes): at most {largest} of {adapterBound} bytes"
 
+/-! ## A written response's capacity -/
+
+/-- The capacity of `a`: `test/retained.c`. -/
+@[extern "lsrv_byte_array_capacity"] opaque byteArrayCapacity (a : @& ByteArray) : Nat
+
+/-- The response's bytes spelled out independently of `Response.write`. -/
+def expectedWrite (now : Nat) (r : Response) (close headOnly : Bool) : ByteArray :=
+  let fields := String.join (r.headers.toList.map fun (n, v) => s!"{n}: {v}\r\n")
+  let date := String.fromUTF8! (Response.pushDate ByteArray.empty now)
+  let cl := if Response.noBody r.status then "" else s!"\r\nContent-Length: {r.body.size}"
+  let conn := if close then "\r\nConnection: close" else ""
+  let head := s!"HTTP/1.1 {r.status} {Response.reason r.status}\r\n{fields}Date: {date}{cl}{conn}\r\n\r\n"
+  head.toUTF8 ++ (if headOnly || Response.noBody r.status then ByteArray.empty else r.body)
+
+/-- `Response.write` gives an array whose capacity is its size, with heads
+shorter and longer than the scratch 192 bytes and responses of exactly
+`maxResponseBytes`, bytes as `expectedWrite` spells them; a response at the
+limit is one 81,920-byte block (README "Memory"). -/
+def responseCapacityScenario : Check Unit := do
+  let now := 253402300799
+  for (what, fs) in [("a short head", #[Response.contentType]),
+      ("a head over 192 bytes", #[Response.contentType, ("X-Long", fill 'a' 1 300)]),
+      ("a head of 40,000 bytes", #[Response.contentType, ("X-Long", fill 'a' 1 40000)])] do
+    for close in [false, true] do
+      let headSize := (Response.write now { status := 200, headers := fs } close true).size
+      -- A body of 1 byte makes Content-Length one digit; the limit's body, five.
+      let atLimit := maxResponseBytes - (headSize + 4)
+      -- 204 and 304 are written without their body (`check` rejects one first).
+      for (status, body) in [(200, ByteArray.empty), (200, "x".toUTF8),
+          (200, ByteArray.mk (Array.replicate atLimit 98)), (204, ByteArray.empty),
+          (204, "x".toUTF8), (304, ByteArray.empty), (304, "x".toUTF8)] do
+        for headOnly in [false, true] do
+          let r : Response := { status, headers := fs, body }
+          let out := Response.write now r close headOnly
+          let cap := byteArrayCapacity out
+          if out != expectedWrite now r close headOnly then
+            fail s!"response capacity, {what}, {status} body {body.size} close {close} head {headOnly}: bytes differ"
+          if cap != out.size then
+            fail s!"response capacity, {what}, {status} body {body.size} close {close} head {headOnly}: capacity {cap} for {out.size} bytes"
+          if body.size == atLimit && !headOnly then
+            if out.size != maxResponseBytes then fail s!"response capacity, {what}, close {close}: {out.size} bytes at the limit"
+            if retainedBytes out != 81920 then
+              fail s!"response capacity, {what}, close {close}: a {retainedBytes out}-byte block at the limit, want 81,920"
+
 def main : IO UInt32 := do
   let ((), failures) ← (do
     retainedScenario
+    responseCapacityScenario
     ownFieldRule
     for ad in [h1, hand] do
       adapterCases ad

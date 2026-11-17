@@ -116,18 +116,26 @@ def hdrConnClose := "\r\nConnection: close".toUTF8
 def crlf := "\r\n".toUTF8
 def crlf2 := "\r\n\r\n".toUTF8
 
-/-- The response's bytes: status line, the application's fields, Date,
+/-- The response's head: status line, the application's fields, Date,
 Content-Length (of `r.body` also for HEAD), `Connection: close` when `close`,
-and the body unless `headOnly`. -/
-def write (now : Nat) (r : Response) (close headOnly : Bool) : ByteArray := Id.run do
-  let mut o := pushStatusLine (ByteArray.emptyWithCapacity (192 + r.body.size)) r.status
+and the empty line. Built in a scratch array that may grow; `write` copies it. -/
+def writeHead (now : Nat) (r : Response) (close : Bool) : ByteArray := Id.run do
+  let mut o := pushStatusLine (ByteArray.emptyWithCapacity 192) r.status
   for (n, v) in r.headers do
     o := (((o.append n.toUTF8).push 58).push 32).append v.toUTF8 |>.append crlf
   o := pushDate (o.append hdrDate) now
   if !noBody r.status then o := pushNat (o.append hdrCL) r.body.size
   if close then o := o.append hdrConnClose
-  o := o.append crlf2
-  return if headOnly || noBody r.status then o else o.append r.body
+  return o.append crlf2
+
+/-- The response's bytes: the head (`writeHead`) and the body unless
+`headOnly`, in an array whose capacity is exactly its size, so a response kept
+while it is sent holds no unused capacity (README "Memory"). The capacity is a
+`Nat` sum, which cannot wrap; both appends fit it, so neither grows the array. -/
+def write (now : Nat) (r : Response) (close headOnly : Bool) : ByteArray :=
+  let head := writeHead now r close
+  let body := if headOnly || noBody r.status then ByteArray.empty else r.body
+  ((ByteArray.emptyWithCapacity (head.size + body.size)).append head).append body
 
 /-! ## Header fields on the library's own responses -/
 

@@ -593,12 +593,12 @@ func rssKiB(pid int) (int, error) {
 // sendingBound, in KiB: the blocks README "Memory" derives for a connection
 // sending a final response, the loop's connection (a 20,480-byte malloc
 // block), the buffer (an exact copy of under 8,192 bytes, at most a
-// 10,240-byte mimalloc block) and the response (capacity at most 131,072, a
-// 163,840-byte block), plus an allowance of 2 KiB, not derived, for the
+// 10,240-byte mimalloc block) and the response (capacity at most 65,536, an
+// 81,920-byte block), plus an allowance of 2 KiB, not derived, for the
 // state's small Lean objects and the allocators' metadata. The adapter is at
 // its shared `init` then. A measurement over it shows the accounting misses
 // something.
-const sendingBound = (20480 + 10240 + 163840 + 2048) / 1024
+const sendingBound = (20480 + 10240 + 81920 + 2048) / 1024
 
 // memory measures the retained memory of connections holding a request
 // head: 1000 connections each send an 8,000-byte head with

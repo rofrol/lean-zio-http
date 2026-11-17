@@ -82,3 +82,9 @@ LEAN_EXPORT lean_obj_res lsrv_retained_bytes(b_lean_obj_arg root) {
   free(seen.slots);
   return lean_usize_to_nat(total);
 }
+
+// The capacity of a byte array (`lean_sarray_capacity`), which Lean does not
+// expose: lsrv-test checks that a written response has no unused capacity.
+LEAN_EXPORT lean_obj_res lsrv_byte_array_capacity(b_lean_obj_arg a) {
+  return lean_usize_to_nat(lean_sarray_capacity(a));
+}

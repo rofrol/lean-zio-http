@@ -376,14 +376,14 @@ lean4 commit 62e0cf0, mimalloc 3.4.5; a block size is what the toolchain's
   32,776: a block of at most 40,960 bytes. While a final response is sent
   the buffer is the rest of the receive that completed the request, under
   8,192 bytes (below), copied exactly: a block of at most 10,240.
-- A response: `Server.Response.write` allocates capacity 192 + body and
-  appends the head and the body; when the head is longer than 192 bytes, the
-  append that runs out of capacity doubles the size it needs. No append needs
-  more than the final size, and a response kept is at most 65,536 bytes
-  (`render` replaces a larger one), so its capacity is at most 131,072: a
-  block of at most 163,840 bytes, of which only the pages written need be
-  resident. The fixture's largest response (60,121 bytes, a 120-byte head)
-  does not grow: capacity 60,193, a 65,536-byte block.
+- A response: `Server.Response.write` builds the head in a scratch array,
+  dropped within the step, then allocates capacity exactly the head and the
+  body it sends and appends both, so neither append grows it. A response
+  kept is at most 65,536 bytes (`render` replaces a larger one), so its
+  capacity is at most 65,536: a block of at most 81,920 bytes, of which only
+  the pages written need be resident (`lsrv-test` checks the capacity and,
+  at the limit, the block). The fixture's largest response (60,121 bytes)
+  is a 65,536-byte block.
 - The adapter's initial state is one object shared by every connection
   (H1's is a closed term, `lean_obj_once` in the generated C), so a
   connection whose adapter is at `init` holds none of its own; the interim
@@ -395,8 +395,8 @@ action constructors, tens of bytes each):
 - while reading, and while sending the interim response: at most 20,480 +
   40,960 = 61,440 bytes, plus the adapter's state, with H1 at most 653,788
   (below): 715,228 bytes (698.5 KiB) in all, the most of any state;
-- while sending a final response: at most 20,480 + 10,240 + 163,840 =
-  194,560 bytes (190 KiB), the adapter at `init`;
+- while sending a final response: at most 20,480 + 10,240 + 81,920 =
+  112,640 bytes (110 KiB), the adapter at `init`;
 - while waiting for a query: the connection and an exact buffer of under
   8,192 bytes, plus the `Server.Query` and continuation the handler built
   (bounded by what it builds), and while the continuation turns it into the
@@ -465,7 +465,7 @@ and how much more freed blocks keep resident, `bench/boundary` measures.
 the H1 fixture, M1, 2026-11-17; from 1,000 connections against the idle
 server for the first, otherwise from half to all of the connections, which
 leaves out the fixed component). These are measurements, not bounds, and
-they check no bound except the last, against the 190 KiB derived above
+they check no bound except the last, against the 110 KiB derived above
 plus an allowance of 2 KiB for the small objects and the allocators'
 metadata, which is not derived (`sendingBound`):
 
