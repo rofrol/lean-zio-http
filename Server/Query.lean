@@ -74,17 +74,19 @@ inductive Query.Result where
 
 /-- Most bytes the Lean value of a `rows` result may cost, a larger one
 becomes `abandoned "54000"`, whose statement's outcome is unknown
-(`Query.Result.abandoned`). The pool receives rows one at a time and charges
-each before building it, as a conservative count of the objects it
+(`Query.Result.abandoned`). The pool receives rows in chunks of 16 and charges
+each row before building it, as a conservative count of the objects it
 allocates: the result, each column name, each row (one slot per field, so a
 `NULL` or empty value costs its slot) and each value's `some` and string,
 with each object's header and rounding, and invalid UTF-8 charged three
 times for its replacement characters. So the row and field counts are
 bounded too: a result of one column of `NULL`s holds fewer than 22,000 rows.
 This bounds the result the pool gathers, not the process's memory: libpq
-holds one whole protocol message at a time before the pool sees it, so a
-single row larger than the bound is received whole before it is refused,
-and the allocator's overhead comes on top. -/
+copies a chunk's rows, up to 16 of any size, before the pool sees them, so
+the row that crosses the bound is received whole (however large) before it
+is refused, and with it up to 15 rows after it; libpq's input buffer may
+also hold more of the result that had arrived, and the allocator's
+overhead comes on top. -/
 def Query.maxResultBytes : Nat := 1048576
 
 /-- An answer that may wait for queries: `done a`, or `query q k`, which runs

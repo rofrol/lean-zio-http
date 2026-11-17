@@ -10,11 +10,11 @@
 # PGSRC is a git checkout of PostgreSQL
 # (https://git.postgresql.org/git/postgresql.git); the lines and releases are
 # its release tags REL_<major>_<minor>, so `git -C PGSRC fetch --tags` first
-# to test the newest releases. Every line from 14 up with a release tag is
-# tested; a line from 14 up to the newest with no tag of its lowest supported
+# to test the newest releases. Every line from 17 up with a release tag is
+# tested; a line from 17 up to the newest with no tag of its lowest supported
 # release is an error.
-# The lowest supported release is 14.6 and 15.1 (single-row mode reset after
-# each pipelined query, pg.c), and <major>.0 from 16 on.
+# The lowest supported release is <major>.0 from 17 on (PQsetChunkedRowsMode,
+# pg.c; decided 2026-11-17, item 4lmjda).
 #
 # Each release's libpq is built from `git archive` of its tag (the checkout
 # is not touched) with
@@ -55,20 +55,20 @@ trap 'exit 130' INT TERM
 jobs=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)
 
 # The releases: "MAJOR MINOR TAG" per line, the lowest supported release and
-# the newest release of each line from 14 up (one line when they are the same).
+# the newest release of each line from 17 up (one line when they are the same).
 git -C "$src" tag -l 'REL_*' | sed -n 's/^REL_\([0-9][0-9]*\)_\([0-9][0-9]*\)$/\1 \2/p' |
   sort -n -k1,1 -k2,2 | awk '
-    $1 >= 14 { if ($1 > top) top = $1; hi[$1] = $2; has[$1 " " $2] = 1 }
+    $1 >= 17 { if ($1 > top) top = $1; hi[$1] = $2; has[$1 " " $2] = 1 }
     END {
-      for (m = 14; m <= top; m++) {
-        lo = m == 14 ? 6 : m == 15 ? 1 : 0
+      for (m = 17; m <= top; m++) {
+        lo = 0
         if (!((m " " lo) in has)) { print "missing REL_" m "_" lo; continue }
         print m, lo, "REL_" m "_" lo
         if (hi[m] != lo) print m, hi[m], "REL_" m "_" hi[m]
       }
     }' >"$tmp/releases"
 if grep '^missing ' "$tmp/releases" >&2; then echo "these supported releases have no tag in $src" >&2; exit 1; fi
-[ -s "$tmp/releases" ] || { echo "$src has no release tag REL_<major>_<minor> from 14 up" >&2; exit 1; }
+[ -s "$tmp/releases" ] || { echo "$src has no release tag REL_<major>_<minor> from 17 up" >&2; exit 1; }
 
 # build TAG COMMIT ENTRY: builds and publishes the cache entry ENTRY.
 build() {

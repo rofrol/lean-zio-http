@@ -8,6 +8,12 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* PQsetChunkedRowsMode, which every execution uses (below), came with
+   libpq 17. */
+#ifndef LIBPQ_HAS_CHUNK_MODE
+#error "the PostgreSQL pool needs libpq 17 or later (PQsetChunkedRowsMode)"
+#endif
+
 /* ---- PostgreSQL (libpq), called by zig/src/pg.zig on its loop's thread ----
    Values cross into Lean as Server.Query and Server.Query.Result
    (lean/Server/Query.lean). Layouts: Query is a structure, constructor 0 with
@@ -57,20 +63,30 @@ lean_object *ekk_pg_abandoned(const char *sqlstate, const char *message) { retur
    is closed after the query's result, which bounds what it leaves on the
    server.
 
-   Every execution runs in libpq's single-row mode, so its rows arrive one
-   PGresult each and are charged against Query.maxResultBytes as they
-   arrive (ekk_rows); a result that crosses the bound closes the session
-   before the rest arrives. libpq lets the mode be set only while its
-   command is the head of libpq's queue and none of its results has been
-   parsed: for a cached or unnamed execution right after sending it, on a
-   first use once the Prepare's results have ended (`stage`). */
+   Every execution runs in libpq's chunked-rows mode, so its rows arrive
+   in PGresults of EKK_CHUNK_ROWS rows (the last one of fewer) and are
+   charged against Query.maxResultBytes as they arrive (ekk_rows); a result
+   that crosses the bound closes the session before the rest arrives. libpq
+   lets the mode be set only while its command is the head of libpq's queue
+   and none of its results has been parsed: for a cached or unnamed
+   execution right after sending it, on a first use once the Prepare's
+   results have ended (`stage`). */
 #define EKK_STATEMENTS 64
+
+/* The rows of one chunk. libpq hands a chunk over only once it holds this
+   many rows or the execution's rows have ended, so it copies at most
+   EKK_CHUNK_ROWS - 1 rows after the one that crosses the bound before the
+   pool sees that row (README, "Bounded only in part"). The smallest size
+   measured that gets single-row mode's per-row cost back: chunks of 16
+   and 64 cost the same within noise, so the smaller residual decides
+   (bench/rows.sh, README "PostgreSQL"). */
+#define EKK_CHUNK_ROWS 16
 
 /* Where the query in flight is in its commands. */
 typedef enum {
     EKK_PREPARING, /* the Prepare's result comes first */
     EKK_PREPARED,  /* the Prepare succeeded; the NULL ending it comes next */
-    EKK_EXECUTING, /* the execution's results, in single-row mode */
+    EKK_EXECUTING, /* the execution's results, in chunked-rows mode */
     EKK_SKIPPED,   /* preparing failed, so PostgreSQL skips the execution */
 } ekk_stage;
 
@@ -96,23 +112,23 @@ typedef struct {
     int last_null; /* PQgetResult's last return was NULL */
     ekk_rows rows; /* the query in flight's rows so far */
     size_t limit;  /* EKK_MAX_RESULT_BYTES; the tests (pg_glue_test.c) set less */
+    int chunk;     /* EKK_CHUNK_ROWS; the tests set others */
 } ekk_pg;
 
-/* libpq's single-row mode for the command at the head of libpq's queue.
+/* libpq's chunked-rows mode for the command at the head of libpq's queue.
    The callers set it only where libpq allows it (above), so a refusal is a
    programming error, never a reason to buffer the whole result. */
-static void single_row(ekk_pg *p) {
-    if (!PQsetSingleRowMode(p->c)) {
-        fprintf(stderr, "pg.c: libpq refused single-row mode for the execution\n");
+static void chunked(ekk_pg *p) {
+    if (!PQsetChunkedRowsMode(p->c, p->chunk)) {
+        fprintf(stderr, "pg.c: libpq refused chunked-rows mode for the execution\n");
         abort();
     }
 }
 
-/* Whether the libpq the process runs supports the pool: pipeline mode
-   (14) with single-row mode reset after each pipelined query ("libpq:
-   Reset singlerow flag correctly in pipeline mode", in 14.6, 15.1 and
-   16.0). `v` is PQlibVersion's major * 10000 + minor. */
-static int libpq_supported(int v) { return v >= 150001 || (v >= 140006 && v < 150000); }
+/* Whether the libpq the process runs supports the pool: chunked-rows mode
+   (PQsetChunkedRowsMode), from 17.0. `v` is PQlibVersion's
+   major * 10000 + minor. */
+static int libpq_supported(int v) { return v >= 170000; }
 
 int ekk_pg_libpq_supported(void) { return libpq_supported(PQlibVersion()); }
 
@@ -191,6 +207,7 @@ ekk_pg *ekk_pg_start(const char *conninfo, const char *options) {
     ekk_pg *p = calloc(1, sizeof *p);
     if (p == NULL) return NULL;
     p->limit = EKK_MAX_RESULT_BYTES;
+    p->chunk = EKK_CHUNK_ROWS;
     p->c = PQconnectStartParams(keys, vals, 1);
     if (p->c == NULL) { free(p); return NULL; }
     return p;
@@ -274,17 +291,17 @@ int ekk_pg_send(ekk_pg *p, lean_object *q, lean_object **err) {
         snprintf(name, sizeof name, "ekk%llu", p->name[k]);
         p->cached = k;
         ok = PQsendQueryPrepared(p->c, name, (int)n, vals, NULL, NULL, 0);
-        if (ok) single_row(p);
+        if (ok) chunked(p);
     } else if (k < EKK_STATEMENTS && (p->sql[k] = strdup(text)) != NULL) {
         p->name[k] = p->next_name++;
         snprintf(name, sizeof name, "ekk%llu", p->name[k]);
         p->prepared++;
-        p->stage = EKK_PREPARING; /* single-row mode once the Prepare's results end */
+        p->stage = EKK_PREPARING; /* chunked-rows mode once the Prepare's results end */
         ok = PQsendPrepare(p->c, name, text, (int)n, NULL)
             && PQsendQueryPrepared(p->c, name, (int)n, vals, NULL, NULL, 0);
     } else {
         ok = PQsendQueryParams(p->c, text, (int)n, NULL, vals, NULL, NULL, 0);
-        if (ok) single_row(p);
+        if (ok) chunked(p);
     }
     rc = ok && PQpipelineSync(p->c) ? 0 : 2;
 done:
@@ -309,15 +326,16 @@ int ekk_pg_consume(ekk_pg *p) {
    costs what lean_alloc_object or lean_alloc_ctor asks for, rounded up to
    LEAN_OBJECT_SIZE_DELTA, plus one word for the size a big object's
    allocation keeps before it (lean.h). The arithmetic saturates at SIZE_MAX,
-   which no limit reaches. Rows are charged one at a time as single-row mode
-   delivers them, so the rows held are bounded by the limit too. The row
+   which no limit reaches. Rows are charged one at a time as chunked-rows
+   mode delivers them, so the rows held are bounded by the limit too. The row
    array doubles as rows arrive and is copied to its exact size once
    complete; that growth's slack, at most two words per row (the old and
    the new array at a doubling or at the copy), is not charged. This bounds
-   what the pool builds, not libpq's buffers: libpq takes in a whole
-   protocol message, a DataRow of any size included, before the pool sees
-   it, and its input buffer keeps the largest such message's size until
-   the session is closed; nor the allocator's own overhead. */
+   what the pool builds, not libpq's buffers: libpq copies a chunk's rows,
+   up to EKK_CHUNK_ROWS DataRows of any size, into its PGresult before the
+   pool sees them, and holds each whole protocol message in its input
+   buffer, which keeps the largest such message's size until the session
+   is closed; nor the allocator's own overhead. */
 
 /* Adds `n` to *total: 0 once the sum exceeds `limit` (or overflows). */
 static int charge(size_t *total, size_t n, size_t limit) {
@@ -501,7 +519,7 @@ static lean_object *error_of(PGresult *r) {
 
 /* Collects the results that have arrived, without blocking, until the
    query's Sync. *acc holds the query's Result: its execution's rows,
-   gathered row by row (single-row mode) and complete at the zero-row
+   gathered chunk by chunk (chunked-rows mode) and complete at the zero-row
    result that ends them, or its error (an error after some rows discards
    them), or the error of preparing its statement (which is then forgotten,
    and the execution PostgreSQL skipped is ignored). A cached statement
@@ -528,7 +546,7 @@ int ekk_pg_collect(ekk_pg *p, lean_object **acc) {
             if (p->stage == EKK_PREPARED) {
                 /* The execution is libpq's queue head now, and the next
                    PQisBusy would parse its first result. */
-                single_row(p);
+                chunked(p);
                 p->stage = EKK_EXECUTING;
             }
             continue;
@@ -556,7 +574,7 @@ int ekk_pg_collect(ekk_pg *p, lean_object **acc) {
             /* fall through: a statement without rows */
         case PGRES_TUPLES_OK:
         case PGRES_EMPTY_QUERY:
-        case PGRES_SINGLE_TUPLE:
+        case PGRES_TUPLES_CHUNK:
             if (!rows_take(&p->rows, r, p->limit)) {
                 PQclear(r);
                 rows_drop(&p->rows);
@@ -564,9 +582,9 @@ int ekk_pg_collect(ekk_pg *p, lean_object **acc) {
                 *acc = ekk_pg_abandoned("54000", EKK_TOO_BIG);
                 return -1;
             }
-            /* A single row is followed by more, or by the zero-row
+            /* A chunk is followed by more, or by the zero-row
                PGRES_TUPLES_OK that ends them (or an error). */
-            if (st != PGRES_SINGLE_TUPLE) v = rows_finish(&p->rows);
+            if (st != PGRES_TUPLES_CHUNK) v = rows_finish(&p->rows);
             break;
         case PGRES_COPY_IN:
         case PGRES_COPY_OUT:

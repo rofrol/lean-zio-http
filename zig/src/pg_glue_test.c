@@ -6,9 +6,11 @@
    what pg.zig does when the socket is readable, ekk_pg_consume then
    ekk_pg_collect, and checks that the query completes exactly at the
    piece that ends its reply, with the expected result, and that the rows it
-   holds are exactly the DataRows of the running execution received so far
-   (single-row mode). It includes pg.c to see its session's fields
-   (last_null, prepared, rows, limit), and counts its
+   holds are exactly the whole chunks of the DataRows of the running
+   execution received so far (chunked-rows mode: libpq hands a chunk over
+   once it is full or the rows have ended, never earlier). It includes pg.c
+   to see its session's fields (last_null, prepared, rows, limit, chunk),
+   and counts its
    PQgetResult calls: a collect that keeps getting results (a reply it
    misreads, such as COPY when it does not stop) fails the test instead of
    looping.
@@ -41,7 +43,7 @@ static PGresult *bounded_get_result(PGconn *c) {
 #undef PQgetResult
 
 /* A whole PGresult's rows as Result.rows, through the same rows_take
-   that collect gives each single row, or Result.abandoned 54000 (as
+   that collect gives each chunk, or Result.abandoned 54000 (as
    collect answers) when they cost more than `limit`. */
 static lean_object *rows_within(PGresult *r, size_t limit) {
     ekk_rows b = {0};
@@ -79,7 +81,7 @@ static void fail(int line, const char *fmt, ...) {
 
 /* ---- backend messages ---- */
 
-typedef struct { uint8_t b[4096]; size_t n; size_t ends[64]; size_t nmsg; } msgs;
+typedef struct { uint8_t b[8192]; size_t n; size_t ends[256]; size_t nmsg; } msgs;
 
 static void put8(msgs *m, uint8_t v) { m->b[m->n++] = v; }
 static void put16(msgs *m, uint16_t v) { put8(m, v >> 8); put8(m, v & 0xff); }
@@ -328,8 +330,8 @@ static void kept_released(void) {
 }
 
 /* Delivers the reply in pieces until collect returns nonzero; after each,
-   consume and collect, which must hold the rows received so far (keep()
-   takes them). An AF_UNIX write is readable by the peer when write
+   consume and collect, which must hold the rows received so far, rounded
+   down to whole chunks of p->chunk rows (keep() takes them). An AF_UNIX write is readable by the peer when write
    returns, so each piece reaches libpq's next read. Returns collect's
    result and sets *at to the bytes delivered. */
 static int reply_until(ekk_pg *p, fake *f, msgs *m, enum piece how, lean_object **acc, size_t between, size_t *at) {
@@ -344,8 +346,9 @@ static int reply_until(ekk_pg *p, fake *f, msgs *m, enum piece how, lean_object 
         int rc = ekk_pg_collect(p, acc);
         if (rc != 0) return rc;
         CHECK(*at != between || p->last_null, "collect did not stop between two commands at byte %zu", *at);
-        CHECK(rows_held(p) == rows_received(m, *at), "collect holds %zu rows after byte %zu, %zu received",
-              rows_held(p), *at, rows_received(m, *at));
+        size_t got = rows_received(m, *at);
+        CHECK(rows_held(p) == got - got % (size_t)p->chunk, "collect holds %zu rows after byte %zu, %zu received in chunks of %d",
+              rows_held(p), *at, got, p->chunk);
         keep(p);
     }
     return 0;
@@ -725,18 +728,21 @@ static PGresult *made_from(int nf, const char *const *cols, int t0, int nt, valu
 
 static PGresult *made(int nf, const char *const *cols, int nt, value_fn value) { return made_from(nf, cols, 0, nt, value); }
 
-/* The rows of value(t, f) for t < nt as single-row mode delivers them, one
-   PGresult each, then the zero-row result, gathered as collect does. */
-static lean_object *rows_by_row(int nf, const char *const *cols, int nt, value_fn value, size_t limit) {
+/* The rows of value(t, f) for t < nt as chunked-rows mode delivers them,
+   `chunk` rows a PGresult (the last of fewer), then the zero-row result,
+   gathered as collect does. */
+static lean_object *rows_in_chunks(int nf, const char *const *cols, int nt, int chunk, value_fn value, size_t limit) {
     ekk_rows b = {0};
-    for (int t = 0; t <= nt; t++) {
-        PGresult *r = made_from(nf, cols, t, t < nt ? 1 : 0, value);
+    for (int t = 0;; t += chunk) {
+        int k = nt - t < chunk ? (nt - t > 0 ? nt - t : 0) : chunk;
+        PGresult *r = made_from(nf, cols, t, k, value);
         int ok = rows_take(&b, r, limit);
         PQclear(r);
         if (!ok) {
             rows_drop(&b);
             return ekk_pg_abandoned("54000", "over the limit");
         }
+        if (k == 0) break;
     }
     return rows_finish(&b);
 }
@@ -864,20 +870,27 @@ static void cost_bound(void) {
     expect_abandoned(rows_within(r, c - 1), "54000");
     PQclear(r);
 
-    current = "result cost: row by row, the same exact bound";
-    res = rows_by_row(2, cols, 3, mixed_value, SIZE_MAX - 1);
-    CHECK(lean_ptr_tag(res) == 0 && built_cost(res) == c, "row by row costs %zu, whole %zu", built_cost(res), c);
-    lean_dec(res);
-    expect_rows_count(rows_by_row(2, cols, 3, mixed_value, c), 3);
-    expect_abandoned(rows_by_row(2, cols, 3, mixed_value, c - 1), "54000");
-    current = "result cost: row by row, many rows copied to their exact size";
-    res = rows_by_row(2, cols, 35, valid_value, SIZE_MAX - 1);
-    c = built_cost(res);
-    CHECK(lean_array_capacity(lean_ctor_get(res, 1)) == 35, "row array capacity %zu",
-          lean_array_capacity(lean_ctor_get(res, 1)));
-    lean_dec(res);
-    expect_rows_count(rows_by_row(2, cols, 35, valid_value, c), 35);
-    expect_abandoned(rows_by_row(2, cols, 35, valid_value, c - 1), "54000");
+    /* In chunks of one row, of two, and of EKK_CHUNK_ROWS (one chunk for
+       three rows, three for 35). */
+    int chunks[] = {1, 2, EKK_CHUNK_ROWS};
+    size_t whole = c;
+    for (size_t i = 0; i < sizeof chunks / sizeof chunks[0]; i++) {
+        int n = chunks[i];
+        current = "result cost: in chunks, the same exact bound";
+        res = rows_in_chunks(2, cols, 3, n, mixed_value, SIZE_MAX - 1);
+        CHECK(lean_ptr_tag(res) == 0 && built_cost(res) == whole, "in chunks of %d costs %zu, whole %zu", n, built_cost(res), whole);
+        lean_dec(res);
+        expect_rows_count(rows_in_chunks(2, cols, 3, n, mixed_value, whole), 3);
+        expect_abandoned(rows_in_chunks(2, cols, 3, n, mixed_value, whole - 1), "54000");
+        current = "result cost: in chunks, many rows copied to their exact size";
+        res = rows_in_chunks(2, cols, 35, n, valid_value, SIZE_MAX - 1);
+        c = built_cost(res);
+        CHECK(lean_array_capacity(lean_ctor_get(res, 1)) == 35, "chunks of %d: row array capacity %zu", n,
+              lean_array_capacity(lean_ctor_get(res, 1)));
+        lean_dec(res);
+        expect_rows_count(rows_in_chunks(2, cols, 35, n, valid_value, c), 35);
+        expect_abandoned(rows_in_chunks(2, cols, 35, n, valid_value, c - 1), "54000");
+    }
 
     current = "result cost: invalid UTF-8 charged at least as built";
     r = made(2, cols, 3 * MIXED_ROWS, mixed_value);
@@ -914,7 +927,7 @@ static void cost_bound(void) {
 }
 
 
-/* ---- single-row collection (pg.c, ekk_rows) ---- */
+/* ---- chunked-rows collection (pg.c, ekk_rows) ---- */
 
 /* Rows of one column `col` whose values, joined by ',', are `values`. */
 static void expect_values(lean_object *r, const char *col, size_t n, const char *values) {
@@ -940,6 +953,18 @@ static void three_rows(msgs *m, size_t len) {
     empty(m, '2'); rowdesc(m, "x"); datarow_n(m, len); datarow_n(m, len); datarow_n(m, len); complete(m, "SELECT 3"); ready(m, 'I');
 }
 
+/* SQL_A's reply of `n` rows of one byte each: on a first use (`first`)
+   the Prepare's result first; the rows end with the CommandComplete
+   (end 'C') or an error (end 'E'). */
+static void n_rows(msgs *m, int first, int n, char end) {
+    *m = (msgs){0};
+    if (first) empty(m, '1');
+    empty(m, '2'); rowdesc(m, "x");
+    for (int i = 0; i < n; i++) datarow_n(m, 1);
+    if (end == 'C') complete(m, "SELECT"); else errresp(m, "22012", "division by zero");
+    ready(m, 'I');
+}
+
 /* Where the k-th message (from 0) of type t ends. */
 static size_t end_of(msgs *m, char t, int k) {
     size_t start = 0;
@@ -951,26 +976,44 @@ static size_t end_of(msgs *m, char t, int k) {
     return 0;
 }
 
+/* Where the chunk that holds row k (from 0) of the running execution
+   reaches collect: at the end of the DataRow that fills it, or, for the
+   last chunk of fewer rows, at the CommandComplete after `rows` rows. */
+static size_t chunk_end(msgs *m, int k, int chunk, int rows) {
+    int last = (k / chunk + 1) * chunk - 1;
+    return last < rows ? end_of(m, 'D', last) : end_of(m, 'C', 0);
+}
+
 /* The query's rows crossed the bound at byte `at` of the reply, which
    ends there: abandoned with 54000 (its outcome unknown), the rows
-   gathered released, the session to close. */
+   gathered released, the session to close. `crossed` is where the chunk
+   holding the row that crossed it reached collect: libpq read at most the
+   rest of that chunk past the row. */
 static void expect_overflow(ekk_pg *p, int rc, lean_object *acc, size_t at, size_t crossed) {
     CHECK(rc == -1, "collect returned %d over the bound", rc);
-    CHECK(at == crossed, "the bound ended the reply at byte %zu, not at the row that crossed it (%zu)", at, crossed);
+    CHECK(at == crossed, "the bound ended the reply at byte %zu, not where the chunk with the row that crossed it arrived (%zu)",
+          at, crossed);
     CHECK(rows_held(p) == 0 && p->rows.cols == NULL, "rows still held after the bound");
     CHECK(strstr(lean_string_cstr(lean_ctor_get(acc, 1)), "unknown") != NULL, "the message does not say the outcome is unknown");
     expect_abandoned(acc, "54000");
 }
 
-/* Rows arrive one at a time (reply() checks how many are held after each
-   piece) on a first use, a cached and an unnamed execution; zero rows keep
-   their columns; rows then an error answer the error; and a result over
-   the session's limit closes it at the row that crosses it, a result at
-   exactly the limit does not. */
-static void rows_and_bound(enum piece how) {
+/* A session in chunks of `chunk` rows. */
+static ekk_pg *connect_chunked(fake *f, int chunk) {
+    ekk_pg *p = connect_fake(f);
+    p->chunk = chunk;
+    return p;
+}
+
+/* Rows arrive in chunks of `chunk` rows (reply() checks how many are held
+   after each piece) on a first use, a cached and an unnamed execution;
+   zero rows keep their columns; rows then an error answer the error; and a
+   result over the session's limit closes it once the chunk holding the row
+   that crosses it arrives, a result at exactly the limit does not. */
+static void rows_and_bound(enum piece how, int chunk) {
     fake f;
     fake_open(&f);
-    ekk_pg *p = connect_fake(&f);
+    ekk_pg *p = connect_chunked(&f, chunk);
     lean_object *acc;
     msgs m;
     size_t at;
@@ -997,11 +1040,31 @@ static void rows_and_bound(enum piece how) {
     m = (msgs){0};
     empty(&m, '2'); rowdesc(&m, "x"); datarow(&m, "1"); datarow(&m, "2"); errresp(&m, "22012", "division by zero"); ready(&m, 'I');
     acc = NULL;
+    /* Rows reach collect before the error when a chunk fills first. */
+    kept.on = how != WHOLE && chunk <= 2;
+    CHECK(reply(p, &f, &m, how, &acc, 0) == 1, "not complete");
+    expect_error(acc, "22012");
+    CHECK(rows_held(p) == 0, "rows still held after the error");
+    if (kept.on) kept_released();
+
+    /* Two full chunks and a partial one (none with chunks of one row). */
+    int many = 2 * chunk + 3;
+    current = "rows: two full chunks and a partial one";
+    send_query(p, &f, SQL_A, "1", "BDES");
+    n_rows(&m, 0, many, 'C');
+    acc = NULL;
+    CHECK(reply(p, &f, &m, how, &acc, 0) == 1, "not complete");
+    expect_rows_count(acc, (size_t)many);
+
+    current = "rows: an error after a full chunk";
+    send_query(p, &f, SQL_A, "1", "BDES");
+    n_rows(&m, 0, chunk + 1, 'E');
+    acc = NULL;
     kept.on = how != WHOLE;
     CHECK(reply(p, &f, &m, how, &acc, 0) == 1, "not complete");
     expect_error(acc, "22012");
     CHECK(rows_held(p) == 0, "rows still held after the error");
-    if (how != WHOLE) kept_released();
+    if (kept.on) kept_released();
 
     current = "rows: the measure of three rows";
     send_query(p, &f, SQL_A, "1", "BDES");
@@ -1024,25 +1087,68 @@ static void rows_and_bound(enum piece how) {
     send_query(p, &f, SQL_A, "1", "BDES");
     three_rows(&m, 100);
     acc = NULL;
-    kept.on = how != WHOLE;
+    /* The third row crosses it; the rows before it are held first when a
+       chunk ends before it. */
+    kept.on = how != WHOLE && chunk <= 2;
     int rc = reply_until(p, &f, &m, how, &acc, 0, &at);
-    expect_overflow(p, rc, acc, at, how == WHOLE ? m.n : end_of(&m, 'D', 2));
-    if (how != WHOLE) kept_released();
+    expect_overflow(p, rc, acc, at, how == WHOLE ? m.n : chunk_end(&m, 2, chunk, 3));
+    if (kept.on) kept_released();
     finish(p, &f);
 
     current = "rows: a single field over the limit, first use";
-    p = connect_fake(&f);
+    p = connect_chunked(&f, chunk);
     p->limit = 200;
     send_query(p, &f, SQL_A, "1", "PBDES");
     m = (msgs){0};
     empty(&m, '1'); empty(&m, '2'); rowdesc(&m, "x"); datarow_n(&m, 300); complete(&m, "SELECT 1"); ready(&m, 'I');
     acc = NULL;
     rc = reply_until(p, &f, &m, how, &acc, m.ends[0], &at);
-    expect_overflow(p, rc, acc, at, how == WHOLE ? m.n : end_of(&m, 'D', 0));
+    expect_overflow(p, rc, acc, at, how == WHOLE ? m.n : chunk_end(&m, 0, chunk, 1));
     finish(p, &f);
 
+    current = "rows: an oversized first row, then more rows in its chunk";
+    /* What libpq takes in past the row that crosses the bound: the rest of
+       its chunk, never more (pg.c, EKK_CHUNK_ROWS). Six rows: the first
+       over the limit, then five small ones. */
+    p = connect_chunked(&f, chunk);
+    p->limit = 200;
+    send_query(p, &f, SQL_A, "1", "PBDES");
+    m = (msgs){0};
+    empty(&m, '1'); empty(&m, '2'); rowdesc(&m, "x"); datarow_n(&m, 300);
+    for (int i = 0; i < 5; i++) datarow_n(&m, 1);
+    complete(&m, "SELECT 6"); ready(&m, 'I');
+    acc = NULL;
+    rc = reply_until(p, &f, &m, how, &acc, m.ends[0], &at);
+    expect_overflow(p, rc, acc, at, how == WHOLE ? m.n : chunk_end(&m, 0, chunk, 6));
+    finish(p, &f);
+
+    /* The bound crossed by row k of `many`: in the second full chunk, and
+       at the last row, in the last partial chunk (a full one with chunks
+       of one row). The limit is what the first k rows cost, measured on a
+       first use that returns k rows. */
+    int crossing[] = {chunk + 1, many - 1};
+    for (int i = 0; i < 2; i++) {
+        int k = crossing[i];
+        current = i == 0 ? "rows: over the limit in a full chunk" : "rows: over the limit in the last chunk";
+        p = connect_chunked(&f, chunk);
+        send_query(p, &f, SQL_A, "1", "PBDES");
+        n_rows(&m, 1, k, 'C');
+        acc = NULL;
+        CHECK(reply(p, &f, &m, how, &acc, m.ends[0]) == 1, "not complete");
+        p->limit = built_cost(acc);
+        expect_rows_count(acc, (size_t)k);
+        send_query(p, &f, SQL_A, "1", "BDES");
+        n_rows(&m, 0, many, 'C');
+        acc = NULL;
+        kept.on = how != WHOLE;
+        rc = reply_until(p, &f, &m, how, &acc, 0, &at);
+        expect_overflow(p, rc, acc, at, how == WHOLE ? m.n : chunk_end(&m, k, chunk, many));
+        if (kept.on) kept_released();
+        finish(p, &f);
+    }
+
     current = "rows: unnamed, past EKK_STATEMENTS cached";
-    p = connect_fake(&f);
+    p = connect_chunked(&f, chunk);
     for (int i = 0; i < EKK_STATEMENTS; i++) {
         char sql[32];
         snprintf(sql, sizeof sql, "SELECT %d AS y", i);
@@ -1064,14 +1170,14 @@ static void rows_and_bound(enum piece how) {
     m = (msgs){0};
     empty(&m, '1'); empty(&m, '2'); rowdesc(&m, "x"); datarow_n(&m, 100); datarow_n(&m, 100); complete(&m, "SELECT 2"); ready(&m, 'I');
     acc = NULL;
-    kept.on = how != WHOLE;
+    kept.on = how != WHOLE && chunk <= 1;
     rc = reply_until(p, &f, &m, how, &acc, 0, &at);
-    expect_overflow(p, rc, acc, at, how == WHOLE ? m.n : end_of(&m, 'D', 1));
-    if (how != WHOLE) kept_released();
+    expect_overflow(p, rc, acc, at, how == WHOLE ? m.n : chunk_end(&m, 1, chunk, 2));
+    if (kept.on) kept_released();
     finish(p, &f);
 
     current = "rows: the session ends with rows held";
-    p = connect_fake(&f);
+    p = connect_chunked(&f, chunk);
     send_query(p, &f, SQL_A, "1", "PBDES");
     m = (msgs){0};
     empty(&m, '1'); empty(&m, '2'); rowdesc(&m, "x"); datarow(&m, "1"); datarow(&m, "2");
@@ -1080,18 +1186,20 @@ static void rows_and_bound(enum piece how) {
     results_left = 32;
     acc = NULL;
     CHECK(ekk_pg_collect(p, &acc) == 0, "complete without its end");
-    CHECK(rows_held(p) == 2, "%zu rows held, 2 received", rows_held(p));
-    kept.on = 1;
+    size_t held = 2 - 2 % (size_t)chunk;
+    CHECK(rows_held(p) == held, "%zu rows held, 2 received in chunks of %d", rows_held(p), chunk);
+    kept.on = held > 0;
     keep(p);
     finish(p, &f);
-    kept_released();
+    if (held > 0) kept_released();
+    kept.on = 0;
     fake_close(&f);
 }
 
 /* The libpq versions the pool accepts (pg.c, libpq_supported). */
 static void libpq_versions(void) {
     current = "libpq versions";
-    int no[] = {130020, 140000, 140005, 150000}, yes[] = {140006, 140019, 150001, 160000, 170000, 180006};
+    int no[] = {130020, 140006, 140019, 150001, 160000, 160013, 169999}, yes[] = {170000, 170012, 180006, 190000};
     for (size_t i = 0; i < sizeof no / sizeof no[0]; i++) CHECK(!libpq_supported(no[i]), "%d accepted", no[i]);
     for (size_t i = 0; i < sizeof yes / sizeof yes[0]; i++) CHECK(libpq_supported(yes[i]), "%d refused", yes[i]);
     CHECK(ekk_pg_libpq_supported(), "the libpq this test links (%d) is refused", PQlibVersion());
@@ -1125,7 +1233,11 @@ int main(void) {
         ending(how, "COPY FROM STDIN", "COPY t FROM STDIN", 'G', "0A000");
         ending(how, "a transaction left open", "BEGIN", 'T', "25000");
         cut(how);
-        rows_and_bound(how);
+        /* Chunks of one row (as single-row mode), of two (a chunk ends
+           inside each result), and the pool's own. */
+        rows_and_bound(how, 1);
+        rows_and_bound(how, 2);
+        rows_and_bound(how, EKK_CHUNK_ROWS);
         printf("pg_glue_test: replies %s: ok\n", piece_name[how]);
     }
     return 0;

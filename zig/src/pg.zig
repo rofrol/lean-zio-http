@@ -77,8 +77,8 @@ extern fn ekk_pg_flush(c: *Session) c_int;
 extern fn ekk_pg_consume(c: *Session) c_int;
 extern fn ekk_pg_collect(c: *Session, acc: *Lean) c_int;
 extern fn ekk_query_drop(q: Lean) void;
-/// Whether the process's libpq is one the pool supports (pg.c: 14.6, 15.1,
-/// or 16 and later), and its version (PQlibVersion).
+/// Whether the process's libpq is one the pool supports (pg.c: 17 or
+/// later), and its version (PQlibVersion).
 pub extern fn ekk_pg_libpq_supported() c_int;
 pub extern fn ekk_pg_libpq_version() c_int;
 

@@ -25,6 +25,9 @@ randomnumber int)`, filled by bench.sh.
   number of rows returned; past about 1,000 rows the result is over
   `Query.maxResultBytes`, which the pool abandons (`Query.Result.abandoned`),
   answered `database error 54000, outcome unknown`.
+- `GET /rows?n=N[&len=L]`: N rows of L bytes (100 by default) from
+  `generate_series`, answered with the number of rows returned; for
+  bench/rows.sh, which measures the cost of collecting many rows.
 - `GET /` and the rest: `App.Hello`, with no query.
 
 A failed query is answered 503 when the database could not be reached or the
@@ -108,6 +111,13 @@ def insert (n : Nat) : Await Response := do
   | .abandoned st _ => pure (abandoned st)
   | .rows _ rows => pure (text 200 (toString rows.size))
 
+def rows (n len : Nat) : Await Response := do
+  match ← Await.run { sql := "SELECT repeat('x', $2::int) FROM generate_series(1, $1::int)",
+                      params := #[some (toString n), some (toString len)] } with
+  | .error st _ => pure (failed st)
+  | .abandoned st _ => pure (abandoned st)
+  | .rows _ rows => pure (text 200 (toString rows.size))
+
 def app : Handler := fun r =>
   if r.method != "GET" then .done (App.Hello.respond r) else
   match path r.target with
@@ -136,6 +146,13 @@ def app : Handler := fun r =>
     match (param r.target "n").bind String.toNat? with
     | some n => if n < 2 ^ 31 then insert n else .done (text 400 "bad n\n")
     | none => .done (text 400 "bad n\n")
+  | "/rows" =>
+    let len := match param r.target "len" with
+      | none => some 100
+      | some l => l.toNat?
+    match (param r.target "n").bind String.toNat?, len with
+    | some n, some l => if n < 2 ^ 31 ∧ l < 2 ^ 31 then rows n l else .done (text 400 "bad n or len\n")
+    | _, _ => .done (text 400 "bad n or len\n")
   | _ => .done (App.Hello.respond r)
 
 end App.Db

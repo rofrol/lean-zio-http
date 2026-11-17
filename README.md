@@ -97,8 +97,9 @@ only `Server.Query` values.
   owner the callback is the last thing the loop does with it. Each loop
   also owns a PostgreSQL pool (`src/pg.zig`, section "PostgreSQL"). The
   library needs libpq's headers (`-Dpq-include`) and the servers link
-  `-lpq`: libpq 14.6, 15.1, or 16 and later (pipeline mode, and single-row
-  mode reset after each pipelined query); a server with `--pg` exits with
+  `-lpq`: libpq 17 or later (pipeline mode, and its chunked-rows mode,
+  `PQsetChunkedRowsMode`; decided 2026-11-17, item 4lmjda); `zig/` does not
+  compile against older headers, and a server with `--pg` exits with
   status 1 at startup when the libpq it runs is older.
 - Command line: `lsrv [THREADS] [--port N] [--max-conns N] [--pg CONNINFO]
   [--pg-conns N] [--idle-ms N] [--head-ms N] [--body-ms N] [--write-ms N]
@@ -363,10 +364,11 @@ else meanwhile; the loop serves its other connections (`Conn.step_query`,
   `Query.maxResultBytes` (1 MiB, charged for every object of its Lean
   value before it is built: each row and field, `NULL` and empty ones
   included, and each string with its header). Rows
-  are received one at a time (libpq's single-row mode) and charged as they
-  arrive; at the row that crosses the bound the rows gathered are
-  released, the query is answered `abandoned "54000"` once and its session
-  is closed without reading the rest. So whether the statement took effect
+  are received in chunks of 16 (libpq's chunked-rows mode; libpq hands a
+  chunk over once it is full or the rows have ended) and each row is
+  charged before it is built; at the row that crosses the bound the rows
+  gathered are released, the query is answered `abandoned "54000"` once
+  and its session is closed without reading the rest. So whether the statement took effect
   is unknown (a write with a large `RETURNING` may have been committed, or
   rolled back when the server noticed the closed connection; effects
   outside transactions, such as sequences, stay). `abandoned` says that
@@ -472,11 +474,16 @@ else meanwhile; the loop serves its other connections (`Conn.step_query`,
   cached statements going stale (`0A000` from `RevalidateCachedQuery` and
   `26000` forget the statement, another `0A000` keeps it, a failed
   transaction still closes the session, 64 stale statements close it), and
-  single-row collection: after every piece the rows held are exactly the
-  rows received (first use, cached and unnamed executions), zero rows keep
-  their columns, rows then an error answer the error, a result at exactly
-  the bound is answered, and one byte over it, or a single field over it,
-  ends the session at the row that crosses it, answered `abandoned`
+  chunked collection, in chunks of 1, 2 and 16 rows: after every piece the
+  rows held are exactly the whole chunks of the rows received (first use,
+  cached and unnamed executions; two full chunks and a partial one),
+  zero rows keep their columns, rows then an error answer the error, also
+  after a full chunk, a result at exactly the bound is answered, and one
+  byte over it, or a single field over it, ends the session once the
+  chunk holding the row that crosses it arrives, in a full chunk or the
+  last partial one (an oversized first row followed by five more: at that
+  row with chunks of 1, at the second row with chunks of 2, at the end of
+  the rows with chunks of 16, never later), answered `abandoned`
   (constructor 2), while a query with a NUL character is an `error 54000`
   (constructor 1) that sends nothing. A connection lost mid-reply is
   `abandoned 08006`, one whose EOF libpq saw before the next query refuses
@@ -495,11 +502,17 @@ else meanwhile; the loop serves its other connections (`Conn.step_query`,
   error, runs entirely inside the `submit` that started it: the loop serves
   nothing else until the chain ends.
 - **Bounded only in part:** the pool gathers at most `Query.maxResultBytes`
-  of a result, but libpq takes in a whole protocol message before the pool
-  sees it, so one row larger than the bound costs its full size (in libpq's
-  input buffer and again in its result) before the session is closed, and
-  libpq's input buffer keeps the size of the largest message a session
-  received until the session is closed.
+  of a result, but libpq copies a chunk's rows into its own result before
+  the pool sees them: the chunk that holds the row crossing the bound, up
+  to 16 rows of any size, the 15 after it included. So one row larger than
+  the bound costs its full size (in libpq's input buffer and again in its
+  result) before the session is closed, and so may up to 15 rows after the
+  row that crosses it, where single-row mode stopped at that row. libpq's
+  input buffer also holds whatever more of the reply had arrived from the
+  socket when the session closed (never parsed into rows), and keeps the
+  size of the largest message a session received until the session is
+  closed. The chunk size, 16 (`EKK_CHUNK_ROWS` in `zig/src/pg.c`), was
+  chosen with `bench/rows.sh` against single-row mode (below).
 
 Measured by `bench.sh` (M1, 2026-11-16, 8 loops with 4 connections each
 against Go's `net/http` with one pgx pool of 32, both on the same private
@@ -538,6 +551,39 @@ out): lean-db 36 to 39 µs at c=1 before and 37 to 39 after, 41 to 44 µs at
 c=64 before and 40 to 44 after; PostgreSQL's backends 12 to 13 µs at c=1
 and 18 to 20 µs at c=64 for both, so the `statement_timeout` the deadlines
 put in every session's startup options shows no cost there either.
+
+Collecting rows in chunks (item 4lmjda) against single-row mode, measured
+by `bench/rows.sh` (M1, 2026-11-17, load average 11 to 17 from other work,
+two rounds of 8 s, a fresh `lsrv-db` per case, 8 loops with 4 connections
+each, `GET /rows?n=N&len=L`: N rows of L bytes; server CPU µs per request,
+then requests per second, one value per round):
+
+| N, L, connections | single row | chunks of 16 | chunks of 64 | chunks of 256 |
+|---|---|---|---|---|
+| 1, 100, c=1 | 37, 37; 11,641, 11,670 | 41, 38; 9,815, 11,231 | 47, 37; 7,616, 11,444 | 37, 37; 12,518, 11,647 |
+| 100, 100, c=1 | 97, 93; 6,409, 6,647 | 84, 82; 7,079, 7,042 | 82, 82; 6,890, 6,967 | 82, 82; 6,859, 6,791 |
+| 1000, 100, c=1 | 621, 594; 1,238, 1,326 | 521, 497; 1,431, 1,524 | 504, 490; 1,450, 1,538 | 512, 510; 1,228, 1,238 |
+| 1000, 100, c=64 | 732, 754; 6,989, 6,990 | 589, 601; 7,846, 7,791 | 585, 589; 7,564, 7,705 | 634, 628; 7,722, 7,295 |
+| 900, 1000, c=64 | 4,236, 4,299; 1,235, 1,117 | 4,191, 4,242; 1,240, 991 | 4,259, 4,421; 1,212, 1,057 | 4,360, 4,334; 1,229, 1,080 |
+
+Peak resident set size of the process, MB per round: at 1000 rows of 100
+bytes and c=64, 28.6 and 28.1 single-row, 27.6 and 27.9 in chunks of 16,
+26.2 and 26.2 of 64, 28.6 and 30.1 of 256; at 900 rows of 1000 bytes,
+77.0 and 77.7, 77.9 and 77.3, 77.5 and 46.4, 99.6 and 140.5. The first
+round's one-row runs in chunks of 16 and 64 were slower at a load average
+of 14 to 17; three more rounds at one row against single-row mode, at a
+load average of 10 to 14, gave 37 µs and 11,477 to 11,643 requests per
+second for both single-row and chunks of 16 at c=1, and 41 to 46 µs,
+73,614 to 76,359 for both at c=64 (chunks of 64: the same), so one row
+costs the same. Chunks of 16 cost 12 to 20% less CPU per request at 100
+and 1000 rows of 100 bytes and serve 11 to 16% more requests at 1000 rows;
+chunks of 64 do the same within noise (1 to 3% less CPU, which a round's
+spread covers) with four times the residual in libpq ("Bounded only in
+part"), so 16 was chosen. Chunks of 256 gain no more CPU, serve no more
+requests at 1000 rows and c=1 (not traced, since they were not chosen) and
+raised the peak memory with large rows, as their larger residual predicts.
+At 1000-byte rows the cost is in the data, not the per-row results, so no
+mode differs within noise.
 
 ## Memory
 
@@ -813,8 +859,8 @@ fresh cluster after `check.sh`'s has been removed.
 
 `check.sh` runs `zig build test` against the one libpq `pg_config` names.
 `./libpq-lines.sh PGSRC` runs it against every libpq line the pool supports
-("Modules", `zig/`: 14.6, 15.1, or 16 and later): the lowest supported release
-and the newest release of each line from 14 up, built from the release tags
+("Modules", `zig/`: 17 or later): the lowest supported release
+and the newest release of each line from 17 up, built from the release tags
 of `PGSRC`, a git checkout of PostgreSQL
 (`git clone https://git.postgresql.org/git/postgresql.git`), into a cache
 outside the repository (`$LIBPQ_CACHE`, default

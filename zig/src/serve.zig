@@ -975,7 +975,7 @@ export fn ekk_serve(port: u16, threads: u32, maxc: u32, conninfo: *anyopaque, co
     pg_conninfo = ekk_string_cstr(conninfo);
     pg_conns = conns;
     if (conns > 0 and pg.ekk_pg_libpq_supported() == 0) {
-        std.debug.print("libpq {d} is not supported: the PostgreSQL pool needs libpq 14.6, 15.1, or 16 and later\n", .{pg.ekk_pg_libpq_version()});
+        std.debug.print("libpq {d} is not supported: the PostgreSQL pool needs libpq 17 or later\n", .{pg.ekk_pg_libpq_version()});
         return 1;
     }
     if (conns > 0) {
