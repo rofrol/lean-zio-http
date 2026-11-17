@@ -37,15 +37,6 @@ import (
 	"time"
 )
 
-// zioShutWarning is the one server output allowed besides the trace: on macOS
-// setsockopt(TCP_NODELAY) fails with EINVAL on an accepted socket whose peer
-// reset it before the accept (setsockopt(2): "[EINVAL] The socket has been
-// shut down"; reproduced 2026-11-16), and zio's os/net.zig setsockopt (pinned
-// 830564437b2c) logs every errno but NOPROTOOPT as unexpected. serve.zig ignores the
-// error and the connection's receive then fails and closes it, which the
-// accounting still checks. Recorded in issues/dqsipn.md.
-const zioShutWarning = "warning(zio): unexpected error: .INVAL (22) - please file a bug report: https://github.com/lalinsky/zio/issues/new"
-
 const bodySize = 60001 // App/Fixture.lean's body
 
 var body = func() []byte {
@@ -148,20 +139,21 @@ func (s *server) stop() (*os.ProcessState, error) {
 }
 
 // trace checks the server's trace lines: each connection opened once and
-// freed once after its open, and no other output except, where the scenario
-// allows it, zio's EINVAL warning (zioShutWarning).
+// freed once after its open, and no other output. No scenario allows a
+// warning: the server sets no option on an accepted socket (serve.zig,
+// openListener), so even the churn scenario's connections reset before the
+// accept give zio nothing to warn about.
 type trace struct {
-	allowShutWarning bool
 	open, freed      map[uint64]bool
-	ops, shutWarns   uint64
+	ops              uint64
 	injRecv, injSend uint64
 	stopped          int
 	// Sends in flight when a loop's stop arrived (its "stop R S" lines).
 	sendsAtStop uint64
 }
 
-func newTrace(allowShutWarning bool) *trace {
-	return &trace{allowShutWarning: allowShutWarning, open: map[uint64]bool{}, freed: map[uint64]bool{}}
+func newTrace() *trace {
+	return &trace{open: map[uint64]bool{}, freed: map[uint64]bool{}}
 }
 
 func (t *trace) take(line string) error {
@@ -187,8 +179,6 @@ func (t *trace) take(line string) error {
 		t.sendsAtStop += num(2)
 	case line == "stopped":
 		t.stopped++
-	case t.allowShutWarning && line == zioShutWarning:
-		t.shutWarns++
 	default:
 		return fmt.Errorf("unexpected server output: %q", line)
 	}
@@ -228,9 +218,6 @@ func (s *server) account(t *trace, connects int64) (string, error) {
 	summary := fmt.Sprintf("%d connections opened and freed once each, %d operations", len(t.open), t.ops)
 	if t.injRecv+t.injSend > 0 {
 		summary += fmt.Sprintf(", %d receive and %d send failures injected", t.injRecv, t.injSend)
-	}
-	if t.shutWarns > 0 {
-		summary += fmt.Sprintf(", %d zio EINVAL warnings", t.shutWarns)
 	}
 	return summary, nil
 }
@@ -422,7 +409,7 @@ func shutdown(path string) (string, error) {
 	}
 	addr := s.addr
 	defer s.stop()
-	t := newTrace(false)
+	t := newTrace()
 	a, err := dial(addr)
 	if err != nil {
 		return "", err
@@ -516,7 +503,7 @@ func deadlineRun(path string, budgets []string, sends []struct{ what, bytes stri
 		return "", err
 	}
 	defer s.stop()
-	t := newTrace(false)
+	t := newTrace()
 	for _, sc := range sends {
 		c, err := dial(s.addr)
 		if err != nil {
@@ -573,7 +560,7 @@ func admit(path, maxConns string) (string, bool, error) {
 	}
 	addr := s.addr
 	defer s.stop()
-	t := newTrace(false)
+	t := newTrace()
 	var cs [3]*net.TCPConn
 	var rs [3]*bufio.Reader
 	for i := range cs {
@@ -652,7 +639,7 @@ func crashPoint(path, crashArg string, n, most int, args ...string) (string, err
 	if err := exchange(s2.addr); err != nil {
 		return "", fmt.Errorf("after the restart: %w", err)
 	}
-	summary, err := s2.account(newTrace(false), 1)
+	summary, err := s2.account(newTrace(), 1)
 	return fmt.Sprintf("client saw %d response bytes, %q; restarted server: %s", len(got), s.output[2], summary), err
 }
 
@@ -1233,9 +1220,6 @@ func holdAfterPipelined(k int) func(c *net.TCPConn) error {
 type scenario struct {
 	name string
 	args []string
-	// resets: clients reset connections, possibly before the server accepts
-	// them, so on macOS zio's EINVAL warning (zioShutWarning) may appear.
-	resets bool
 	// injects: the server injects failures, and the trace must show both
 	// receive and send failures injected.
 	injects bool
@@ -1341,32 +1325,32 @@ func main() {
 	only := flag.String("only", "", "run only the scenarios whose name contains this text")
 	flag.Parse()
 	scenarios := []scenario{
-		{"large responses, operations of at most 7 bytes", []string{"2", "--chunk", "7", "--trace"}, false, false, exchanges(8), nil, false},
-		{"large responses, full-size operations", []string{"2", "--trace"}, false, false, exchanges(16), nil, false},
-		{"every 29th receive and every 29th send fail", []string{"2", "--fail-every", "29", "--trace"}, false, true, failures, nil, false},
-		{"connection churn with resets", []string{"4", "--trace"}, true, false, churn, nil, false},
-		{"Expect: 100-continue and a response over the bound, operations of at most 7 bytes", []string{"2", "--chunk", "7", "--trace"}, false, false, expectations, nil, true},
-		{"graceful shutdown with a response in flight, an idle and a partial connection", nil, false, false, nil, shutdown, false},
-		{"admission: at most 2 connections", nil, false, false, nil, admission, false},
-		{"deadlines: idle, head and body expire and close", nil, false, false, nil, deadlines, false},
-		{"crash after the first receive", nil, false, false, nil, func(p string) (string, error) {
+		{"large responses, operations of at most 7 bytes", []string{"2", "--chunk", "7", "--trace"}, false, exchanges(8), nil, false},
+		{"large responses, full-size operations", []string{"2", "--trace"}, false, exchanges(16), nil, false},
+		{"every 29th receive and every 29th send fail", []string{"2", "--fail-every", "29", "--trace"}, true, failures, nil, false},
+		{"connection churn with resets", []string{"4", "--trace"}, false, churn, nil, false},
+		{"Expect: 100-continue and a response over the bound, operations of at most 7 bytes", []string{"2", "--chunk", "7", "--trace"}, false, expectations, nil, true},
+		{"graceful shutdown with a response in flight, an idle and a partial connection", nil, false, nil, shutdown, false},
+		{"admission: at most 2 connections", nil, false, nil, admission, false},
+		{"deadlines: idle, head and body expire and close", nil, false, nil, deadlines, false},
+		{"crash after the first receive", nil, false, nil, func(p string) (string, error) {
 			return crashPoint(p, "--crash-after-recv", 1, 0)
 		}, false},
-		{"crash after the third 7-byte send", nil, false, false, nil, func(p string) (string, error) {
+		{"crash after the third 7-byte send", nil, false, nil, func(p string) (string, error) {
 			return crashPoint(p, "--crash-after-send", 3, 21, "--chunk", "7")
 		}, false},
-		{"memory of 1000 connections holding a head", nil, false, false, nil, memory, true},
-		{"memory of 100 connections each sending a response with a pipelined tail buffered", nil, false, false, nil, memoryFull, false},
-		{"memory of 400 connections holding a head of 100 short fields", nil, false, false, nil, adapterScenario([]string{"1"}, 400, false, holdHead(fieldsHead())), true},
-		{"memory of 400 connections holding all but one byte of a maximum body", nil, false, false, nil, adapterScenario([]string{"1"}, 400, true, holdBody(expectHead("/echo", ""))), true},
-		{"memory of 100 connections holding a nearly maximum head and all but one body byte, received 7 bytes at a time", nil, false, false, nil, adapterScenario([]string{"1", "--chunk", "7"}, 100, true, holdBody(longFieldsHead())), true},
-		{"memory of 400 connections holding an incomplete request after 50 pipelined ones", nil, false, false, nil, adapterScenario([]string{"1"}, 400, false, holdAfterPipelined(50)), true},
-		{"memory of 400 connections holding a head whose target has 4,000 path segments", nil, false, false, nil, adapterScenario([]string{"1"}, 400, false, holdHead(expectHead("/"+strings.Repeat("a/", 3999)+"a", ""))), true},
-		{"memory of 400 connections holding a head whose target has 4,000 query parameters", nil, false, false, nil, adapterScenario([]string{"1"}, 400, false, holdHead(expectHead("/echo?"+strings.Repeat("a&", 3999)+"a", ""))), true},
+		{"memory of 1000 connections holding a head", nil, false, nil, memory, true},
+		{"memory of 100 connections each sending a response with a pipelined tail buffered", nil, false, nil, memoryFull, false},
+		{"memory of 400 connections holding a head of 100 short fields", nil, false, nil, adapterScenario([]string{"1"}, 400, false, holdHead(fieldsHead())), true},
+		{"memory of 400 connections holding all but one byte of a maximum body", nil, false, nil, adapterScenario([]string{"1"}, 400, true, holdBody(expectHead("/echo", ""))), true},
+		{"memory of 100 connections holding a nearly maximum head and all but one body byte, received 7 bytes at a time", nil, false, nil, adapterScenario([]string{"1", "--chunk", "7"}, 100, true, holdBody(longFieldsHead())), true},
+		{"memory of 400 connections holding an incomplete request after 50 pipelined ones", nil, false, nil, adapterScenario([]string{"1"}, 400, false, holdAfterPipelined(50)), true},
+		{"memory of 400 connections holding a head whose target has 4,000 path segments", nil, false, nil, adapterScenario([]string{"1"}, 400, false, holdHead(expectHead("/"+strings.Repeat("a/", 3999)+"a", ""))), true},
+		{"memory of 400 connections holding a head whose target has 4,000 query parameters", nil, false, nil, adapterScenario([]string{"1"}, 400, false, holdHead(expectHead("/echo?"+strings.Repeat("a&", 3999)+"a", ""))), true},
 		// The target with the most elements per byte, as long as the request
 		// line allows (8,192 bytes): its live blocks are the largest lsrv-test
 		// finds. H1 keeps it from the end of the line.
-		{"memory of 400 connections holding a request line whose target has 8,176 empty query parameters", nil, false, false, nil, adapterScenario([]string{"1"}, 400, true, holdLine("GET /?"+strings.Repeat("&", 8175)+" HTTP/1.1\r\n")), false},
+		{"memory of 400 connections holding a request line whose target has 8,176 empty query parameters", nil, false, nil, adapterScenario([]string{"1"}, 400, true, holdLine("GET /?"+strings.Repeat("&", 8175)+" HTTP/1.1\r\n")), false},
 	}
 	failed, ran := 0, 0
 	for _, sc := range scenarios {
@@ -1409,7 +1393,7 @@ func runScenario(path string, sc scenario) error {
 		s.stop()
 		return fmt.Errorf("%w; server output: %s", err, tail(s.output))
 	}
-	t := newTrace(sc.resets && runtime.GOOS == "darwin")
+	t := newTrace()
 	summary, err := s.account(t, connects)
 	if err != nil {
 		return err

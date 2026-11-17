@@ -23,7 +23,6 @@ const serve = @import("serve.zig");
 
 const c = std.c;
 extern "c" fn socket(domain: c_uint, kind: c_uint, protocol: c_uint) c_int;
-extern "c" fn getsockname(fd: c.fd_t, addr: *c.sockaddr, len: *c.socklen_t) c_int;
 
 /// The most nonblocking polls a single-loop test makes while it waits for an
 /// event that its last step has already made ready: running out means the
@@ -276,20 +275,15 @@ const Listener = struct {
     fd: c.fd_t,
     addr: c.sockaddr.in,
 
-    /// A nonblocking listening socket on 127.0.0.1 at a port the kernel picks.
+    /// The server's own nonblocking listening socket (serve.openListener) on
+    /// 127.0.0.1 at a port the kernel picks.
     fn open() !Listener {
-        const fd = socket(c.AF.INET, c.SOCK.STREAM, 0);
-        if (fd < 0) return error.Socket;
+        const l = serve.openListener(0) orelse return error.OpenListener;
         var sa = std.mem.zeroes(c.sockaddr.in);
         sa.family = c.AF.INET;
+        sa.port = std.mem.nativeToBig(u16, l.port);
         sa.addr = @bitCast([4]u8{ 127, 0, 0, 1 });
-        if (c.bind(fd, @ptrCast(&sa), @sizeOf(c.sockaddr.in)) != 0) return error.Bind;
-        if (c.listen(fd, 16) != 0) return error.Listen;
-        var len: c.socklen_t = @sizeOf(c.sockaddr.in);
-        if (getsockname(fd, @ptrCast(&sa), &len) != 0) return error.Getsockname;
-        const nonblock: c_int = @bitCast(c.O{ .NONBLOCK = true });
-        if (c.fcntl(fd, c.F.SETFL, nonblock) != 0) return error.Fcntl;
-        return .{ .fd = fd, .addr = sa };
+        return .{ .fd = l.fd, .addr = sa };
     }
 
     fn close(self: *Listener) void {
@@ -461,6 +455,26 @@ test "the shutdown cancels each receive in flight without calling back into the 
         }
         try std.testing.expect(refused_at.? < freed_at.?);
     }
+}
+
+test "an accepted connection has TCP_NODELAY, inherited from the listening socket" {
+    // serve.zig sets TCP_NODELAY only on the listener (openListener); the
+    // kernel copies it to each accepted socket. Checked on macOS; Linux is not
+    // yet checked by a run there.
+    var s: Single = undefined;
+    try s.init(64);
+    defer s.deinit();
+    const cl = try s.listener.connect();
+    defer _ = c.close(cl);
+    awaitReadable(s.listener.fd);
+    try s.stepUntil(.open, 1);
+    const accepted = s.lp.head orelse return error.NoConnection;
+    var nodelay: c_int = 0;
+    try zio.os.net.getsockopt(accepted.fd, zio.os.net.IPPROTO.TCP, zio.os.posix.TCP.NODELAY, std.mem.asBytes(&nodelay));
+    try std.testing.expect(nodelay != 0);
+    s.lp.stop.notify();
+    try s.stepUntil(.free, 1);
+    try s.finish();
 }
 
 test "a receive whose result is queued when the shutdown cancels it is dispatched once, with that result" {

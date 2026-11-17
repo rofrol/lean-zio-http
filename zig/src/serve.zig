@@ -532,7 +532,7 @@ pub const LoopCtx = struct {
             releaseSlot();
             return;
         }
-        net.setNoDelay(fd, true) catch {};
+        // TCP_NODELAY comes from the listener (openListener).
         const conn = alloc.create(Conn) catch fatal("no memory for a connection", .{});
         conn.* = .{ .fd = fd, .lp = self, .id = conn_ids.fetchAdd(1, .monotonic) };
         self.link(conn);
@@ -652,13 +652,61 @@ fn awaitReadyThenStop(ready: std.c.fd_t, threads: u32, stop_fd: c_int) void {
     for (loops) |*lp| lp.stop.notify();
 }
 
-/// Reports a failed setup call on the listening socket with its errno, for
-/// `ekk_serve` to return 1 (a port another process holds: EADDRINUSE).
-fn setupFailed(what: []const u8, port: u16) u8 {
+/// Reports a failed setup call on the listening socket with its errno (a
+/// port another process holds: EADDRINUSE) and closes the socket, for
+/// `openListener` to return null.
+fn setupFailed(lfd: std.c.fd_t, what: []const u8, port: u16) ?Listening {
     const e = std.c._errno().*;
     const name = std.enums.tagName(std.c.E, @enumFromInt(e)) orelse "unknown";
     std.debug.print("cannot {s} 127.0.0.1:{d}: errno {d} ({s})\n", .{ what, port, e, name });
-    return 1;
+    net.close(lfd);
+    return null;
+}
+
+/// The listening socket and the port it is bound to (the kernel's pick when
+/// `port` was 0).
+pub const Listening = struct { fd: std.c.fd_t, port: u16 };
+
+/// Opens the nonblocking listening socket on 127.0.0.1:`port` (port 0: one
+/// the kernel picks) with SO_REUSEADDR and TCP_NODELAY. Reports a failure and
+/// returns null. `ekk_serve` and the transport's tests (serve_test.zig) both
+/// open their listener here.
+pub fn openListener(port: u16) ?Listening {
+    const lfd = net.socket(.ipv4, .stream, .ip, .{ .nonblocking = true }) catch |e| {
+        std.debug.print("cannot open the listening socket: {s}\n", .{@errorName(e)});
+        return null;
+    };
+    const one: c_int = 1;
+    net.setsockopt(lfd, net.SOL.SOCKET, net.SO.REUSEADDR, std.mem.asBytes(&one)) catch |e| {
+        std.debug.print("cannot set SO_REUSEADDR on the listening socket: {s}\n", .{@errorName(e)});
+        net.close(lfd);
+        return null;
+    };
+    // TCP_NODELAY is set once here and every accepted connection inherits it,
+    // so `acceptCb` sets nothing on the connections. The basis is zio's
+    // maintainer, answering our report of EINVAL warnings from a per-connection
+    // setsockopt (https://github.com/lalinsky/zio/issues/926#issuecomment-6942382039,
+    // lalinsky, 2026-11-17): "Since #870, which is in 9bef33d, `TCP_NODELAY` is
+    // set once on the listening socket and accepted connections inherit it.
+    // [...] If you set `TCP_NODELAY` on the listener next to `SO_REUSEADDR` and
+    // drop the per-connection call, the warnings go away, and you save a syscall
+    // per connection." The pinned zio's own listen does the same (src/net.zig,
+    // `listen`: "Accepted sockets inherit TCP_NODELAY from the listener.").
+    // serve_test.zig checks the accepted connection's TCP_NODELAY on macOS;
+    // Linux is not yet checked by a run there.
+    net.setNoDelay(lfd, true) catch |e| {
+        std.debug.print("cannot set TCP_NODELAY on the listening socket: {s}\n", .{@errorName(e)});
+        net.close(lfd);
+        return null;
+    };
+    // bind, listen and getsockname through libc, so a failure reports its errno.
+    var sa: net.sockaddr.in = .{ .port = std.mem.nativeToBig(u16, port), .addr = @bitCast([4]u8{ 127, 0, 0, 1 }) };
+    var sa_len: std.c.socklen_t = @sizeOf(net.sockaddr.in);
+    if (std.c.bind(lfd, @ptrCast(&sa), sa_len) != 0) return setupFailed(lfd, "bind", port);
+    if (std.c.listen(lfd, 4096) != 0) return setupFailed(lfd, "listen on", port);
+    // With port 0 the kernel picked the port: report the one it gave.
+    if (std.c.getsockname(lfd, @ptrCast(&sa), &sa_len) != 0) return setupFailed(lfd, "read the address of", port);
+    return .{ .fd = lfd, .port = std.mem.bigToNative(u16, sa.port) };
 }
 
 /// Serves on 127.0.0.1:port (port 0: one the kernel picks) with `threads`
@@ -690,25 +738,11 @@ export fn ekk_serve(port: u16, threads: u32, maxc: u32, conninfo: *anyopaque, co
     }
     const stop_fd = ekk_stop_signals();
     if (stop_fd < 0) return 1;
-    const lfd = net.socket(.ipv4, .stream, .ip, .{ .nonblocking = true }) catch |e| {
-        std.debug.print("cannot open the listening socket: {s}\n", .{@errorName(e)});
-        return 1;
-    };
-    const one: c_int = 1;
-    net.setsockopt(lfd, net.SOL.SOCKET, net.SO.REUSEADDR, std.mem.asBytes(&one)) catch |e| {
-        std.debug.print("cannot set SO_REUSEADDR on the listening socket: {s}\n", .{@errorName(e)});
-        return 1;
-    };
-    // bind, listen and getsockname through libc, so a failure reports its errno.
-    var sa: net.sockaddr.in = .{ .port = std.mem.nativeToBig(u16, port), .addr = @bitCast([4]u8{ 127, 0, 0, 1 }) };
-    var sa_len: std.c.socklen_t = @sizeOf(net.sockaddr.in);
-    if (std.c.bind(lfd, @ptrCast(&sa), sa_len) != 0) return setupFailed("bind", port);
-    if (std.c.listen(lfd, 4096) != 0) return setupFailed("listen on", port);
-    // With port 0 the kernel picked the port: report the one it gave.
-    if (std.c.getsockname(lfd, @ptrCast(&sa), &sa_len) != 0) return setupFailed("read the address of", port);
+    const listener = openListener(port) orelse return 1;
+    const lfd = listener.fd;
     // The checks read the address from this line (bench/lib.sh, bench/boundary,
     // bench/dbcheck); it comes only after listen succeeded.
-    std.debug.print("listening on 127.0.0.1:{d} with {d} loops, at most {d} connections\n", .{ std.mem.bigToNative(u16, sa.port), threads, maxc });
+    std.debug.print("listening on 127.0.0.1:{d} with {d} loops, at most {d} connections\n", .{ listener.port, threads, maxc });
 
     loops = alloc.alloc(LoopCtx, threads) catch return 1;
     for (loops) |*lp| lp.* = .{ .lfd = lfd };
