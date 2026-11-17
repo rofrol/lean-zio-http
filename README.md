@@ -338,14 +338,20 @@ else meanwhile; the loop serves its other connections (`Conn.step_query`,
   `Query.sql` on its first use (one round trip: Prepare, execute and Sync in
   libpq's pipeline mode) and executes it by name after that, as pgx does;
   past 64 statements on a connection further texts run unnamed. So a query
-  must not deallocate statements (`DEALLOCATE`, `DISCARD ALL`). A cached
-  statement that went stale (its result type changed after a schema change:
-  `0A000` raised by PostgreSQL's `RevalidateCachedQuery`; or the server no
-  longer has it: `26000`) fails that query with PostgreSQL's error, which is
-  not resent, and is forgotten: the text's next use prepares it again, under
-  a name the connection never used, so it cannot collide with the statement
-  the server still holds. A connection closes after the query that leaves 64
-  such forgotten statements, which bounds what it keeps on the server.
+  must not deallocate statements (`DEALLOCATE`, `DISCARD ALL`). An
+  execution of a cached statement that fails with `0A000` or `26000` fails
+  that query with PostgreSQL's error, which is not resent, and the statement
+  is forgotten: the text's next use prepares it again, under a name the
+  connection never used. These two SQLSTATEs cover a statement gone stale
+  (its result type changed after a schema change is `0A000`; one the server
+  no longer has is `26000`) and other errors as well, since PostgreSQL
+  documents nothing narrower; a good statement forgotten costs a fresh
+  Prepare. Before that query is answered, the forgotten statement is closed
+  on the server (a Close with its own Sync, one more round trip), so the
+  server holds only the statements the connection caches; a connection
+  whose Close fails, or that is lost during it, is closed and the query
+  answered with its own error (its deadline still abandons it with
+  `57014`, as for any busy query).
   Parameters and results are text; one statement per query.
 - **Results and errors.** Every query is answered exactly once: rows (text
   values, `none` for NULL, invalid UTF-8 replaced), PostgreSQL's error with
@@ -453,7 +459,9 @@ else meanwhile; the loop serves its other connections (`Conn.step_query`,
   `zig build test` in `zig/` (`bench.sh` runs it). `src/pg_test.zig` runs
   `pg.zig`'s pool on a real loop and real sockets with a scripted fake in
   place of `pg.c`: a partial flush with both polls outstanding and the
-  write completion arriving after the slot went idle, a session ended
+  write completion arriving after the slot went idle, output that collect
+  queued (a Close) flushed before its results are awaited and a connection
+  lost then delivering the query's answer, a session ended
   (COPY) with both polls outstanding, synchronous chains of 10,000
   failing queries (no slots, the database down) that stay iterative,
   deadlines (an expiry in the queue unlinks only that query, a busy
@@ -471,9 +479,11 @@ else meanwhile; the loop serves its other connections (`Conn.step_query`,
   PostgreSQL server on a Unix socket, each reply delivered whole, a message
   at a time and a byte at a time: command boundaries and Sync, errors,
   COPY in and out, a transaction left open, a connection lost mid-reply,
-  cached statements going stale (`0A000` from `RevalidateCachedQuery` and
-  `26000` forget the statement, another `0A000` keeps it, a failed
-  transaction still closes the session, 64 stale statements close it), and
+  cached statements forgotten (`0A000` from any routine and `26000` forget
+  the statement and close it on the server before the answer, more than 64
+  of them keep the session, a failed Close or a connection lost during it
+  closes the session with the query's own error, a failed transaction closes
+  it with no Close sent), and
   chunked collection, in chunks of 1, 2 and 16 rows: after every piece the
   rows held are exactly the whole chunks of the rows received (first use,
   cached and unnamed executions; two full chunks and a partial one),

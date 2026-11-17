@@ -44,6 +44,8 @@ const Session = struct {
     id: u32,
     /// "libpq's socket": the slot end of the test's socketpair.
     fd: c.fd_t,
+    /// The last collect returned 2 and the query is not yet answered.
+    closing: bool = false,
 };
 
 const Kind = enum { start, connect_poll, finish, send, flush, consume, collect, deliver };
@@ -90,7 +92,10 @@ const Fake = struct {
     send: Script = .{},
     flush: Script = .{},
     consume: Script = .{},
-    /// 0 more input, 1 rows, -1 the session ends with 0A000 (COPY).
+    /// 0 more input, 1 rows, -1 the session ends with 0A000 (COPY), 2 the
+    /// query's error 0A000 is kept while collect's own output (the Close of
+    /// a forgotten statement) is flushed; a 1 or -1 after it answers that
+    /// error.
     collect: Script = .{},
     /// The socket the next session's `ekk_pg_socket` returns.
     next_fd: c.fd_t = -1,
@@ -251,14 +256,16 @@ export fn ekk_pg_consume(p: *anyopaque) c_int {
 }
 
 export fn ekk_pg_collect(p: *anyopaque, acc: *Lean) c_int {
-    fake.note(.collect, sessionOf(p).id);
+    const s = sessionOf(p);
+    fake.note(.collect, s.id);
     const rc = fake.collect.next("ekk_pg_collect");
-    if (acc.* != null) @panic("collect: an accumulated value the fake never made");
-    switch (rc) {
+    if ((acc.* != null) != s.closing) @panic("collect: an accumulated value the fake never made, or lost");
+    if (acc.* == null) switch (rc) {
         0 => {},
         1 => acc.* = newObj(.{ .kind = .rows }),
         else => acc.* = newObj(.{ .kind = .err, .sqlstate = "0A000".* }),
-    }
+    };
+    s.closing = rc == 2 or (rc == 0 and s.closing);
     return rc;
 }
 
@@ -531,6 +538,79 @@ test "a: the write completion arrives after the slot went idle and changes nothi
     try std.testing.expect(s.rarmed);
     try std.testing.expectEqual(@as(usize, 1), w.n);
 
+    try fx.deinit();
+}
+
+test "a: output collect queued (2) is flushed, then the slot waits for its results" {
+    var fx: Fixture = .{};
+    try fx.init(1);
+    var w: TestWaiter = .{ .pool = &fx.pool };
+    const peer = try busyWithBothPolls(&fx, &w);
+    const s = slot0(&fx);
+
+    // The query's results arrive: the receive finishes the flush, collect
+    // keeps the answer and queues output that does not all go out.
+    fake.consume.push(&.{1});
+    fake.flush.push(&.{ 0, 1 });
+    fake.collect.push(&.{2});
+    var mark = fake.calls;
+    try poke(peer);
+    try fx.until(&fake, struct {
+        fn f(x: *Fake) bool {
+            return x.count.get(.collect) == 1;
+        }
+    }.f);
+    try expectKinds(mark, &.{ .consume, .flush, .collect, .flush });
+    try std.testing.expectEqual(.busy, s.state);
+    try std.testing.expect(s.flushing and s.warmed and s.rarmed);
+    try std.testing.expectEqual(@as(usize, 0), w.n);
+
+    // Writable: the send poll flushes the rest.
+    fake.flush.push(&.{0});
+    mark = fake.calls;
+    drain(peer);
+    try fx.until(s, struct {
+        fn f(x: *pg.Slot) bool {
+            return !x.warmed;
+        }
+    }.f);
+    try expectKinds(mark, &.{.flush});
+    try std.testing.expect(!s.flushing);
+
+    // Its results arrive: the query is answered with the error kept.
+    fake.consume.push(&.{1});
+    fake.collect.push(&.{1});
+    mark = fake.calls;
+    try poke(peer);
+    try fx.until(&w, delivered);
+    try expectKinds(mark, &.{ .consume, .collect, .deliver });
+    try std.testing.expectEqual(.idle, s.state);
+    try std.testing.expectEqual(.err, w.got[0].kind);
+    try fx.deinit();
+}
+
+test "a: a connection lost after collect has the answer (2) delivers that answer, not 08006" {
+    var fx: Fixture = .{};
+    try fx.init(1);
+    var w: TestWaiter = .{ .pool = &fx.pool };
+    const peer = try sentAndBusy(&fx, &w, query());
+    fake.consume.push(&.{ 1, 0 });
+    fake.flush.push(&.{0});
+    fake.collect.push(&.{2});
+    try poke(peer);
+    try fx.until(&fake, struct {
+        fn f(x: *Fake) bool {
+            return x.count.get(.collect) == 1;
+        }
+    }.f);
+    try std.testing.expectEqual(@as(usize, 0), w.n);
+    // The Close's results never come: the connection fails.
+    const mark = fake.calls;
+    try poke(peer);
+    try fx.until(&w, delivered);
+    try expectKinds(mark, &.{ .consume, .deliver });
+    try std.testing.expectEqual(.err, w.got[0].kind);
+    try std.testing.expectEqualSlices(u8, "0A000", &w.got[0].sqlstate);
     try fx.deinit();
 }
 

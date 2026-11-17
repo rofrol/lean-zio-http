@@ -138,6 +138,11 @@ pub const Slot = struct {
     acc: Lean = null,
     /// busy: libpq has output left to send.
     flushing: bool = false,
+    /// busy: collect returned 2, so `acc` is the query's answer while the
+    /// session closes the statement it forgot (pg.c); a connection lost
+    /// from here on ends the session but delivers that answer (a deadline
+    /// still abandons it with 57014, as for any busy query).
+    answered: bool = false,
     /// Readability: a receive of one byte with MSG_PEEK, which leaves the
     /// bytes to libpq. zio tries a receive first and parks on its kqueue or
     /// epoll registration only when nothing is there; NetPoll would probe
@@ -257,6 +262,7 @@ pub const Slot = struct {
         const w = self.waiter.?;
         const q = w.query;
         w.query = null;
+        self.answered = false;
         var err: Lean = null;
         switch (ekk_pg_send(self.pg.?, q, &err)) {
             0 => self.flush(),
@@ -350,14 +356,20 @@ pub const Slot = struct {
     fn collect(self: *Slot) void {
         const rc = ekk_pg_collect(self.pg.?, &self.acc);
         if (rc == 0) return;
+        // Collect queued commands of its own (the Close of a forgotten
+        // statement, pg.c): flush them, then wait for their results.
+        if (rc == 2) {
+            self.answered = true;
+            return self.flush();
+        }
         const w = self.waiter.?;
         const result = self.acc;
         self.acc = null;
         self.waiter = null;
         if (rc < 0) {
             // COPY, a transaction left open, a result over the bound, a lost
-            // connection or too many stale statements (pg.c): the session
-            // serves no other query.
+            // connection or a failed Close (pg.c): the session serves no
+            // other query.
             self.teardown();
         } else {
             // A complete answer of the database's: connects may start again.
@@ -369,11 +381,14 @@ pub const Slot = struct {
     }
 
     /// The connection failed while busy, after the query was handed to
-    /// libpq: it is abandoned with `08006` (it may have run).
+    /// libpq: it is abandoned with `08006` (it may have run), or answered
+    /// with its own result once that is known (`answered`).
     fn lost(self: *Slot) void {
         const w = self.waiter.?;
-        const err = ekk_pg_lost_sent(self.pg);
-        if (self.acc) |a| ekk_query_drop(a);
+        const err = if (self.answered) self.acc else blk: {
+            if (self.acc) |a| ekk_query_drop(a);
+            break :blk ekk_pg_lost_sent(self.pg);
+        };
         self.acc = null;
         self.waiter = null;
         self.teardown();

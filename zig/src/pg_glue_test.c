@@ -475,9 +475,16 @@ static void prepare_ok(ekk_pg *p, fake *f, enum piece how, const char *sql, cons
           "the new entry is not \"%s\" as ekk%llu", sql, name);
 }
 
+/* Checks that the client sent nothing since the fake last read. */
+static void nothing_sent(fake *f) {
+    uint8_t in[64];
+    CHECK(take_input(f, in, sizeof in) == 0, "the client sent bytes");
+}
+
 /* The cached `sql` executed and failing with `sqlstate` raised by
-   `routine`, the session left in transaction status `status`; returns
-   collect's result and checks the error. */
+   `routine` (field R, which pg.c does not read), the session left in
+   transaction status `status`; returns collect's result and checks the
+   error and that nothing more was sent (no Close). */
 static int cached_fails(ekk_pg *p, fake *f, enum piece how, const char *sql, const char *sqlstate,
                         const char *routine, char status, const char *expected) {
     send_query(p, f, sql, NULL, "BDES");
@@ -485,13 +492,55 @@ static int cached_fails(ekk_pg *p, fake *f, enum piece how, const char *sql, con
     errresp_at(&m, sqlstate, STALE_PLAN, routine); ready(&m, status);
     lean_object *acc = NULL;
     int rc = reply(p, f, &m, how, &acc, 0);
+    CHECK(rc != 2, "collect queued a Close");
     expect_error(acc, expected);
+    nothing_sent(f);
     return rc;
 }
 
-/* Cached statements that go stale (pg.c, `invalidated`): the failing
-   query gets the error, the entry is forgotten and its text prepared again
-   under a name never used before; other errors keep the entry. */
+/* The cached `sql`, prepared as "ekk<name>", executed and failing with
+   `sqlstate` (raised by `routine`) in a session left idle: collect forgets
+   it and, at the query's Sync, returns 2 with the query's error kept in
+   *acc; flushed as pg.zig does, the client has sent exactly a Close of
+   "ekk<name>" and a Sync. */
+static void evict_start(ekk_pg *p, fake *f, enum piece how, const char *sql, const char *sqlstate, const char *routine,
+                        unsigned long long name, lean_object **acc) {
+    send_query(p, f, sql, NULL, "BDES");
+    msgs m = {0};
+    errresp_at(&m, sqlstate, STALE_PLAN, routine); ready(&m, 'I');
+    *acc = NULL;
+    CHECK(reply(p, f, &m, how, acc, 0) == 2, "collect did not queue the Close");
+    CHECK(*acc != NULL, "the query's error was not kept");
+    CHECK(ekk_pg_flush(p) == 0, "ekk_pg_flush left output");
+    char stmt[32];
+    stmt_name(stmt, name);
+    msgs want = {0};
+    size_t a = begin(&want, 'C'); put8(&want, 'S'); puts0(&want, stmt); end(&want, a);
+    empty(&want, 'S');
+    uint8_t in[256];
+    size_t n = take_input(f, in, sizeof in);
+    CHECK(n == want.n && memcmp(in, want.b, n) == 0, "the client sent %zu bytes, not a Close of %s and a Sync", n, stmt);
+}
+
+/* evict_start, then the Close succeeds (CloseComplete, ReadyForQuery):
+   collect answers the query's own error at the Close's Sync. */
+static void evicted(ekk_pg *p, fake *f, enum piece how, const char *sql, const char *sqlstate, const char *routine,
+                    unsigned long long name) {
+    lean_object *acc;
+    evict_start(p, f, how, sql, sqlstate, routine, name, &acc);
+    msgs m = {0};
+    empty(&m, '3'); ready(&m, 'I');
+    CHECK(reply(p, f, &m, how, &acc, m.ends[0]) == 1, "not complete after the Close");
+    expect_error(acc, sqlstate);
+    nothing_sent(f);
+}
+
+/* A cached statement whose execution fails with 0A000 or 26000 (pg.c,
+   `evicts`), whatever routine raised it: the failing query gets the error,
+   the entry is forgotten, its statement closed on the server, and its text
+   prepared again under a name never used before. Other errors keep the
+   entry (usable_session); an execution right after its Prepare is not a
+   cached one; in a failed transaction the session is closed, no Close sent. */
 static void stale_statements(enum piece how) {
     fake f;
     fake_open(&f);
@@ -500,27 +549,30 @@ static void stale_statements(enum piece how) {
     current = "stale: prepared";
     prepare_ok(p, &f, how, SQL_A, "x", 0);
 
-    current = "stale: a schema change altered the result type";
-    CHECK(cached_fails(p, &f, how, SQL_A, "0A000", "RevalidateCachedQuery", 'I', "0A000") == 1, "the session was ended");
-    CHECK(p->prepared == 0 && p->stale == 1, "prepared %d, stale %d", p->prepared, p->stale);
+    current = "stale: a schema change altered the result type (0A000)";
+    evicted(p, &f, how, SQL_A, "0A000", "RevalidateCachedQuery", 0);
+    CHECK(p->prepared == 0, "prepared %d", p->prepared);
 
     current = "stale: prepared again under a new name";
     prepare_ok(p, &f, how, SQL_A, "x", 1);
 
-    current = "stale: another 0A000 keeps the statement";
-    CHECK(cached_fails(p, &f, how, SQL_A, "0A000", "transformStmt", 'I', "0A000") == 1, "the session was ended");
-    CHECK(cached_fails(p, &f, how, SQL_A, "0A000", NULL, 'I', "0A000") == 1, "the session was ended");
-    CHECK(p->prepared == 1 && p->stale == 1, "prepared %d, stale %d", p->prepared, p->stale);
+    current = "stale: an unrelated 0A000 evicts too";
+    evicted(p, &f, how, SQL_A, "0A000", "transformStmt", 1);
+    CHECK(p->prepared == 0, "prepared %d", p->prepared);
+    prepare_ok(p, &f, how, SQL_A, "x", 2);
+    evicted(p, &f, how, SQL_A, "0A000", NULL, 2);
+    CHECK(p->prepared == 0, "prepared %d", p->prepared);
 
     current = "stale: the statement no longer on the server (26000)";
-    CHECK(cached_fails(p, &f, how, SQL_A, "26000", "FetchPreparedStatement", 'I', "26000") == 1, "the session was ended");
-    CHECK(p->prepared == 0 && p->stale == 2, "prepared %d, stale %d", p->prepared, p->stale);
+    prepare_ok(p, &f, how, SQL_A, "x", 3);
+    evicted(p, &f, how, SQL_A, "26000", "FetchPreparedStatement", 3);
+    CHECK(p->prepared == 0, "prepared %d", p->prepared);
 
     current = "stale: the first of two entries forgotten";
-    prepare_ok(p, &f, how, SQL_A, "x", 2);
-    prepare_ok(p, &f, how, SQL_C, "y", 3);
-    CHECK(cached_fails(p, &f, how, SQL_A, "0A000", "RevalidateCachedQuery", 'I', "0A000") == 1, "the session was ended");
-    CHECK(p->prepared == 1 && strcmp(p->sql[0], SQL_C) == 0 && p->name[0] == 3, "the remaining entry moved wrongly");
+    prepare_ok(p, &f, how, SQL_A, "x", 4);
+    prepare_ok(p, &f, how, SQL_C, "y", 5);
+    evicted(p, &f, how, SQL_A, "0A000", "RevalidateCachedQuery", 4);
+    CHECK(p->prepared == 1 && strcmp(p->sql[0], SQL_C) == 0 && p->name[0] == 5, "the remaining entry moved wrongly");
 
     current = "stale: an execution right after its Prepare is not a cached one";
     send_query(p, &f, SQL_B, NULL, "PBDES");
@@ -529,7 +581,8 @@ static void stale_statements(enum piece how) {
     lean_object *acc = NULL;
     CHECK(reply(p, &f, &m, how, &acc, 0) == 1, "not complete");
     expect_error(acc, "0A000");
-    CHECK(p->prepared == 2 && strcmp(p->sql[1], SQL_B) == 0 && p->stale == 3, "prepared %d, stale %d", p->prepared, p->stale);
+    nothing_sent(&f);
+    CHECK(p->prepared == 2 && strcmp(p->sql[1], SQL_B) == 0, "prepared %d", p->prepared);
 
     current = "stale: the remaining entry still executed by name";
     send_query(p, &f, SQL_C, NULL, "BDES");
@@ -539,27 +592,61 @@ static void stale_statements(enum piece how) {
     CHECK(reply(p, &f, &m, how, &acc, 0) == 1, "not complete");
     expect_rows(acc, "y", "2");
 
-    current = "stale: in a failed transaction the session is still closed";
+    current = "stale: in a failed transaction the session is closed, no Close sent";
     CHECK(cached_fails(p, &f, how, SQL_C, "0A000", "RevalidateCachedQuery", 'E', "25000") == -1, "the session was kept");
     CHECK(p->prepared == 1 && strcmp(p->sql[0], SQL_B) == 0, "prepared %d", p->prepared);
     finish(p, &f);
     fake_close(&f);
 }
 
-/* A session closes, after the failing query's result, once EKK_STATEMENTS
-   forgotten statements may remain on the server. */
-static void stale_bound(enum piece how) {
-    current = "stale bound";
+/* Every forgotten statement is closed, so nothing accumulates on the
+   server: a session keeps serving past EKK_STATEMENTS evictions. */
+static void evictions_unbounded(enum piece how) {
+    current = "stale: no bound on evictions";
     fake f;
     fake_open(&f);
     ekk_pg *p = connect_fake(&f);
-    for (int i = 0; i < EKK_STATEMENTS; i++) {
+    for (int i = 0; i <= EKK_STATEMENTS; i++) {
         prepare_ok(p, &f, how, SQL_C, "y", (unsigned long long)i);
-        int rc = cached_fails(p, &f, how, SQL_C, "0A000", "RevalidateCachedQuery", 'I', "0A000");
-        CHECK(rc == (i + 1 < EKK_STATEMENTS ? 1 : -1), "after %d stale statements collect returned %d", i + 1, rc);
+        evicted(p, &f, how, SQL_C, "0A000", NULL, (unsigned long long)i);
     }
+    prepare_ok(p, &f, how, SQL_C, "y", EKK_STATEMENTS + 1);
     finish(p, &f);
     fake_close(&f);
+}
+
+/* The Close of a forgotten statement fails, or the connection ends before
+   its result: the session is closed (collect -1, or the consume pg.zig
+   checks fails), and the query is answered with its own error, which is
+   known since its Sync. */
+static void close_fails(enum piece how) {
+    for (int lost = 0; lost <= 1; lost++) {
+        current = lost ? "stale: the connection ends during the Close" : "stale: the Close fails";
+        fake f;
+        fake_open(&f);
+        ekk_pg *p = connect_fake(&f);
+        prepare_ok(p, &f, how, SQL_A, "x", 0);
+        lean_object *acc;
+        evict_start(p, &f, how, SQL_A, "0A000", NULL, 0, &acc);
+        if (!lost) {
+            msgs m = {0};
+            errresp(&m, "XX000", "the Close failed"); ready(&m, 'I');
+            size_t at;
+            CHECK(reply_until(p, &f, &m, how, &acc, 0, &at) == -1, "the session was kept");
+            CHECK(at == (how == WHOLE ? m.n : m.ends[0]), "collect ended at byte %zu, not at the Close's error", at);
+            expect_error(acc, "0A000");
+            finish(p, &f);
+        } else {
+            close(f.conn);
+            f.conn = -1;
+            /* Through collect, or through the consume that fails, where
+               pg.zig's `lost` delivers the answer collect kept. */
+            if (ekk_pg_consume(p) == 1) CHECK(ekk_pg_collect(p, &acc) == -1, "a lost connection not reported");
+            expect_error(acc, "0A000");
+            ekk_pg_finish(p);
+        }
+        fake_close(&f);
+    }
 }
 
 /* A query whose reply ends the session: collect returns -1 with `sqlstate`
@@ -1228,7 +1315,8 @@ int main(void) {
     for (enum piece how = WHOLE; how <= BYTE; how++) {
         usable_session(how);
         stale_statements(how);
-        stale_bound(how);
+        evictions_unbounded(how);
+        close_fails(how);
         ending(how, "COPY TO STDOUT", "COPY t TO STDOUT", 'H', "0A000");
         ending(how, "COPY FROM STDIN", "COPY t FROM STDIN", 'G', "0A000");
         ending(how, "a transaction left open", "BEGIN", 'T', "25000");

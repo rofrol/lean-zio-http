@@ -8,8 +8,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* PQsetChunkedRowsMode, which every execution uses (below), came with
-   libpq 17. */
+/* PQsetChunkedRowsMode, which every execution uses, and
+   PQsendClosePrepared (below) came with libpq 17. */
 #ifndef LIBPQ_HAS_CHUNK_MODE
 #error "the PostgreSQL pool needs libpq 17 or later (PQsetChunkedRowsMode)"
 #endif
@@ -53,15 +53,14 @@ lean_object *ekk_pg_abandoned(const char *sqlstate, const char *message) { retur
    deallocate statements (DEALLOCATE, DISCARD ALL). One query is in flight
    per session (pg.zig).
 
-   A cached statement whose execution fails because its plan went stale
-   (`invalidated`: a schema change altered its result type, or the server
-   no longer has it) is forgotten, and that query is answered with the
-   error, never sent again; the text's next use prepares it afresh. Names
-   come from a counter and are never reused within a session, so preparing
-   cannot collide with a forgotten statement the server still holds; those
-   are counted in `stale`, and a session that reaches EKK_STATEMENTS of them
-   is closed after the query's result, which bounds what it leaves on the
-   server.
+   A cached statement whose execution fails with 0A000 or 26000 (`evicts`)
+   is forgotten, and that query is answered with the error, never sent
+   again; the text's next use prepares it afresh under a new name (names
+   come from a counter and are never reused within a session). After the
+   query's Sync, when no transaction is open, the forgotten statement is
+   closed on the server (a Close with a Sync of its own) before the answer
+   is delivered, so the server holds exactly the statements cached here; a
+   session whose Close fails is closed.
 
    Every execution runs in libpq's chunked-rows mode, so its rows arrive
    in PGresults of EKK_CHUNK_ROWS rows (the last one of fewer) and are
@@ -88,6 +87,8 @@ typedef enum {
     EKK_PREPARED,  /* the Prepare succeeded; the NULL ending it comes next */
     EKK_EXECUTING, /* the execution's results, in chunked-rows mode */
     EKK_SKIPPED,   /* preparing failed, so PostgreSQL skips the execution */
+    EKK_CLOSING,   /* answered; the Close of the forgotten statement comes next */
+    EKK_CLOSED,    /* the Close succeeded; its Sync comes next */
 } ekk_stage;
 
 /* The Result.rows of the query in flight, built as its rows arrive. `cost`
@@ -106,7 +107,8 @@ typedef struct {
     unsigned long long name[EKK_STATEMENTS];
     int prepared;                    /* entries in sql and name */
     unsigned long long next_name;    /* the next statement's name; never reused */
-    int stale;                       /* forgotten statements perhaps still on the server */
+    int evicted;                     /* the query in flight forgot a cached entry... */
+    unsigned long long evicted_name; /* ...of this name, to close after its Sync */
     ekk_stage stage; /* EKK_PREPARING..: the query in flight prepares sql[prepared - 1] */
     int cached;    /* the query in flight executes the entry prepared before, or -1 */
     int last_null; /* PQgetResult's last return was NULL */
@@ -118,6 +120,9 @@ typedef struct {
 /* libpq's chunked-rows mode for the command at the head of libpq's queue.
    The callers set it only where libpq allows it (above), so a refusal is a
    programming error, never a reason to buffer the whole result. */
+/* The name statement `n` is prepared under. */
+static void stmt_name(char out[32], unsigned long long n) { snprintf(out, 32, "ekk%llu", n); }
+
 static void chunked(ekk_pg *p) {
     if (!PQsetChunkedRowsMode(p->c, p->chunk)) {
         fprintf(stderr, "pg.c: libpq refused chunked-rows mode for the execution\n");
@@ -262,6 +267,7 @@ int ekk_pg_send(ekk_pg *p, lean_object *q, lean_object **err) {
     *err = NULL;
     p->stage = EKK_EXECUTING;
     p->cached = -1;
+    p->evicted = 0;
     p->last_null = 0;
     rows_drop(&p->rows);
     if (PQstatus(p->c) != CONNECTION_OK) {
@@ -288,13 +294,13 @@ int ekk_pg_send(ekk_pg *p, lean_object *q, lean_object **err) {
     char name[32];
     int ok;
     if (k < p->prepared) {
-        snprintf(name, sizeof name, "ekk%llu", p->name[k]);
+        stmt_name(name, p->name[k]);
         p->cached = k;
         ok = PQsendQueryPrepared(p->c, name, (int)n, vals, NULL, NULL, 0);
         if (ok) chunked(p);
     } else if (k < EKK_STATEMENTS && (p->sql[k] = strdup(text)) != NULL) {
         p->name[k] = p->next_name++;
-        snprintf(name, sizeof name, "ekk%llu", p->name[k]);
+        stmt_name(name, p->name[k]);
         p->prepared++;
         p->stage = EKK_PREPARING; /* chunked-rows mode once the Prepare's results end */
         ok = PQsendPrepare(p->c, name, text, (int)n, NULL)
@@ -491,20 +497,31 @@ static void forget(ekk_pg *p, int k) {
     memmove(p->name + k, p->name + k + 1, (size_t)(p->prepared - k) * sizeof p->name[0]);
 }
 
-/* An execution of a cached statement failed because the statement went
-   stale: 0A000 raised by RevalidateCachedQuery, PostgreSQL's "cached plan
-   must not change result type" (the routine, field R, is sent with every
-   error and is not translated as the message is; PostgreSQL 14 to 18
-   raise it there, recheck when that changes), or 26000, no such prepared
-   statement. A 26000 may also come from a statement that runs EXECUTE
-   itself; forgetting the entry then costs only a fresh Prepare under a new
-   name, and the count in `stale`. */
-static int invalidated(PGresult *r) {
+/* Whether an execution of a cached statement that failed with result `r`
+   forgets the statement: SQLSTATE 0A000 (feature_not_supported) or 26000
+   (invalid_sql_statement_name). These classes hold every error of a
+   statement the server can no longer run as prepared (PostgreSQL's
+   "cached plan must not change result type" after a schema change is
+   0A000; a statement the server no longer has is 26000) and others too:
+   PostgreSQL documents no code or field that singles the stale statement
+   out (decided 2026-11-17, item 7mzw77). Forgetting a statement that was
+   still good costs only its Close and a fresh Prepare under a new name. */
+static int evicts(PGresult *r) {
     const char *st = PQresultErrorField(r, PG_DIAG_SQLSTATE);
-    const char *fn = PQresultErrorField(r, PG_DIAG_SOURCE_FUNCTION);
-    if (st == NULL) return 0;
-    if (strcmp(st, "26000") == 0) return 1;
-    return strcmp(st, "0A000") == 0 && fn != NULL && strcmp(fn, "RevalidateCachedQuery") == 0;
+    return st != NULL && (strcmp(st, "0A000") == 0 || strcmp(st, "26000") == 0);
+}
+
+/* Queues the Close of the statement the query in flight forgot, with a
+   Sync of its own, once the query's Sync has arrived: 2 (flush, then wait
+   for its results), or -1 when the connection failed. Closing a statement
+   the server does not have is not an error (protocol, "Extended Query"),
+   so a 26000's statement is closed the same way. */
+static int close_evicted(ekk_pg *p) {
+    char name[32];
+    stmt_name(name, p->evicted_name);
+    p->evicted = 0;
+    p->stage = EKK_CLOSING;
+    return PQsendClosePrepared(p->c, name) && PQpipelineSync(p->c) ? 2 : -1;
 }
 
 static lean_object *error_of(PGresult *r) {
@@ -523,14 +540,18 @@ static lean_object *error_of(PGresult *r) {
    result that ends them, or its error (an error after some rows discards
    them), or the error of preparing its statement (which is then forgotten,
    and the execution PostgreSQL skipped is ignored). A cached statement
-   that went stale is forgotten (`invalidated`). 1 when the Sync arrived
-   (*acc is complete), 0 when more input is needed, -1 when the session
+   whose execution fails with an error that `evicts` it is forgotten and,
+   after the query's Sync, closed on the server (close_evicted). 1 when the
+   Sync arrived (*acc is complete), and the Close's Sync after it when one
+   was sent; 0 when more input is needed; 2 when collect queued the Close:
+   flush it (ekk_pg_flush), then more input is needed; -1 when the session
    must be closed, with *acc the query's result: Result.abandoned 08006
    when the connection failed (ekk_pg_lost_sent), an error when the statement started COPY, which this pool does not
    speak, or it left a transaction open; Result.abandoned 54000
    (EKK_TOO_BIG) when its rows crossed Query.maxResultBytes (the rows
-   gathered are released, the rest is never read); the query's own result when the
-   session holds EKK_STATEMENTS stale statements. */
+   gathered are released, the rest is never read); the query's own error
+   when the Close failed or the connection failed after the query's
+   Sync. */
 int ekk_pg_collect(ekk_pg *p, lean_object **acc) {
     while (!PQisBusy(p->c)) {
         PGresult *r = PQgetResult(p->c);
@@ -538,6 +559,8 @@ int ekk_pg_collect(ekk_pg *p, lean_object **acc) {
             /* A NULL ends one command's results; two in a row mean nothing is
                pending, so the Sync can never come. */
             if (p->last_null || PQstatus(p->c) != CONNECTION_OK) {
+                /* After the query's Sync its answer is known. */
+                if (p->stage == EKK_CLOSING || p->stage == EKK_CLOSED) return -1;
                 if (*acc) lean_dec(*acc);
                 *acc = ekk_pg_lost_sent(p);
                 return -1;
@@ -552,9 +575,16 @@ int ekk_pg_collect(ekk_pg *p, lean_object **acc) {
             continue;
         }
         p->last_null = 0;
+        ExecStatusType st = PQresultStatus(r);
+        if (p->stage == EKK_CLOSING || p->stage == EKK_CLOSED) {
+            /* The Close's CommandComplete, then its Sync; anything else ends
+               the session, the query's answer kept. */
+            PQclear(r);
+            if (st == PGRES_COMMAND_OK && p->stage == EKK_CLOSING) { p->stage = EKK_CLOSED; continue; }
+            return st == PGRES_PIPELINE_SYNC && p->stage == EKK_CLOSED && PQtransactionStatus(p->c) == PQTRANS_IDLE ? 1 : -1;
+        }
         lean_object *v = NULL;
         int stop = 0;
-        ExecStatusType st = PQresultStatus(r);
         switch (st) {
         case PGRES_PIPELINE_SYNC:
             PQclear(r);
@@ -566,7 +596,7 @@ int ekk_pg_collect(ekk_pg *p, lean_object **acc) {
                 *acc = ekk_pg_error("25000", "the query left a transaction open; it was rolled back");
                 return -1;
             }
-            return p->stale >= EKK_STATEMENTS ? -1 : 1;
+            return p->evicted ? close_evicted(p) : 1;
         case PGRES_PIPELINE_ABORTED:
             break; /* skipped after the error already in *acc */
         case PGRES_COMMAND_OK:
@@ -598,10 +628,11 @@ int ekk_pg_collect(ekk_pg *p, lean_object **acc) {
                    does not hold. */
                 p->stage = EKK_SKIPPED;
                 forget(p, p->prepared - 1);
-            } else if (p->cached >= 0 && invalidated(r)) {
+            } else if (p->cached >= 0 && evicts(r)) {
+                p->evicted = 1;
+                p->evicted_name = p->name[p->cached];
                 forget(p, p->cached);
                 p->cached = -1;
-                p->stale++;
             }
             rows_drop(&p->rows); /* rows before the error are not the answer */
             v = error_of(r);
