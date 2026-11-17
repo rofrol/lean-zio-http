@@ -11,9 +11,12 @@
 //! response of that many bytes under the write deadline, watches for the
 //! next request's first byte while it is sent, and runs that request's head
 //! budget beside the send from its arrival, as Lean's Conn.step does for a
-//! pipelined request (item dv6ikn). Clients connect over TCP on 127.0.0.1, and in
-//! one test over a Unix-domain stream socket, whose buffer gains room only
-//! when its peer reads. Before a single-loop test
+//! pipelined request (item dv6ikn). Clients connect over TCP on 127.0.0.1, and
+//! in the tests whose premise is a send that waits in the kernel or writes
+//! only part of what it was asked, over a Unix-domain stream socket, whose
+//! buffer gains room only when its peer reads (item emb2ob: loopback TCP's
+//! buffers are the kernel's to size and drain, and differ between macOS and
+//! Linux). Before a single-loop test
 //! polls its loop for an event, it waits (`awaitReadable`) until the kernel
 //! has made that event ready: a connection queued on the listening socket, or
 //! bytes readable at the server's end. The loop's nonblocking polls then find
@@ -979,16 +982,19 @@ test "a receive the loop runs before a due expiry wins: that expiry is stale and
 
 /// A response larger than the socket buffers seen in the runs so far on
 /// both ends: while the client does not read, its sends fill them and one
-/// parks. The TCP tests do not guarantee that the send stays parked:
-/// loopback may keep moving bytes into the client's receive buffer and
-/// freeing room in the server's send buffer after it, so a parked send may
-/// become ready with no read by the client.
+/// parks. On TCP that is not guaranteed: loopback may keep moving bytes
+/// into the client's receive buffer and freeing room in the server's send
+/// buffer after a send parked, so it may become ready with no read by the
+/// client, and Linux autotunes a send buffer it was not given past 1 MiB
+/// (tcp_wmem). The tests that need a send to stay parked use a Unix-domain
+/// pair; the TCP tests that wait for a parked send ask for small buffers.
 const response_len: usize = 1 << 20;
-/// The size the TCP tests ask for the server's send buffer and the client's
-/// receive buffer. The kernel need not grant it: on macOS getsockopt read
-/// 314352 for a client's SO_RCVBUF set to this before connect (item znioju),
-/// so the requested 4096 bytes were not the client's effective receive
-/// buffer there.
+/// The size the tests ask for the server's send buffer (and on TCP the
+/// client's receive buffer). The kernel need not grant it, and no test
+/// checks what it granted: on macOS getsockopt read 314352 for a client's
+/// SO_RCVBUF set to this before connect (item znioju), and Linux doubles a
+/// requested SO_SNDBUF (socket(7)). A test whose premise is a parked or
+/// partial send asserts that event itself.
 const small_buffer: c_int = 4096;
 
 fn setBuffer(fd: c.fd_t, opt: u32) !void {
@@ -1010,18 +1016,26 @@ fn stepUntilPolling(s: *Single) !void {
     }
 }
 
-/// Connects a TCP client, asking for a `small_buffer` receive buffer (which
-/// the kernel may not grant), has it send a request ('R'), and steps the
-/// loop until the fake has started the response of `len` bytes, its send on
-/// a `small_buffer` send buffer.
+/// Connects a client to the test's listener (on TCP asking for a
+/// `small_buffer` receive buffer), has it send a request ('R'), and steps
+/// the loop until the fake has started the response of `len` bytes, its
+/// send on a server socket asked for a `small_buffer` send buffer. The
+/// kernel may grant other sizes.
 fn requestResponse(s: *Single, len: usize) !c.fd_t {
     respond = len;
     recv_keeps = true;
-    const cl = socket(c.AF.INET, c.SOCK.STREAM, 0);
-    if (cl < 0) return error.Socket;
+    const cl = switch (s.listener.addr) {
+        .tcp => |*sa| tcp: {
+            const fd = socket(c.AF.INET, c.SOCK.STREAM, 0);
+            if (fd < 0) return error.Socket;
+            errdefer _ = c.close(fd);
+            try setBuffer(fd, c.SO.RCVBUF);
+            if (c.connect(fd, @ptrCast(sa), @sizeOf(c.sockaddr.in)) != 0) return error.Connect;
+            break :tcp fd;
+        },
+        .unix => try s.listener.connect(),
+    };
     errdefer _ = c.close(cl);
-    try setBuffer(cl, c.SO.RCVBUF);
-    if (c.connect(cl, @ptrCast(&s.listener.addr.tcp), @sizeOf(c.sockaddr.in)) != 0) return error.Connect;
     awaitReadable(s.listener.fd);
     try s.stepUntil(.open, 1);
     try setBuffer(s.lp.head.?.fd, c.SO.SNDBUF);
@@ -1047,19 +1061,30 @@ fn pipelinedBehindResponse(s: *Single) !c.fd_t {
 const max_drain = 100_000;
 
 /// Reads whatever the client has, without blocking, and polls the loop,
-/// until the fake has seen the response's last send.
-fn drainUntilWritten(s: *Single, cl: c.fd_t) !void {
+/// until the fake has seen the response's last send. Returns the bytes the
+/// client read.
+fn drainUntilWritten(s: *Single, cl: c.fd_t) !usize {
     var buf: [65536]u8 = undefined;
+    var got: usize = 0;
     var round: usize = 0;
     while (s.count(.written) == 0) : (round += 1) {
         if (round == max_drain) {
             s.dump();
             return error.ResponseNeverWritten;
         }
-        _ = c.recv(cl, &buf, buf.len, c.MSG.DONTWAIT);
+        const r = c.recv(cl, &buf, buf.len, c.MSG.DONTWAIT);
+        if (r > 0) {
+            got += @intCast(r);
+        } else if (r == 0) {
+            s.dump();
+            return error.ClientEndedBeforeWritten;
+        } else if (c.errno(r) != .AGAIN) {
+            return error.ClientRead;
+        }
         try s.lp.loop.poll(.zero);
         s.collect();
     }
+    return got;
 }
 
 test "the shutdown's drain ends with a send waiting in the kernel: the send is canceled, unreported, and the connection closes" {
@@ -1125,7 +1150,7 @@ test "a partial pipelined head behind a blocked response: finishing the response
     try std.testing.expect(head_arm.gen == genPtr(2));
     try std.testing.expect(!conn.polling);
     const due = head_arm.timer.deadline;
-    try drainUntilWritten(&s, cl);
+    _ = try drainUntilWritten(&s, cl);
     // The response is sent whole: the same arm, with the same due time, is
     // now the reading phase's own deadline; the write deadline is gone.
     try std.testing.expect(conn.arm.? == head_arm);
@@ -1189,7 +1214,7 @@ test "a complete pipelined head whose budget ends while its response is still bl
     try std.testing.expect(!write_arm.retired);
     try std.testing.expect(conn.cur.?.kind == .send);
     try std.testing.expect(!conn.polling and !conn.watching);
-    try drainUntilWritten(&s, cl);
+    _ = try drainUntilWritten(&s, cl);
     try s.stepUntil(.recv, 2);
     _ = c.shutdown(cl, c.SHUT.WR);
     try s.stepUntil(.free, 1);
@@ -1231,6 +1256,41 @@ test "a response sent at once starts no poll, and the receive after it reports w
     try s.finish();
 }
 
+test "over TCP, a response larger than the send buffer reaches a reading client whole, through a parked send" {
+    // The TCP counterpart of the Unix-domain tests of parked and partial
+    // sends below (item emb2ob): a Unix-domain pair makes those tests'
+    // premises stable, and their coverage does not establish TCP's. This
+    // one asserts its own premise, a send parked while the client does not
+    // read, by its event (the readiness poll beside it; with the small
+    // buffers `requestResponse` asks for, it came in the runs on macOS and
+    // Linux), and checks that once the client reads, the fake hears of the
+    // response's last send and the
+    // client gets the whole response, no more, before the close. (Each send
+    // is not reported: a 1 MiB response takes more of them than the log
+    // holds.)
+    var s: Single = undefined;
+    try s.init(64);
+    defer s.deinit();
+    const cl = try requestResponse(&s, response_len);
+    defer _ = c.close(cl);
+    try stepUntilPolling(&s);
+    var got = try drainUntilWritten(&s, cl);
+    _ = c.shutdown(cl, c.SHUT.WR);
+    try s.stepUntil(.free, 1);
+    var buf: [65536]u8 = undefined;
+    while (true) {
+        const r = c.read(cl, &buf, buf.len);
+        if (r < 0) return error.ClientRead;
+        if (r == 0) break;
+        got += @intCast(r);
+    }
+    try std.testing.expectEqual(response_len, got);
+    try std.testing.expectEqual(@as(usize, 1), s.count(.written));
+    try std.testing.expectEqual(@as(usize, 0), s.count(.expired) + s.count(.fail));
+    s.lp.stop.notify();
+    try s.finish();
+}
+
 test "a response whose write deadline ends before any next byte arrives closes once the canceled poll completed" {
     var s: Single = undefined;
     try s.init(64);
@@ -1260,20 +1320,20 @@ test "a response whose write deadline ends before any next byte arrives closes o
 }
 
 test "a send that fails while the poll beside it is in flight closes only after the poll's completion" {
+    // On a Unix-domain pair, so that a send parks before the client reads
+    // and stays parked until it does (on loopback TCP Linux's autotuned send
+    // buffer took the whole response with no send parked; item emb2ob).
     var s: Single = undefined;
-    try s.init(64);
+    try s.initOn(64, .unix);
     defer s.deinit();
     defer serve.testing = .{};
     respond_on_open = response_len;
-    const cl = socket(c.AF.INET, c.SOCK.STREAM, 0);
-    if (cl < 0) return error.Socket;
+    const cl = try s.listener.connect();
     defer _ = c.close(cl);
-    try setBuffer(cl, c.SO.RCVBUF);
-    if (c.connect(cl, @ptrCast(&s.listener.addr.tcp), @sizeOf(c.sockaddr.in)) != 0) return error.Connect;
     awaitReadable(s.listener.fd);
     try s.stepUntil(.open, 1);
     // The client reads nothing: the sends complete at once until the
-    // buffers fill, and the one that parks has the poll beside it.
+    // buffer fills, and the one that parks has the poll beside it.
     try stepUntilPolling(&s);
     const conn = s.lp.head.?;
     // From now on every completed send is reported as failed: once the
@@ -1315,10 +1375,8 @@ const max_reads = 1000;
 
 /// Until the kernel reports the server's socket `fd` writable, reads what
 /// reaches the client and adds it to `got`; it waits for whichever comes
-/// first, as loopback delivers the bytes and their acknowledgements
-/// asynchronously. The socket becomes writable with less room than one
-/// send asks for (`out_cap`, more than its 4096-byte buffer), so the parked
-/// send can complete, partially. The loop does not poll meanwhile.
+/// first. On the Unix-domain pairs that use it the room comes from these
+/// reads alone. The loop does not poll meanwhile.
 fn drainUntilWritable(cl: c.fd_t, fd: c.fd_t, got: *usize) !void {
     var buf: [65536]u8 = undefined;
     var reads: usize = 0;
@@ -1359,6 +1417,15 @@ fn sentFrom(s: *const Single, from: usize) !Event {
 /// remain. That completion keeps the write deadline's arm, with the due
 /// time it was armed with. Returns with the next send parked and its
 /// readiness poll beside it.
+///
+/// On a Unix-domain pair (the test's `initOn(.unix)`): its room is freed
+/// only by the client's reads, so the send stays parked until
+/// `drainUntilWritable`, and the next one parks again while the client does
+/// not read. That the completion is partial is not derived from a buffer
+/// size the kernel reports (macOS and Linux size it differently; item
+/// emb2ob): the `sent` event itself is checked to have written less than it
+/// was asked, with bytes left. The small send buffer `requestResponse` asks
+/// for is what made it partial in the runs on macOS and Linux.
 const PartialSend = struct { cl: c.fd_t, arm: *serve.Arm, due: @FieldType(ev.Timer, "deadline"), got: usize };
 
 fn partialSend(s: *Single) !PartialSend {
@@ -1371,20 +1438,12 @@ fn partialSend(s: *Single) !PartialSend {
     const arm = conn.arm.?;
     try std.testing.expectEqual(write_code, arm.kind);
     const due = arm.timer.deadline;
-    // A send writes at most the room in the server's send buffer, never
-    // more than the buffer holds: one smaller than the send asked for
-    // bounds every completion below `asked`, so the partial sends checked
-    // here are the kernel's, whatever room loopback frees meanwhile.
-    var sndbuf: c_int = 0;
-    var sndbuf_len: c.socklen_t = @sizeOf(c_int);
-    if (c.getsockopt(conn.fd, c.SOL.SOCKET, c.SO.SNDBUF, @ptrCast(&sndbuf), &sndbuf_len) != 0) return error.GetSockOpt;
-    // 8192: one send's most bytes (serve.zig's `out_cap`).
-    try std.testing.expect(@as(usize, @intCast(sndbuf)) < @min(response_len, 8192));
     var got: usize = 0;
     const from = s.n;
     try drainUntilWritable(cl, conn.fd, &got);
     try s.stepUntil(.sent, s.count(.sent) + 1);
     const e = try sentFrom(s, from);
+    // The positive event: this completion wrote part of what it asked.
     try std.testing.expect(e.n < e.asked);
     try std.testing.expect(e.left > 0);
     try std.testing.expect(conn.arm.? == arm);
@@ -1526,7 +1585,7 @@ fn expectExpiredWhileSending(s: *Single, cl: c.fd_t, got: usize) !void {
 
 test "a write deadline the loop runs before a ready send's completion closes, and what that send wrote is not reported" {
     var s: Single = undefined;
-    try s.init(64);
+    try s.initOn(64, .unix);
     defer s.deinit();
     var p = try partialSend(&s);
     defer _ = c.close(p.cl);
@@ -1553,7 +1612,7 @@ test "a write deadline the loop runs before a ready send's completion closes, an
 
 test "a partial send's completion the loop runs before a due write deadline is reported, keeps the arm, and that arm's expiry closes" {
     var s: Single = undefined;
-    try s.init(64);
+    try s.initOn(64, .unix);
     defer s.deinit();
     var p = try partialSend(&s);
     defer _ = c.close(p.cl);
@@ -1576,18 +1635,18 @@ test "a partial send's completion the loop runs before a due write deadline is r
     try std.testing.expect(!p.arm.retired);
     try std.testing.expectEqual(due_injected.?, p.arm.timer.deadline);
     try std.testing.expect(p.due.value != p.arm.timer.deadline.value);
+    // The partial completion took the room the client's reads freed, and
+    // the client reads no more: the next send parked (`spyOnSend` checks)
+    // and stays in the kernel until the expiry.
     try spyOnSend(conn);
+    try std.testing.expect(!writableNow(conn.fd));
     const sends = s.count(.sent);
     try s.stepUntil(.free, 1);
     try std.testing.expectEqual(sends, s.count(.sent));
     try expectExpiredWhileSending(&s, p.cl, p.got);
-    // The next send's fate is the kernel's: the client's read left room
-    // that the server's send buffer may keep draining into, so by the
-    // expiry's poll that send may have become ready and completed with
-    // what it wrote (the cancel then too late, as in the test above), or
-    // still be parked, and the expiry then asked to cancel it. Either way
-    // it was not reported, and the client got exactly its bytes and the
-    // reported ones (both checked above).
+    // The expiry asked to cancel that send; its one completion carried
+    // error.Canceled, unreported.
+    try std.testing.expect(spied.running_at_expiry and spied.canceled);
     s.lp.stop.notify();
     try s.finish();
 }
@@ -1601,17 +1660,18 @@ fn writableNow(fd: c.fd_t) bool {
 }
 
 test "a write deadline that ends while its send waits in the kernel cancels that send, which completes canceled to the closing connection" {
-    // The TCP tests above do not guarantee that a send stays in the kernel:
-    // loopback may keep freeing room in the server's send buffer after a
-    // send parks, so they allow either outcome of the expiry. A Unix-domain stream socket
+    // On loopback TCP a send need not stay in the kernel: loopback may keep
+    // freeing room in the server's send buffer after a send parks, so the
+    // TCP test of an expiry beside a parked send ("a response whose write
+    // deadline ends before any next byte arrives ...") allows either
+    // outcome. A Unix-domain stream socket
     // gains room only when its peer reads (XNU and Linux move the bytes
     // into the peer's receive buffer at the send and free the sender's
     // room only at the peer's read, or its close), and this client never
     // reads, so the parked send stays in the kernel until the expiry. The
     // pair is the listener's accepted end and its client, not a
     // socketpair(2): serve.zig takes connections only from its accept.
-    // Checked by runs on macOS (kqueue); Linux (epoll, io_uring) is not yet
-    // checked by a run there.
+    // Checked by runs on macOS (kqueue) and on Linux (epoll; item emb2ob).
     var s: Single = undefined;
     try s.initOn(64, .unix);
     defer s.deinit();
