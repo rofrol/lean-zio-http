@@ -6,3 +6,8 @@ Options:
 - A build option (for example `zig build test -Dcleanup-demo`) that adds a deliberately failing test and a deliberately leaking passing test, and a script step in `check.sh` that runs it and expects exactly those two reported, by name, with every other test passing. Cost: a build option, a script and a second test run in every gate.
 - Recheck by hand at each Zig update only, with a line in the Zig update procedure.
 - Leave it as is.
+
+Decided 2026-11-17 by the coordinating session with sol (consult call b0d6691f) under the user's delegation: a variant of (1). Commit the two demonstrations as negative controls behind one explicit command, outside ./check.sh.
+- A test that leaks deliberately but otherwise passes: assert the leak diagnostic naming that test and the runner's nonzero exit.
+- A test that fails deliberately with connections left open: assert the intended failure, that the drain finished, and that the tests after it ran without cascading failures.
+Check those specific outcomes, not merely that the command failed; a compile error must not count as success. The repository's procedure for a Zig update, and for any change to Single.deinit, requires running this command.
