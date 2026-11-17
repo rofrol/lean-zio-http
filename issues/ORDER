@@ -12,7 +12,6 @@ faahn4 Decide how to settle zio's undocumented setTimer from a timer's own callb
 6p6tu6 Find why pipelined requests cost the Lean server about 32 µs of CPU each and leave responses waiting over 5 s
 q2g4am Act on leanprover/lean4's answers to the Std.Http questions 16522 and 16523
 5f54l4 Should H1Adapter decode chunked request bodies, so HttpArena's baseline and limited-conn run with their whole request mix?
-2ltibq Run a clean D2 acceptance of the Lean HTTP server with the load generator on cores of its own
 
 ## Needs a decision
 
@@ -20,3 +19,4 @@ yvladm Decide whether per-loop PostgreSQL pools should share connections across 
 rtkla3 Whether a handler's synchronous PostgreSQL error chain needs a scheduling boundary
 kaslrv Run the worst-case memory scenario on Linux
 3pund6 Decide what follows from the classification of Linux pending-connection accept errnos (xihdtw)
+2ltibq Run a clean D2 acceptance of the Lean HTTP server with the load generator on cores of its own
