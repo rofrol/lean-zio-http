@@ -11,3 +11,5 @@ Options: accept the derived bound (698.5 KiB per connection, 2.73 GiB at 4,096) 
 
 Decided by the user 2026-11-17: ask upstream (leanprover/lean4) for maxPathSegments and maxQueryParams in H1.Config. No fork: upstream's comment at Parser.lean:268 states that tying them to maxUriLength is deliberate (the 414/400 reasoning), so under policy Rule 6 this is a feature request, not a bug. lgxdi7 drafts the text next to the mxzlsx question. This item posts it from the user's gh account and records the answer.
 Done by: the coordinating session
+
+Decided by the user 2026-11-17, while lgxdi7 ran: publish it. The coordinating session posts the draft on leanprover/lean4 from the user's gh account as soon as lgxdi7 has written it and the session has read it.
