@@ -17,6 +17,8 @@
    authentication, the extended-query messages libpq sends for pg.c's
    pipelines; it reads the client's messages up to the Sync and checks their
    types. */
+#define _GNU_SOURCE /* dladdr, on glibc */
+#include <dlfcn.h>
 #include <libpq-fe.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -974,6 +976,11 @@ static void libpq_versions(void) {
     for (size_t i = 0; i < sizeof no / sizeof no[0]; i++) CHECK(!libpq_supported(no[i]), "%d accepted", no[i]);
     for (size_t i = 0; i < sizeof yes / sizeof yes[0]; i++) CHECK(libpq_supported(yes[i]), "%d refused", yes[i]);
     CHECK(ekk_pg_libpq_supported(), "the libpq this test links (%d) is refused", PQlibVersion());
+    /* Which libpq the process loaded, for libpq-lines.sh (and the log of
+       check.sh): the file that defines PQlibVersion, and its version. */
+    Dl_info d;
+    CHECK(dladdr((void *)PQlibVersion, &d) != 0 && d.dli_fname != NULL, "dladdr(PQlibVersion) failed");
+    printf("pg_glue_test: libpq %d loaded from %s\n", PQlibVersion(), d.dli_fname);
 }
 
 int main(void) {

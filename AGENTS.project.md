@@ -62,3 +62,11 @@ measurements; `./bench.sh` runs it first. `lsrv-bench` only measures; the
 correctness of what it measures is checked in `lsrv-test` (item 6zs4mr). Use `./check.sh` while editing;
 the whole `./bench.sh` stays every item's gate before it ends (decided
 2026-11-17, item cxhvkb).
+
+`./libpq-lines.sh PGSRC` (README, "Running") runs `zig build test` against
+the lowest supported and the newest release of every supported libpq line,
+not only the one `pg_config` names. Run it for every change to the
+PostgreSQL glue (`zig/src/pg.c`, `zig/src/pg_glue_test.c`) and at each
+update of libpq; it is not part of every item's gate (decided 2026-11-17,
+item oruxe4; whether it joins the gate is a later decision on its measured
+time and disk use).

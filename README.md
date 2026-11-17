@@ -637,6 +637,21 @@ integrating a change (item cxhvkb). Both scripts share their helpers and the
 private cluster's setup through `bench/lib.sh`; `bench.sh` measures on a
 fresh cluster after `check.sh`'s has been removed.
 
+`check.sh` runs `zig build test` against the one libpq `pg_config` names.
+`./libpq-lines.sh PGSRC` runs it against every libpq line the pool supports
+("Modules", `zig/`: 14.6, 15.1, or 16 and later): the lowest supported release
+and the newest release of each line from 14 up, built from the release tags
+of `PGSRC`, a git checkout of PostgreSQL
+(`git clone https://git.postgresql.org/git/postgresql.git`), into a cache
+outside the repository (`$LIBPQ_CACHE`, default
+`~/.cache/lean-zio-http/libpq`). It checks that each run loaded the libpq it
+built (`pg_glue_test` prints the file and the version it loaded) and prints
+one line per release. It is opt-in, not part of `check.sh` (item oruxe4):
+run it for every change to the PostgreSQL glue and at libpq updates. On
+the M1 (2026-11-17, 10 releases from 14.6 to 18.7) the first run, building
+every libpq, took 269 s, and a run on a warm cache 5 s; the cache holds
+81 MB, the checkout 596 MB.
+
 `bench/boundary` starts the fixture server (`lsrv-fixture`, and
 `lsrv-fixture-hand` with `-no-continue`) with the test settings and checks:
 exact 60,001-byte responses through 7-byte operations, split and pipelined
