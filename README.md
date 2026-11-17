@@ -271,7 +271,10 @@ else meanwhile; the loop serves its other connections (`Conn.step_query`,
   its SQLSTATE, or a pool error: `08006` when the connection could not be
   made or was lost (also for a query in flight when the server restarts),
   `54000` for a query that cannot be sent (a NUL byte, more than 65,535
-  parameters) or a result over `Query.maxResultBytes` (1 MiB of text). A
+  parameters) or a result over `Query.maxResultBytes` (1 MiB, charged
+  before the result is built for every object of its Lean value: each row
+  and field, `NULL` and empty ones included, and each string with its
+  header). A
   query is never retried: once it may have reached the server, a lost
   connection fails it, and its outcome is unknown (a write may have been
   committed); the next query opens a fresh connection. Likewise a process
@@ -400,7 +403,9 @@ action constructors, tens of bytes each):
 - while waiting for a query: the connection and an exact buffer of under
   8,192 bytes, plus the `Server.Query` and continuation the handler built
   (bounded by what it builds), and while the continuation turns it into the
-  answer a result of at most `Query.maxResultBytes` of text.
+  answer a result whose Lean value costs at most `Query.maxResultBytes`
+  (counted with object headers; libpq's copy of it, freed once the value is
+  built, comes on top).
 
 These count the arrays the connection's state holds; a copy of buffer bytes
 that the adapter keeps is the adapter's (below). Allocations made and

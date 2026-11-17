@@ -504,8 +504,189 @@ static void cut(enum piece how) {
     fake_close(&f);
 }
 
+/* ---- what a result costs (pg.c, result_fits) ----
+   Results made with libpq's own PGresult builders, no server needed. */
+
+/* A PGresult of `nf` (at most 4) text columns named `cols` and `nt` rows whose field (t, f) is value(t, f, &len): NULL for
+   SQL NULL. */
+typedef const char *(*value_fn)(int t, int f, int *len);
+static PGresult *made(int nf, const char *const *cols, int nt, value_fn value) {
+    PGresult *r = PQmakeEmptyPGresult(NULL, PGRES_TUPLES_OK);
+    CHECK(r != NULL, "PQmakeEmptyPGresult");
+    PGresAttDesc d[4] = {0};
+    for (int f = 0; f < nf; f++) {
+        d[f].name = (char *)cols[f];
+        d[f].typid = 25;
+        d[f].typlen = -1;
+        d[f].atttypmod = -1;
+    }
+    CHECK(PQsetResultAttrs(r, nf, d), "PQsetResultAttrs");
+    for (int t = 0; t < nt; t++)
+        for (int f = 0; f < nf; f++) {
+            int len = -1;
+            const char *v = value(t, f, &len);
+            CHECK(PQsetvalue(r, t, f, (char *)v, v ? len : -1), "PQsetvalue");
+        }
+    return r;
+}
+
+/* What the Lean value rows_of built costs by the same measure as
+   result_fits, from the sizes its objects have (capacities included). */
+static size_t built_cost(lean_object *res) {
+    size_t total = object_cost(sizeof(lean_ctor_object), 2);
+    lean_object *cols = lean_ctor_get(res, 0), *rows = lean_ctor_get(res, 1);
+    total += object_cost(sizeof(lean_array_object), lean_array_capacity(cols));
+    for (size_t f = 0; f < lean_array_size(cols); f++)
+        total += object_cost(lean_string_byte_size(lean_array_get_core(cols, f)), 0);
+    total += object_cost(sizeof(lean_array_object), lean_array_capacity(rows));
+    for (size_t t = 0; t < lean_array_size(rows); t++) {
+        lean_object *row = lean_array_get_core(rows, t);
+        total += object_cost(sizeof(lean_array_object), lean_array_capacity(row));
+        for (size_t f = 0; f < lean_array_size(row); f++) {
+            lean_object *v = lean_array_get_core(row, f);
+            if (lean_is_scalar(v)) continue;
+            total += object_cost(sizeof(lean_ctor_object), 1) + object_cost(lean_string_byte_size(lean_ctor_get(v, 0)), 0);
+        }
+    }
+    return total;
+}
+
+static const char *null_value(int t, int f, int *len) { (void)t; (void)f; (void)len; return NULL; }
+static const char *empty_value(int t, int f, int *len) { (void)t; (void)f; *len = 0; return ""; }
+/* Four bytes, each an invalid sequence of its own (no lead byte that
+   consumes continuation bytes): four U+FFFD, three bytes each, as
+   charged. */
+static const char *invalid_value(int t, int f, int *len) { (void)t; (void)f; *len = 4; return "\xff\xfe\xff\xfe"; }
+
+static void expect_rows_count(lean_object *r, size_t n) {
+    CHECK(r != NULL && lean_ptr_tag(r) == 0, "expected rows, got %s: %s", r ? lean_string_cstr(lean_ctor_get(r, 0)) : "nothing",
+          r ? lean_string_cstr(lean_ctor_get(r, 1)) : "");
+    CHECK(lean_array_size(lean_ctor_get(r, 1)) == n, "%zu rows, expected %zu", lean_array_size(lean_ctor_get(r, 1)), n);
+    lean_dec(r);
+}
+
+/* One of each kind of value, by row: NULL, empty, ASCII, multibyte UTF-8,
+   invalid bytes (an overlong form among them), a truncated sequence, and
+   valid text around an encoded surrogate. */
+static const char *mixed[] = {NULL, "", "hello", "za\xc5\xbc\xc3\xb3\xc5\x82\xc4\x87 \xf0\x9f\x98\x80",
+                              "\xff\xfe\xc0\x80", "\xe2\x82", "a\xed\xa0\x80z"};
+#define MIXED_ROWS (int)(sizeof mixed / sizeof mixed[0])
+static const char *mixed_value(int t, int f, int *len) {
+    const char *v = mixed[(t + f) % MIXED_ROWS];
+    if (v) *len = (int)strlen(v);
+    return v;
+}
+
+/* utf8_valid agrees with the Lean runtime: a string Lean keeps byte for
+   byte is valid, one it changes is not. Every sequence of up to two bytes,
+   every three-byte one led by a multibyte lead, and four-byte edge cases. */
+static int lean_keeps(const unsigned char *s, size_t n) {
+    lean_object *o = lean_mk_string_from_bytes((const char *)s, n);
+    int same = lean_string_size(o) == n + 1 && memcmp(lean_string_cstr(o), s, n) == 0;
+    lean_dec(o);
+    return same;
+}
+
+static void utf8_agrees(void) {
+    current = "utf8_valid agrees with lean_mk_string_from_bytes";
+    unsigned char s[4];
+    for (unsigned a = 0; a < 256; a++) {
+        s[0] = (unsigned char)a;
+        CHECK(utf8_valid(s, 1) == lean_keeps(s, 1), "%02x", a);
+        for (unsigned b = 0; b < 256; b++) {
+            s[1] = (unsigned char)b;
+            CHECK(utf8_valid(s, 2) == lean_keeps(s, 2), "%02x %02x", a, b);
+            if (a < 0xe0 || a > 0xf7) continue;
+            for (unsigned c = 0; c < 256; c++) {
+                s[2] = (unsigned char)c;
+                CHECK(utf8_valid(s, 3) == lean_keeps(s, 3), "%02x %02x %02x", a, b, c);
+            }
+        }
+    }
+    const char *four[] = {"\xf0\x9f\x98\x80", "\xf0\x8f\xbf\xbf", "\xf4\x8f\xbf\xbf", "\xf4\x90\x80\x80",
+                          "\xf5\x80\x80\x80", "\xf0\x9f\x98\x41", "\xf0\x9f\x98"};
+    for (size_t i = 0; i < sizeof four / sizeof four[0]; i++) {
+        size_t n = strlen(four[i]);
+        CHECK(utf8_valid((const unsigned char *)four[i], n) == lean_keeps((const unsigned char *)four[i], n), "four[%zu]", i);
+    }
+}
+
+/* The charge saturates instead of wrapping. */
+static void cost_overflow(void) {
+    current = "result cost: overflow";
+    size_t t = 0;
+    CHECK(charge(&t, 100, 100) && t == 100, "a charge up to the limit refused");
+    CHECK(!charge(&t, 1, 100), "a charge past the limit accepted");
+    t = 1;
+    CHECK(!charge(&t, SIZE_MAX, SIZE_MAX - 1), "a wrapping charge accepted");
+    CHECK(object_cost(0, SIZE_MAX) == SIZE_MAX, "words overflow");
+    CHECK(object_cost(SIZE_MAX / 8 * 8, 0) == SIZE_MAX, "rounding overflows");
+    CHECK(object_cost(sizeof(lean_array_object), SIZE_MAX / 8) == SIZE_MAX, "header overflows");
+    CHECK(string_cost(SIZE_MAX / 3 + 1, 0) == SIZE_MAX, "replacement overflows");
+    CHECK(string_cost(SIZE_MAX - sizeof(lean_string_object), 1) == SIZE_MAX, "string header overflows");
+    CHECK(object_cost(sizeof(lean_array_object), 1) == 40 && string_cost(1, 1) == 48 && string_cost(1, 0) == 48
+              && string_cost(4, 0) == 56,
+          "an object's cost: header, rounding to 8, one word");
+}
+
+/* A result is accepted exactly up to its cost, which is what its Lean value
+   costs (more for invalid UTF-8), and refused below it; NULL and empty
+   values cost their slots. */
+static void cost_bound(void) {
+    const char *cols[] = {"a", "column b"};
+
+    current = "result cost: exact bound, valid UTF-8";
+    PGresult *r = made(2, cols, 3, mixed_value);
+    lean_object *res = rows_within(r, SIZE_MAX - 1);
+    CHECK(lean_ptr_tag(res) == 0, "refused without a limit");
+    size_t c = built_cost(res);
+    lean_dec(res);
+    /* Mixed values 0 to 3 (NULL, empty, ASCII, multibyte): all valid, so
+       charged as built. */
+    expect_rows_count(rows_within(r, c), 3);
+    expect_error(rows_within(r, c - 1), "54000");
+    PQclear(r);
+
+    current = "result cost: invalid UTF-8 charged at least as built";
+    r = made(2, cols, 3 * MIXED_ROWS, mixed_value);
+    res = rows_within(r, SIZE_MAX - 1);
+    c = built_cost(res);
+    lean_dec(res);
+    expect_error(rows_within(r, c - 1), "54000");
+    PQclear(r);
+
+    current = "result cost: each invalid byte replaced, charged as built";
+    r = made(1, cols, 1, invalid_value);
+    res = rows_within(r, SIZE_MAX - 1);
+    c = built_cost(res);
+    lean_dec(res);
+    expect_rows_count(rows_within(r, c), 1);
+    expect_error(rows_within(r, c - 1), "54000");
+    PQclear(r);
+
+    /* At Query.maxResultBytes, 22,000 rows of one NULL (40 bytes each and a
+       slot of the row array) or of one empty string (also its `some` and
+       its string) are over the bound, though they hold no text. */
+    current = "result cost: many NULLs over Query.maxResultBytes";
+    r = made(1, cols, 22000, null_value);
+    expect_error(rows_of(r), "54000");
+    PQclear(r);
+    current = "result cost: many empty strings over Query.maxResultBytes";
+    r = made(1, cols, 22000, empty_value);
+    expect_error(rows_of(r), "54000");
+    PQclear(r);
+    current = "result cost: many NULLs within Query.maxResultBytes";
+    r = made(1, cols, 21000, null_value);
+    expect_rows_count(rows_of(r), 21000);
+    PQclear(r);
+}
+
 int main(void) {
     lean_initialize_runtime_module();
+    utf8_agrees();
+    cost_overflow();
+    cost_bound();
+    printf("pg_glue_test: result cost: ok\n");
     for (enum piece how = WHOLE; how <= BYTE; how++) {
         usable_session(how);
         stale_statements(how);

@@ -41,8 +41,16 @@ inductive Query.Result where
   | error (sqlstate : String) (message : String)
   deriving Inhabited
 
-/-- Most bytes of text (field values and column names) a result may hold;
-a larger one becomes `error "54000"`. -/
+/-- Most bytes the Lean value of a `rows` result may cost, a larger one
+becomes `error "54000"`. The pool charges it before building it, as a
+conservative count of the objects it would allocate: the result, each column
+name, each row (one slot per field, so a `NULL` or empty value costs its slot)
+and each value's `some` and string, with each object's header and rounding,
+and invalid UTF-8 charged three times for its replacement characters. So the
+row and field counts are bounded too: a result of one column of `NULL`s holds
+fewer than 22,000 rows. This is a budget for the result, not a ceiling on the
+process's memory: libpq's own copy of the result and the allocator's overhead
+come on top. -/
 def Query.maxResultBytes : Nat := 1048576
 
 /-- An answer that may wait for queries: `done a`, or `query q k`, which runs

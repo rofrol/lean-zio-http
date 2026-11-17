@@ -171,15 +171,110 @@ int ekk_pg_consume(ekk_pg *p) {
     return PQconsumeInput(p->c) && PQstatus(p->c) == CONNECTION_OK;
 }
 
-/* A PGresult with rows as Result.rows, or Result.error when its text exceeds
-   EKK_MAX_RESULT_BYTES. */
-static lean_object *rows_of(PGresult *r) {
+/* ---- What a result costs (Query.maxResultBytes) ----
+   rows_of charges, before it allocates anything, every Lean object it would
+   build: the Result, the column array and each column name, the row array,
+   each row's array (one slot per field, so a NULL or empty value costs its
+   slot), and for each non-NULL value its `some` and its string. Each object
+   costs what lean_alloc_object or lean_alloc_ctor asks for, rounded up to
+   LEAN_OBJECT_SIZE_DELTA, plus one word for the size a big object's
+   allocation keeps before it (lean.h). The arithmetic saturates at SIZE_MAX,
+   which no limit reaches. This bounds the result it hands to Lean, not the
+   PGresult libpq built before (qsqb5f), nor the allocator's own overhead. */
+
+/* Adds `n` to *total: 0 once the sum exceeds `limit` (or overflows). */
+static int charge(size_t *total, size_t n, size_t limit) {
+    return !__builtin_add_overflow(*total, n, total) && *total <= limit;
+}
+
+/* What an object of `fixed` bytes and `n` words more costs; SIZE_MAX on
+   overflow. */
+static size_t object_cost(size_t fixed, size_t n) {
+    size_t sz;
+    if (__builtin_mul_overflow(n, sizeof(void *), &sz) || __builtin_add_overflow(sz, fixed, &sz)
+        || __builtin_add_overflow(sz, LEAN_OBJECT_SIZE_DELTA - 1 + sizeof(size_t), &sz))
+        return SIZE_MAX;
+    return sz / LEAN_OBJECT_SIZE_DELTA * LEAN_OBJECT_SIZE_DELTA;
+}
+
+/* Whether s[0..n) is UTF-8 as RFC 3629 defines it, as Lean's runtime
+   checks it (validate_utf8_one in src/runtime/utf8.cpp): no overlong forms,
+   no surrogates, nothing above U+10FFFF. */
+static int utf8_valid(const unsigned char *s, size_t n) {
+    size_t i = 0;
+    while (i < n) {
+        unsigned c = s[i];
+        size_t k;
+        unsigned v, min;
+        if (c < 0x80) { i++; continue; }
+        if ((c & 0xe0) == 0xc0) { k = 1; v = c & 0x1f; min = 0x80; }
+        else if ((c & 0xf0) == 0xe0) { k = 2; v = c & 0x0f; min = 0x800; }
+        else if ((c & 0xf8) == 0xf0) { k = 3; v = c & 0x07; min = 0x10000; }
+        else return 0;
+        if (n - i <= k) return 0;
+        for (size_t j = 1; j <= k; j++) {
+            if ((s[i + j] & 0xc0) != 0x80) return 0;
+            v = v << 6 | (s[i + j] & 0x3f);
+        }
+        if (v < min || v > 0x10FFFF || (v >= 0xD800 && v <= 0xDFFF)) return 0;
+        i += k + 1;
+    }
+    return 1;
+}
+
+/* What the Lean string of `n` bytes, `valid` UTF-8 or not, costs.
+   lean_mk_string_from_bytes keeps valid UTF-8 as it is and replaces each
+   invalid sequence, at least one byte, with U+FFFD, three bytes
+   (lean_mk_string_lossy_recover in src/runtime/object.cpp), so invalid
+   bytes are charged three times; the string adds its NUL. */
+static size_t string_cost(size_t n, int valid) {
+    size_t bytes;
+    if (!valid && __builtin_mul_overflow(n, 3, &n)) return SIZE_MAX;
+    if (__builtin_add_overflow(n, sizeof(lean_string_object) + 1, &bytes)) return SIZE_MAX;
+    return object_cost(bytes, 0);
+}
+
+/* Charges the Lean string of s[0..n). Its least cost is charged first, so
+   the bytes are checked only when they fit: the work stays proportional
+   to the limit too. */
+static int charge_text(size_t *total, const char *s, size_t n, size_t limit) {
+    size_t least = *total;
+    if (!charge(&least, string_cost(n, 1), limit)) return 0;
+    return charge(total, string_cost(n, utf8_valid((const unsigned char *)s, n)), limit);
+}
+
+/* Whether the Result rows_of builds from `r` costs at most `limit` bytes
+   (less than SIZE_MAX). */
+static int result_fits(PGresult *r, size_t limit) {
     int nf = PQnfields(r), nt = PQntuples(r);
     size_t total = 0;
-    for (int f = 0; f < nf; f++) total += strlen(PQfname(r, f));
-    for (int t = 0; t < nt && total <= EKK_MAX_RESULT_BYTES; t++)
-        for (int f = 0; f < nf; f++) total += (size_t)PQgetlength(r, t, f);
-    if (total > EKK_MAX_RESULT_BYTES) return ekk_pg_error("54000", "the result exceeds Query.maxResultBytes");
+    if (!charge(&total, object_cost(sizeof(lean_ctor_object), 2), limit)
+        || !charge(&total, object_cost(sizeof(lean_array_object), (size_t)nf), limit)
+        || !charge(&total, object_cost(sizeof(lean_array_object), (size_t)nt), limit))
+        return 0;
+    for (int f = 0; f < nf; f++) {
+        const char *name = PQfname(r, f);
+        size_t n = strnlen(name, limit + 1);
+        if (n > limit || !charge_text(&total, name, n, limit)) return 0;
+    }
+    size_t row = object_cost(sizeof(lean_array_object), (size_t)nf), some = object_cost(sizeof(lean_ctor_object), 1);
+    for (int t = 0; t < nt; t++) {
+        if (!charge(&total, row, limit)) return 0;
+        for (int f = 0; f < nf; f++) {
+            if (PQgetisnull(r, t, f)) continue;
+            if (!charge(&total, some, limit)
+                || !charge_text(&total, PQgetvalue(r, t, f), (size_t)PQgetlength(r, t, f), limit))
+                return 0;
+        }
+    }
+    return 1;
+}
+
+/* A PGresult with rows as Result.rows, or Result.error when that would cost
+   more than `limit` bytes (result_fits). */
+static lean_object *rows_within(PGresult *r, size_t limit) {
+    if (!result_fits(r, limit)) return ekk_pg_error("54000", "the result exceeds Query.maxResultBytes");
+    int nf = PQnfields(r), nt = PQntuples(r);
     lean_object *cols = lean_alloc_array(0, nf);
     for (int f = 0; f < nf; f++) cols = lean_array_push(cols, lean_mk_string(PQfname(r, f)));
     lean_object *rows = lean_alloc_array(0, nt);
@@ -202,6 +297,8 @@ static lean_object *rows_of(PGresult *r) {
     lean_ctor_set(res, 1, rows);
     return res;
 }
+
+static lean_object *rows_of(PGresult *r) { return rows_within(r, EKK_MAX_RESULT_BYTES); }
 
 /* Forgets cache entry k, keeping the others in order. */
 static void forget(ekk_pg *p, int k) {
