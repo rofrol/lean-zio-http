@@ -1,6 +1,5 @@
 ## Next, in order
 
-im7c5q Should dusty-hello give dusty the real zio module instead of its stub?
 zg4hrz Pin the Linux validation container's base image and packages
 rqc3ql Install bc in the Linux validation image, so bench.sh reports CPU per request there
 qgrnr3 Backend-independent tests of the transport's completion, cancel and expiry orderings
