@@ -7,3 +7,5 @@ Question: should the scenario read the queues on Linux too? Options: /proc/net/t
 Recommendation (consult round 20261116-183449-f682, sol, under the user's delegation of 2026-11-16): decide with 53rwgc; leave /proc/net/tcp against ss open until namespace visibility and attribution to the server's sockets are established on a Linux machine.
 Question: Should the scenario read the socket queues on Linux too, once a Linux machine is available?
 Options: yes, decided with 53rwgc | leave macOS only
+
+Checked 2026-11-17 with sol (consult round 20261117-011832-74e7) under the user's delegation: deferred until an authorized Linux machine (53rwgc) and evidence of socket attribution and namespace visibility; then choose /proc/net/tcp or ss.
