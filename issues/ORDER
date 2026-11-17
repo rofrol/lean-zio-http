@@ -1,6 +1,5 @@
 ## Next, in order
 
-p5pyti The servers exit silently when their port is taken, and the checks share 127.0.0.1:8083 with ekklesiai.org's
 6zs4mr check.sh still takes about nine minutes: lsrv-bench, not the load measurements, holds most of it
 i35sos Invalidate the per-connection statement cache after a schema change
 i2rh6f Behavior of the PostgreSQL pool while the database is down
@@ -11,6 +10,8 @@ sy3ims Decide whether to report upstream that Std.Http's H1 reparses an unfinish
 u4moqo Move the toolchain to the first nightly with lean4 PR 16417 (Std.Http RFC fixes)
 
 ## Proposed
+
+qucxyv lsrv-bench prints nothing for over five minutes, so every ./check.sh run trips rr2's quiet wake
 
 ## Needs a decision
 
