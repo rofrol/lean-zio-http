@@ -1,6 +1,5 @@
 ## Next, in order
 
-5lkloz Test a connection whose close completes before a retired timer's callback
 ub3d5m Make a failed transport test leave no state that fails the tests after it
 se4hhx Should a transport test force a send that stays in the kernel when its write deadline expires?
 ycpzlt Should Server.Query carry a structured "outcome unknown" signal for a query the server abandoned?
