@@ -13,3 +13,5 @@ socket buffer, then force (a) the expiry before a send completion that is
 ready and (b) a send completion run before a due expiry, as the receive
 tests do (`dueNow` after the socket is writable/readable), and check that a
 partial send keeps the arm (same pointer and `timer.deadline`).
+
+Decided 2026-11-17 by the coordinating session with sol (consult round 20261117-101429-40ca), under the user's delegation: approved, both orders. Extend the fake so it requests sends and acknowledges their completions. Show a real partial-send completion and the outstanding remainder through observable hooks; payload size alone proves neither. Force expiry before completion and completion before expiry. Check that partial progress leaves the arm's identity and the absolute deadline unchanged, that expiry cancels the send, that no ekk_sent comes after the close, and that cleanup happens exactly once. Use explicit dispatch barriers and controlled due-state injection, never elapsed-time races.
