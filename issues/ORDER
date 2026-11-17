@@ -5,8 +5,8 @@ daaqgn Keep the H1 parser's state across receives instead of reparsing the whole
 i35sos Invalidate the per-connection statement cache after a schema change
 i2rh6f Behavior of the PostgreSQL pool while the database is down
 es53kx Bound the capacity of connection buffers or qualify the memory claim
-u4moqo Move the toolchain to the first nightly with lean4 PR 16417 (Std.Http RFC fixes)
 tc5rsx Bound the memory of a PostgreSQL result before it is fully received
+u4moqo Move the toolchain to the first nightly with lean4 PR 16417 (Std.Http RFC fixes)
 
 ## Proposed
 
