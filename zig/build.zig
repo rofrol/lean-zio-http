@@ -66,6 +66,14 @@ pub fn build(b: *std.Build) void {
     }
     glue_mod.linkSystemLibrary("leanshared", .{});
     glue_mod.linkSystemLibrary("pq", .{});
+    // pg_glue_test.c calls dladdr, which glibc before 2.34 has only in libdl.
+    // No `-ldl` is needed here: for every glibc target Zig (0.17.1) links
+    // libdl itself, from its own glibc stubs below 2.34 (src/libs/glibc.zig,
+    // `libs`) or, from the host's glibc, as part of libcFullLinkFlags
+    // (src/target.zig); and linkSystemLibrary("dl") on a GNU ABI only sets
+    // link_libc (std.zig.target.isLibCLibName). A cross-link for
+    // aarch64-linux-gnu.2.26 and x86_64-linux-gnu.2.26 (stub libpq and Lean
+    // libraries) needs dladdr from libdl.so.2. Recheck at a Zig update.
     const glue_tests = b.addExecutable(.{ .name = "pg_glue_test", .root_module = glue_mod });
     test_step.dependOn(&b.addRunArtifact(glue_tests).step);
 }
