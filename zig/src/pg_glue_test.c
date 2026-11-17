@@ -158,6 +158,25 @@ static size_t take_input(fake *f, uint8_t *buf, size_t cap) {
     return n;
 }
 
+/* The startup options every session of these tests is started with, as
+   ekk_pg_options makes them, and the value its startup packet carried. */
+static char *start_options;
+static char sent_options[256];
+
+/* The value of `key` in the startup packet `in` (`len` bytes), or NULL. */
+static const char *startup_param(const uint8_t *in, size_t len, const char *key) {
+    size_t at = 8;
+    while (at < len && in[at] != 0) {
+        const char *k = (const char *)in + at;
+        at += strlen(k) + 1;
+        if (at >= len) return NULL;
+        const char *v = (const char *)in + at;
+        at += strlen(v) + 1;
+        if (strcmp(k, key) == 0) return v;
+    }
+    return NULL;
+}
+
 /* Connects a session to the fake: pg.zig's connect steps, with the fake's
    steps in between. The fake accepts, reads the startup packet (protocol
    3.0) and answers AuthenticationOk, the parameters, BackendKeyData and
@@ -165,7 +184,7 @@ static size_t take_input(fake *f, uint8_t *buf, size_t cap) {
 static ekk_pg *connect_fake(fake *f) {
     char conninfo[256];
     snprintf(conninfo, sizeof conninfo, "host=%s port=5432 user=fake dbname=fake sslmode=disable gssencmode=disable", f->dir);
-    ekk_pg *p = ekk_pg_start(conninfo);
+    ekk_pg *p = ekk_pg_start(conninfo, start_options);
     CHECK(p != NULL, "ekk_pg_start");
     uint8_t in[1024];
     size_t got = 0;
@@ -189,6 +208,9 @@ static ekk_pg *connect_fake(fake *f) {
         if (got < len) continue;
         uint32_t version = (uint32_t)in[4] << 24 | in[5] << 16 | in[6] << 8 | in[7];
         CHECK(version == 196608, "startup asks for protocol %u.%u, the fake speaks 3.0", version >> 16, version & 0xffff);
+        const char *opt = startup_param(in, len, "options");
+        CHECK(opt != NULL && strlen(opt) < sizeof sent_options, "the startup packet carries no options");
+        strcpy(sent_options, opt);
         msgs m = {0};
         size_t a = begin(&m, 'R'); put32(&m, 0); end(&m, a);
         const char *params[][2] = {{"client_encoding", "UTF8"}, {"server_version", "18.0"},
@@ -233,9 +255,10 @@ static lean_object *query(const char *sql, const char *param) {
         lean_ctor_set(some, 0, lean_mk_string(param));
         params = lean_array_push(params, some);
     }
-    lean_object *q = lean_alloc_ctor(0, 2, 0);
+    lean_object *q = lean_alloc_ctor(0, 3, 0);
     lean_ctor_set(q, 0, lean_mk_string(sql));
     lean_ctor_set(q, 1, params);
+    lean_ctor_set(q, 2, lean_box(0)); /* timeoutMs: none */
     return q;
 }
 
@@ -590,8 +613,9 @@ static void unsendable(void) {
     fake_close(&f);
 }
 
-/* The server's connection ends in the middle of a reply: the query fails
-   with 08006, through consume (pg.zig's `lost`) or collect. */
+/* The server's connection ends in the middle of a reply, after the query
+   was handed to libpq: the query is abandoned with 08006, through consume
+   (pg.zig's `lost`, ekk_pg_lost_sent) or collect. */
 static void cut(enum piece how) {
     current = "connection lost mid-reply";
     fake f;
@@ -609,12 +633,67 @@ static void cut(enum piece how) {
     f.conn = -1;
     if (ekk_pg_consume(p) == 1) {
         CHECK(ekk_pg_collect(p, &acc) == -1, "a lost connection not reported");
-        expect_error(acc, "08006");
-    } else if (acc) {
-        lean_dec(acc);
+        expect_abandoned(acc, "08006");
+    } else {
+        if (acc) lean_dec(acc);
+        expect_abandoned(ekk_pg_lost_sent(p), "08006");
     }
     ekk_pg_finish(p);
     fake_close(&f);
+}
+
+/* The server's connection ended before the next query: once libpq has seen
+   the EOF, the query is refused before anything of it is handed to libpq
+   (ekk_pg_send 3), so it is proven never sent: error 08006. */
+static void lost_before_send(void) {
+    current = "connection lost before the query";
+    fake f;
+    fake_open(&f);
+    ekk_pg *p = connect_fake(&f);
+    close(f.conn);
+    f.conn = -1;
+    CHECK(ekk_pg_consume(p) == 0, "the EOF was not seen");
+    lean_object *err = NULL;
+    CHECK(ekk_pg_send(p, query(SQL_A, "1"), &err) == 3, "a query on a failed connection was handed to libpq");
+    CHECK(err == NULL, "ekk_pg_send 3 made an error");
+    expect_error(ekk_pg_lost(p), "08006");
+    ekk_pg_finish(p);
+    fake_close(&f);
+}
+
+/* ekk_pg_options: statement_timeout after the conninfo's own options (or
+   PGOPTIONS), and no options at all for a service, whose file this explicit
+   value would replace, or for options ending in an unpaired backslash. */
+static void startup_options(void) {
+    current = "startup options";
+    struct { const char *conninfo, *env, *want; int rc; } cases[] = {
+        {"host=/tmp dbname=x", NULL, "-c statement_timeout=%u", 0},
+        {"host=/tmp options='-c search_path=s'", NULL, "-c search_path=s -c statement_timeout=%u", 0},
+        {"host=/tmp", "-c work_mem=64kB", "-c work_mem=64kB -c statement_timeout=%u", 0},
+        {"host=/tmp options='-c a.b=c'", "-c work_mem=64kB", "-c a.b=c -c statement_timeout=%u", 0},
+        {"postgresql:///x?options=-c%20d.e%3Df", NULL, "-c d.e=f -c statement_timeout=%u", 0},
+        {"service=svc", NULL, NULL, 1},
+        {"host=/tmp options='-c a=b\\\\'", NULL, NULL, 3},
+        {"host=/tmp options='-c a=b\\\\\\\\'", NULL, "-c a=b\\\\ -c statement_timeout=%u", 0},
+        {"host=/tmp", "-c a=b\\", NULL, 3},
+    };
+    unsigned ms = 1234;
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        if (cases[i].env) setenv("PGOPTIONS", cases[i].env, 1); else unsetenv("PGOPTIONS");
+        char *out = NULL;
+        int rc = ekk_pg_options(cases[i].conninfo, ms, &out);
+        CHECK(rc == cases[i].rc, "%s: rc %d", cases[i].conninfo, rc);
+        if (rc != 0) continue;
+        char want[128];
+        snprintf(want, sizeof want, cases[i].want, ms);
+        CHECK(strcmp(out, want) == 0, "%s: options \"%s\", want \"%s\"", cases[i].conninfo, out, want);
+        free(out);
+    }
+    unsetenv("PGOPTIONS");
+    setenv("PGSERVICE", "svc", 1);
+    char *out = NULL;
+    CHECK(ekk_pg_options("host=/tmp", ms, &out) == 1, "PGSERVICE not refused");
+    unsetenv("PGSERVICE");
 }
 
 /* ---- what a result costs (pg.c, result_fits) ----
@@ -1030,8 +1109,14 @@ int main(void) {
     cost_overflow();
     cost_bound();
     printf("pg_glue_test: result cost: ok\n");
+    startup_options();
+    CHECK(ekk_pg_options("", 4321, &start_options) == 0, "ekk_pg_options");
+    printf("pg_glue_test: startup options: ok\n");
     unsendable();
+    CHECK(strcmp(sent_options, start_options) == 0, "the startup packet carried options \"%s\", not \"%s\"", sent_options, start_options);
     printf("pg_glue_test: unsendable queries: ok\n");
+    lost_before_send();
+    printf("pg_glue_test: a connection lost before the query: ok\n");
     for (enum piece how = WHOLE; how <= BYTE; how++) {
         usable_session(how);
         stale_statements(how);

@@ -100,10 +100,13 @@ only `Server.Query` values.
   mode reset after each pipelined query); a server with `--pg` exits with
   status 1 at startup when the libpq it runs is older.
 - Command line: `lsrv [THREADS] [--port N] [--max-conns N] [--pg CONNINFO]
-  [--pg-conns N] [--idle-ms N] [--head-ms N] [--body-ms N] [--write-ms N]`
-  (`--pg-conns`, default 4, is per loop; without `--pg` no pool is made and
-  every query fails with `08006`; the four budgets, in milliseconds, are in
-  "Deadlines" below), then the test settings:
+  [--pg-conns N] [--idle-ms N] [--head-ms N] [--body-ms N] [--write-ms N]
+  [--pg-query-ms N] [--pg-query-max-ms N] [--pg-connect-ms N]
+  [--pg-statement-ms N]` (`--pg-conns`, default 4, is per loop; without
+  `--pg` no pool is made and every query fails with `08006`; the four
+  connection budgets, in milliseconds, are in "Deadlines" below, the four
+  database budgets in section "PostgreSQL", "Deadlines"), then the test
+  settings:
   `--chunk N` caps every receive and send at N bytes, `--fail-every N`
   reports every N-th completed receive and every N-th completed send to Lean
   as failed, `--trace` prints `open <id>` and `free <id> <operations>
@@ -173,8 +176,10 @@ only `Server.Query` values.
   the end of that response keeps the period, `Conn.step_sent_handoff`); body
   `--body-ms` 30,000 from the head's acceptance, across an interim
   `100 Continue`; response write `--write-ms` 30,000 from the start of each
-  response. A connection waiting for a query has no deadline (queries have
-  none yet, "Not yet"). `Conn.step` takes `Event.expired kind generation`:
+  response. A connection waiting for a query runs under no deadline of its
+  own: the query's completion deadline bounds that wait, and its expiry
+  reaches the handler as the query's result (section "PostgreSQL",
+  "Deadlines"). `Conn.step` takes `Event.expired kind generation`:
   the loop's timer reports the phase it was armed for, and an expiry of an
   earlier phase is stale and changes nothing (`Conn.step_expired_stale`,
   `expired_old_stale`). A later request's first byte is known at the
@@ -191,7 +196,10 @@ only `Server.Query` values.
   registration (section "PostgreSQL" measures that cost on macOS), which a
   poll on every keep-alive response would add to each request.
   Bytes that arrive while a query runs are seen when its response starts, so
-  that head's budget starts late by at most the query's duration. When the
+  that head's budget starts late by at most the time the handler's queries
+  take, each bounded by its completion deadline: for a request pipelined
+  behind a query, the query deadlines bound how late its head budget starts;
+  they do not make that budget absolute from the head's first byte. When the
   head budget ends during the write and the next request's head is already
   complete in the server's buffer, the budget ends without a close
   (`Conn.step_expired_ahead_complete`); a head still in the kernel is not
@@ -245,7 +253,8 @@ only `Server.Query` values.
   connection closes; a shorter bound for the whole shutdown is the
   supervisor's (SIGKILL).
   A query in flight or waiting for a pool slot also holds the shutdown
-  until it is answered (section "PostgreSQL").
+  until it is answered, at most for its completion budget (section
+  "PostgreSQL", "Deadlines").
 - **Transport tests.** `zig build test` in `zig/` (`bench.sh` runs it) also
   runs `src/serve_test.zig`. It drives `serve.zig`'s loops on real sockets,
   with a fake of `glue.c` that reports every call as an event, and checks
@@ -283,7 +292,7 @@ only `Server.Query` values.
   after the receive is ready, or a test timer in the same batch), not
   timed. `bench/boundary`'s `deadlines` scenario checks the idle, head and
   body expiries end to end with short budgets.
-- **Not yet:** deadlines for queries, chunked
+- **Not yet:** chunked
   request bodies, percent-decoding and query parsing, Go's larger limits.
 
 ## PostgreSQL
@@ -324,13 +333,20 @@ else meanwhile; the loop serves its other connections (`Conn.step_query`,
 - **Results and errors.** Every query is answered exactly once: rows (text
   values, `none` for NULL, invalid UTF-8 replaced), PostgreSQL's error with
   its SQLSTATE, a pool error (`Query.Result.error`): `08006` when the
-  connection could not be made or was lost (also for a query in flight
-  when the server restarts), `54000` for a query that cannot be sent (a
-  NUL byte, more than 65,535 parameters), which did not run; or the query
-  abandoned (`Query.Result.abandoned`), now only for a result over
+  connection could not be made, or was found lost before the query was
+  handed to libpq (`ekk_pg_send` checks the connection's status before
+  any libpq call), `57014` when the query's deadline passed before it was
+  sent, `22023` for a `Query.timeoutMs` outside 1 to the ceiling, `54000`
+  for a query that cannot be sent (a NUL byte, more than 65,535
+  parameters), none of which ran; or the query abandoned
+  (`Query.Result.abandoned`): `08006` when the connection was lost after
+  the query was handed to libpq (also for a query in flight when the
+  server restarts: libpq documents no point before which a failed send or
+  an unflushed buffer proves nothing reached the server), `57014` when its
+  deadline passed after that ("Deadlines"), and `54000` for a result over
   `Query.maxResultBytes` (1 MiB, charged for every object of its Lean
   value before it is built: each row and field, `NULL` and empty ones
-  included, and each string with its header), with SQLSTATE `54000`. Rows
+  included, and each string with its header). Rows
   are received one at a time (libpq's single-row mode) and charged as they
   arrive; at the row that crosses the bound the rows gathered are
   released, the query is answered `abandoned "54000"` once and its session
@@ -341,25 +357,63 @@ else meanwhile; the loop serves its other connections (`Conn.step_query`,
   structurally, so a caller need not read the message; it promises no
   rollback and never authorizes sending the statement again, which only
   the caller's own means (an idempotent statement, a key it checks) can
-  make safe. An `error` does not prove the opposite: a lost connection
-  (`08006`) may also have an unknown outcome. A
-  query is never retried: once it may have reached the server, a lost
-  connection fails it, and its outcome is unknown (a write may have been
-  committed); the next query opens a fresh connection. Likewise a process
+  make safe. An `error` does not prove the opposite in general (PostgreSQL's
+  own errors are its own word); an unknown outcome the pool knows of is
+  answered `abandoned`. A query is never retried: once it may have reached
+  the server, a lost connection or an expiry abandons it, and its outcome
+  is unknown (a write may have been committed); the next query opens a
+  fresh connection. Likewise a process
   that ends after a query was sent leaves its outcome to PostgreSQL, as
   for any client that disconnects. A connect that fails fails every query
   waiting at that moment, each once with `08006`, also when other
   connections of the pool are busy; a query submitted later starts the
   next connect. So with the database down a loop has at most one connect
   in flight, and a flood of requests is answered from it rather than with
-  a connect each; there are no timers, backoff or circuit breaker, so this
+  a connect each; there are no retries, backoff or circuit breaker, so this
   bounds concurrent connects, not their rate while the database stays down.
-  `App.Db` answers class 08 with 503, other errors with 500, and an
-  abandoned query with 500 and `outcome unknown` in its body.
+  `App.Db` answers class 08 with 503, `57014` with 504, other errors with
+  500, and an abandoned query with the same status and `outcome unknown`
+  in its body.
+- **Deadlines.** Each budget is an external database budget, configurable
+  from 1 ms to below 2^31 ms (another value: exit status 2). A query's
+  completion deadline runs from its submission to the pool to its complete
+  result, queueing and connecting included: `--pg-query-ms` 5,000 by
+  default; a handler may ask for another with `Query.timeoutMs`, up to
+  `--pg-query-max-ms` 5,000 (a value of 0 or over it is answered `error
+  22023` unsent). A connect has `--pg-connect-ms` 5,000 from its start to a
+  connection ready for queries, enforced by the pool's timer around libpq's
+  asynchronous connect (libpq's `connect_timeout` does not bound
+  `PQconnectPoll`); a query waiting for it keeps its own earlier deadline.
+  Every session starts with PostgreSQL's `statement_timeout` at
+  `--pg-statement-ms` 4,000, through libpq's `options` startup parameter
+  after the conninfo's own `options` (or `PGOPTIONS`); a conninfo or
+  `PGSERVICE` naming a service is refused at startup, since the service
+  file's options would be replaced, and so are options ending in an
+  unpaired backslash, which would escape the appended one. So PostgreSQL usually ends a long
+  statement itself (`error 57014`, the session serves on), but that does
+  not bound the pool's wait: queueing, transmission and the server's
+  scheduling come before its timer starts. One timer per pool is armed for
+  the earliest deadline; its callback expires what is due at that moment
+  and re-arms. A query that expires in the queue (or while the connect
+  runs) is unlinked and answered `error 57014`; one already handed to libpq
+  is answered `abandoned 57014` and its session closed at once with
+  PQfinish, without PQcancel: the backend may run on until its
+  `statement_timeout` or until it next writes to the closed connection, a
+  write may commit, and the query is never sent again. A connect that ends
+  at its deadline fails the queries waiting with `08006`, as a failed
+  connect does. Expiry is judged against the pool's state when the timer's
+  callback runs (the waiter still queued, the slot still busy with it, the
+  slot still connecting), so an expiry whose completion came first finds
+  nothing due and changes nothing; which of a due timer and a ready result
+  wins is the order zio runs their callbacks in, as for the connections'
+  deadlines. The expiry reaches the handler as the query's result, and its
+  response is the handler's: no response byte of the request is sent while
+  its query runs, so `App.Db`'s 504 is always possible.
 - **Liveness.** An idle connection keeps its receive armed, so a connection
   the server closed is ended when the loop handles its EOF. This is best
-  effort: a query the loop dispatches before handling the EOF fails with
-  `08006`.
+  effort: a query the loop dispatches before handling the EOF is answered
+  `08006`: `error` when libpq already knew the connection had failed,
+  `abandoned` once it was handed to libpq.
 - **Sessions.** Each query is its own implicit transaction. A query that
   leaves a transaction open or failed (`BEGIN`) is answered `25000` and its
   session is closed, which rolls the transaction back, so no query runs in
@@ -367,7 +421,8 @@ else meanwhile; the loop serves its other connections (`Conn.step_query`,
   locks, temporary tables) stays with the session for later queries of any
   request; queries must not change it (`Server.Query`).
 - **Connection string.** `--pg` is a libpq conninfo; the pool adds
-  `client_encoding=UTF8`. It must name a Unix socket directory or a
+  `client_encoding=UTF8` and the `options` that set `statement_timeout`
+  ("Deadlines"). It must name a Unix socket directory or a
   `hostaddr`: libpq resolves a host name synchronously, which would block
   the loop.
 - **Tests.** `bench/dbcheck` runs `lsrv-db` against the private cluster.
@@ -376,8 +431,15 @@ else meanwhile; the loop serves its other connections (`Conn.step_query`,
   `pg.zig`'s pool on a real loop and real sockets with a scripted fake in
   place of `pg.c`: a partial flush with both polls outstanding and the
   write completion arriving after the slot went idle, a session ended
-  (COPY) with both polls outstanding, and synchronous chains of 10,000
-  failing queries (no slots, the database down) that stay iterative.
+  (COPY) with both polls outstanding, synchronous chains of 10,000
+  failing queries (no slots, the database down) that stay iterative,
+  deadlines (an expiry in the queue unlinks only that query, a busy
+  query's expiry closes its session without reading, which never serves
+  again, a connect's deadline fails its waiters, a waiter's own earlier
+  deadline, a timer callback after the completion changing nothing, a
+  budget refused with `22023`), and a lost connection before the query
+  reached libpq (`error`) and after (`abandoned`: a failed send, flush or
+  read).
   `src/pg_glue_test.c` runs `pg.c` and the real libpq against a fake
   PostgreSQL server on a Unix socket, each reply delivered whole, a message
   at a time and a byte at a time: command boundaries and Sync, errors,
@@ -391,8 +453,15 @@ else meanwhile; the loop serves its other connections (`Conn.step_query`,
   the bound is answered, and one byte over it, or a single field over it,
   ends the session at the row that crosses it, answered `abandoned`
   (constructor 2), while a query with a NUL character is an `error 54000`
-  (constructor 1) that sends nothing.
-  `bench/dbcheck` changes a column's type under a cached statement and back,
+  (constructor 1) that sends nothing. A connection lost mid-reply is
+  `abandoned 08006`, one whose EOF libpq saw before the next query refuses
+  it unsent (`error 08006`), and every session's startup packet carries
+  the startup options (`ekk_pg_options`: merged with the conninfo's or
+  `PGOPTIONS`, refused for a service or for options ending in an unpaired
+  backslash).
+  `bench/dbcheck` checks the deadlines against the private cluster (a query
+  expiring in flight and in the queue, `statement_timeout`, a connect to a
+  listener that never answers) and changes a column's type under a cached statement and back,
   and runs an `INSERT ... RETURNING` over the bound (abandoned with
   `54000`, the session closed, the insert wholly applied or not at all).
   A chain of queries that fail synchronously, each asked again from its
@@ -403,9 +472,7 @@ else meanwhile; the loop serves its other connections (`Conn.step_query`,
   sees it, so one row larger than the bound costs its full size (in libpq's
   input buffer and again in its result) before the session is closed, and
   libpq's input buffer keeps the size of the largest message a session
-  received until the session is closed. **Not bounded yet:** a query or a
-  connection attempt has no deadline, so a stuck
-  database holds connections, and shutdown, until it answers.
+  received until the session is closed.
 
 Measured by `bench.sh` (M1, 2026-11-16, 8 loops with 4 connections each
 against Go's `net/http` with one pgx pool of 32, both on the same private

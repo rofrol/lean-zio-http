@@ -10,8 +10,10 @@ randomnumber int)`, filled by bench.sh.
   `bench/pgserver` answers the same.
 - `GET /chain`: two queries, the second built from the first's result
   (`SELECT 1`, then `SELECT $1::int + 1`), answered `2`.
-- `GET /lock?key=K`: `SELECT pg_advisory_xact_lock_shared(K)`, which waits
-  while a test holds the exclusive lock K; answered `released`.
+- `GET /lock?key=K[&ms=N]`: `SELECT pg_advisory_xact_lock_shared(K)`, which
+  waits while a test holds the exclusive lock K; answered `released`. `ms`
+  is the query's completion budget (`Query.timeoutMs`), the server's default
+  without it.
 - `GET /bad`: a query PostgreSQL cannot prepare (no such column), answered
   `database error 42703`.
 - `GET /div?d=N`: `SELECT 1 / $1::int`, answered with the quotient or, for
@@ -26,9 +28,10 @@ randomnumber int)`, filled by bench.sh.
 - `GET /` and the rest: `App.Hello`, with no query.
 
 A failed query is answered 503 when the database could not be reached or the
-connection was lost (SQLSTATE class 08) and 500 otherwise, with the SQLSTATE
-as the body; an abandoned one (`Query.Result.abandoned`) is answered 500, its
-body adding `, outcome unknown`. -/
+connection was lost (SQLSTATE class 08), 504 when its deadline or
+PostgreSQL's `statement_timeout` ended it (`57014`) and 500 otherwise, with
+the SQLSTATE as the body; an abandoned one (`Query.Result.abandoned`) is
+answered with the same status, its body adding `, outcome unknown`. -/
 
 namespace App.Db
 
@@ -40,12 +43,15 @@ def text (status : Nat) (body : String) : Response :=
 def json (body : String) : Response :=
   { status := 200, headers := #[("Content-Type", "application/json")], body := body.toUTF8 }
 
+def status (sqlstate : String) : Nat :=
+  if sqlstate.startsWith "08" then 503 else if sqlstate == "57014" then 504 else 500
+
 def failed (sqlstate : String) : Response :=
-  text (if sqlstate.startsWith "08" then 503 else 500) s!"database error {sqlstate}\n"
+  text (status sqlstate) s!"database error {sqlstate}\n"
 
 /-- A query the pool abandoned: whether it took effect is unknown. -/
 def abandoned (sqlstate : String) : Response :=
-  text 500 s!"database error {sqlstate}, outcome unknown\n"
+  text (status sqlstate) s!"database error {sqlstate}, outcome unknown\n"
 
 /-- The value of `name` in the request-target's query, as sent. -/
 def param (target name : String) : Option String :=
@@ -82,8 +88,8 @@ def chain : Await Response := do
     | .abandoned st _ => pure (abandoned st)
     | r2 => pure (text 200 (((first r2).join).getD "null"))
 
-def lock (key : Nat) : Await Response := do
-  match ← Await.run { sql := "SELECT pg_advisory_xact_lock_shared($1)", params := #[some (toString key)] } with
+def lock (key : Nat) (timeoutMs : Option Nat) : Await Response := do
+  match ← Await.run { sql := "SELECT pg_advisory_xact_lock_shared($1)", params := #[some (toString key)], timeoutMs } with
   | .error st _ => pure (failed st)
   | .abandoned st _ => pure (abandoned st)
   | .rows .. => pure (text 200 "released")
@@ -112,7 +118,13 @@ def app : Handler := fun r =>
   | "/chain" => chain
   | "/lock" =>
     match (param r.target "key").bind String.toNat? with
-    | some k => if k < 2 ^ 62 then lock k else .done (text 400 "bad key\n")
+    | some k =>
+      if k ≥ 2 ^ 62 then .done (text 400 "bad key\n") else
+      match param r.target "ms" with
+      | none => lock k none
+      | some ms => match ms.toNat? with
+        | some n => lock k (some n)
+        | none => .done (text 400 "bad ms\n")
     | none => .done (text 400 "bad key\n")
   | "/bad" => single { sql := "SELECT no_such_column FROM world" }
   | "/div" =>

@@ -150,6 +150,20 @@ structure Options where
   /-- A response: 30 s from when it is ready to its last byte handed to the
   socket. -/
   writeMs : Nat := 30000
+  /-- The PostgreSQL pool's deadlines in milliseconds (README, "PostgreSQL",
+  "Deadlines"), each an external database budget (policy rule 10), each at
+  least 1 (decided 2026-11-17, item 3jnkx5). A query's completion budget when
+  it names none (`Server.Query.timeoutMs`): 5 s from its submission to the
+  pool to its complete result, queueing included. -/
+  pgQueryMs : Nat := 5000
+  /-- The largest `Server.Query.timeoutMs` a query may name: 5 s. -/
+  pgQueryMaxMs : Nat := 5000
+  /-- A connect: 5 s from its start to a connection ready for queries. -/
+  pgConnectMs : Nat := 5000
+  /-- PostgreSQL's own `statement_timeout`, set in every session's startup
+  options: 4 s, below the query budget, so the server usually ends a long
+  statement itself and the session survives. -/
+  pgStatementMs : Nat := 4000
   /-- Test settings (`Testing` in zig/src/serve.zig); all zero in normal runs. -/
   chunk : Nat := 0
   failEvery : Nat := 0
@@ -159,7 +173,7 @@ structure Options where
 
 @[extern "ekk_serve"]
 opaque serve (port : UInt16) (threads : UInt32) (maxConns : UInt32) (pg : @& String) (pgConns : UInt32)
-  (idleMs headMs bodyMs writeMs : UInt32) (chunk : USize) (failEvery : UInt32) (trace : UInt8) (crashAfterRecv : UInt32) (crashAfterSend : UInt32) : UInt8
+  (idleMs headMs bodyMs writeMs : UInt32) (pgQueryMs pgQueryMaxMs pgConnectMs pgStatementMs : UInt32) (chunk : USize) (failEvery : UInt32) (trace : UInt8) (crashAfterRecv : UInt32) (crashAfterSend : UInt32) : UInt8
 
 def parseArgs : List String → Options → Except String Options
   | [], o => .ok o
@@ -174,6 +188,10 @@ def parseArgs : List String → Options → Except String Options
     | "--head-ms", some k => parseArgs rest { o with headMs := k }
     | "--body-ms", some k => parseArgs rest { o with bodyMs := k }
     | "--write-ms", some k => parseArgs rest { o with writeMs := k }
+    | "--pg-query-ms", some k => parseArgs rest { o with pgQueryMs := k }
+    | "--pg-query-max-ms", some k => parseArgs rest { o with pgQueryMaxMs := k }
+    | "--pg-connect-ms", some k => parseArgs rest { o with pgConnectMs := k }
+    | "--pg-statement-ms", some k => parseArgs rest { o with pgStatementMs := k }
     | "--chunk", some k => parseArgs rest { o with chunk := k }
     | "--fail-every", some k => parseArgs rest { o with failEvery := k }
     | "--crash-after-recv", some k => parseArgs rest { o with crashAfterRecv := k }
@@ -188,7 +206,8 @@ def parseArgs : List String → Options → Except String Options
     | none => .error s!"unknown argument: {a}"
 
 /-- `[THREADS] [--port N] [--max-conns N] [--pg CONNINFO] [--pg-conns N]
-[--idle-ms N] [--head-ms N] [--body-ms N] [--write-ms N] [--chunk N]
+[--idle-ms N] [--head-ms N] [--body-ms N] [--write-ms N] [--pg-query-ms N]
+[--pg-query-max-ms N] [--pg-connect-ms N] [--pg-statement-ms N] [--chunk N]
 [--fail-every N] [--trace] [--crash-after-recv N] [--crash-after-send N]`;
 the last five are the loop's test settings. Serves on 127.0.0.1:PORT (default
 8083) until SIGTERM or SIGINT, then shuts down gracefully and returns 0
@@ -213,9 +232,14 @@ def main (args : List String) : IO UInt32 := do
     if [o.idleMs, o.headMs, o.bodyMs, o.writeMs].any (fun ms => ms == 0 || ms ≥ 2 ^ 32) then
       IO.eprintln "--idle-ms, --head-ms, --body-ms and --write-ms must be at least 1 and below 4294967296"
       return 2
+    if [o.pgQueryMs, o.pgQueryMaxMs, o.pgConnectMs, o.pgStatementMs].any (fun ms => ms == 0 || ms ≥ 2 ^ 31)
+        || o.pgQueryMaxMs < o.pgQueryMs then
+      IO.eprintln "--pg-query-ms, --pg-query-max-ms, --pg-connect-ms and --pg-statement-ms must be at least 1 and below 2147483648, and --pg-query-max-ms at least --pg-query-ms"
+      return 2
     let pgConns := if o.pg.isEmpty then 0 else o.pgConns
     return (serve o.port.toUInt16 o.threads.toUInt32 o.maxConns.toUInt32 o.pg pgConns.toUInt32
-      o.idleMs.toUInt32 o.headMs.toUInt32 o.bodyMs.toUInt32 o.writeMs.toUInt32 o.chunk.toUSize o.failEvery.toUInt32
+      o.idleMs.toUInt32 o.headMs.toUInt32 o.bodyMs.toUInt32 o.writeMs.toUInt32
+      o.pgQueryMs.toUInt32 o.pgQueryMaxMs.toUInt32 o.pgConnectMs.toUInt32 o.pgStatementMs.toUInt32 o.chunk.toUSize o.failEvery.toUInt32
       (if o.trace then 1 else 0) o.crashAfterRecv.toUInt32 o.crashAfterSend.toUInt32).toUInt32
 
 end Server.Transport

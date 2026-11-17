@@ -11,7 +11,7 @@
 /* ---- PostgreSQL (libpq), called by zig/src/pg.zig on its loop's thread ----
    Values cross into Lean as Server.Query and Server.Query.Result
    (lean/Server/Query.lean). Layouts: Query is a structure, constructor 0 with
-   fields sql, params; Option: none = box(0), some = constructor 1 with one
+   fields sql, params, timeoutMs (an Option Nat); Option: none = box(0), some = constructor 1 with one
    field; Result.rows = constructor 0 (columns, rows), Result.error =
    constructor 1 (sqlstate, message), Result.abandoned = constructor 2
    (sqlstate, message). */
@@ -120,18 +120,74 @@ int ekk_pg_libpq_version(void) { return PQlibVersion(); }
 
 static void rows_drop(ekk_rows *b);
 
-/* The connection's last error, for a lost connection: class 08006. */
+/* The connection's last error, for a connection that could not be made or
+   a query proven never sent: Result.error 08006. */
 lean_object *ekk_pg_lost(ekk_pg *p) {
     return ekk_pg_error("08006", p && p->c ? PQerrorMessage(p->c) : "could not connect");
 }
 
+/* The connection's last error, for a connection lost after the query was
+   handed to libpq: Result.abandoned 08006, since PostgreSQL may have run
+   it. Handing it over is the boundary (Server.Query): libpq documents no
+   point before which a failed send call or an unflushed output buffer
+   proves that nothing reached the server. */
+lean_object *ekk_pg_lost_sent(ekk_pg *p) {
+    return ekk_pg_abandoned("08006", p && p->c ? PQerrorMessage(p->c) : "the connection was lost");
+}
+
+/* The completion budget query `q` asks for (Query.timeoutMs) in
+   milliseconds: `dflt` for none, the value itself from 1 to `ceiling`, 0
+   for any other value (the pool answers it 22023 without sending it). */
+unsigned ekk_query_timeout_ms(lean_object *q, unsigned dflt, unsigned ceiling) {
+    lean_object *t = lean_ctor_get(q, 2);
+    if (lean_is_scalar(t)) return dflt; /* none */
+    lean_object *n = lean_ctor_get(t, 0);
+    if (!lean_is_scalar(n)) return 0; /* a Nat beyond a machine word */
+    size_t v = lean_unbox(n);
+    return v >= 1 && v <= ceiling ? (unsigned)v : 0;
+}
+
+/* The startup `options` every session sends: the conninfo's own `options`
+   (or else PGOPTIONS), then `-c statement_timeout=MS`, which PostgreSQL
+   applies after them, so it overrides one given there. 0 with *out set
+   (malloc'd); 1 when the conninfo or PGSERVICE names a service, whose file
+   may hold options this explicit value would replace; 2 out of memory;
+   3 when those options end in an unpaired backslash, which PostgreSQL
+   would read as escaping the separator, joining the next token to the
+   last one (its option splitting, pg_split_opts). */
+int ekk_pg_options(const char *conninfo, unsigned statement_ms, char **out) {
+    const char *base = NULL;
+    int named_service = getenv("PGSERVICE") != NULL;
+    PQconninfoOption *opts = PQconninfoParse(conninfo, NULL);
+    for (PQconninfoOption *o = opts; o && o->keyword; o++) {
+        if (o->val == NULL) continue;
+        if (strcmp(o->keyword, "service") == 0) named_service = 1;
+        if (strcmp(o->keyword, "options") == 0) base = o->val;
+    }
+    if (base == NULL) base = getenv("PGOPTIONS");
+    int rc = 0;
+    size_t tail = 0;
+    for (size_t k = base ? strlen(base) : 0; k > 0 && base[k - 1] == '\\'; k--) tail++;
+    if (named_service) rc = 1;
+    else if (tail % 2 == 1) rc = 3;
+    else {
+        size_t n = (base ? strlen(base) : 0) + 64;
+        *out = malloc(n);
+        if (*out == NULL) rc = 2;
+        else snprintf(*out, n, "%s%s-c statement_timeout=%u", base ? base : "", base && *base ? " " : "", statement_ms);
+    }
+    if (opts) PQconninfoFree(opts);
+    return rc;
+}
+
 /* Starts a non-blocking connection (PQconnectStartParams). The conninfo is
-   expanded as dbname; client_encoding=UTF8 after it overrides any given there.
-   The conninfo must name a Unix socket directory or a hostaddr: resolving a
-   host name would block the loop. NULL when there is no memory. */
-ekk_pg *ekk_pg_start(const char *conninfo) {
-    const char *keys[] = {"dbname", "client_encoding", NULL};
-    const char *vals[] = {conninfo, "UTF8", NULL};
+   expanded as dbname; client_encoding=UTF8 and `options` (ekk_pg_options)
+   after it override any given there. The conninfo must name a Unix socket
+   directory or a hostaddr: resolving a host name would block the loop.
+   NULL when there is no memory. */
+ekk_pg *ekk_pg_start(const char *conninfo, const char *options) {
+    const char *keys[] = {"dbname", "client_encoding", "options", NULL};
+    const char *vals[] = {conninfo, "UTF8", options, NULL};
     ekk_pg *p = calloc(1, sizeof *p);
     if (p == NULL) return NULL;
     p->limit = EKK_MAX_RESULT_BYTES;
@@ -174,7 +230,11 @@ static const char *cstr(lean_object *s) {
 /* Sends query `q` (consumed) and a Sync, with text parameters and results:
    by its statement's name, preparing it first on its first use. 0 sent
    (flush with ekk_pg_flush); 1 not sent, *err holds the error Result and the
-   connection is unchanged; 2 the connection failed. */
+   connection is unchanged; 2 the connection failed after the query was
+   handed to libpq (it may have reached the server); 3 the connection had
+   already failed, so nothing of the query was handed to libpq (libpq's
+   send functions refuse a connection whose status is not CONNECTION_OK
+   before they queue anything). */
 int ekk_pg_send(ekk_pg *p, lean_object *q, lean_object **err) {
     lean_object *sql = lean_ctor_get(q, 0);
     lean_object *params = lean_ctor_get(q, 1);
@@ -187,6 +247,10 @@ int ekk_pg_send(ekk_pg *p, lean_object *q, lean_object **err) {
     p->cached = -1;
     p->last_null = 0;
     rows_drop(&p->rows);
+    if (PQstatus(p->c) != CONNECTION_OK) {
+        rc = 3;
+        goto done;
+    }
     if (text == NULL || n > 65535) {
         *err = ekk_pg_error("54000", text == NULL ? "a NUL character in the SQL" : "more than 65535 parameters");
         rc = 1;
@@ -443,8 +507,8 @@ static lean_object *error_of(PGresult *r) {
    and the execution PostgreSQL skipped is ignored). A cached statement
    that went stale is forgotten (`invalidated`). 1 when the Sync arrived
    (*acc is complete), 0 when more input is needed, -1 when the session
-   must be closed, with *acc the query's result: an error when the
-   connection failed, the statement started COPY, which this pool does not
+   must be closed, with *acc the query's result: Result.abandoned 08006
+   when the connection failed (ekk_pg_lost_sent), an error when the statement started COPY, which this pool does not
    speak, or it left a transaction open; Result.abandoned 54000
    (EKK_TOO_BIG) when its rows crossed Query.maxResultBytes (the rows
    gathered are released, the rest is never read); the query's own result when the
@@ -457,7 +521,7 @@ int ekk_pg_collect(ekk_pg *p, lean_object **acc) {
                pending, so the Sync can never come. */
             if (p->last_null || PQstatus(p->c) != CONNECTION_OK) {
                 if (*acc) lean_dec(*acc);
-                *acc = ekk_pg_lost(p);
+                *acc = ekk_pg_lost_sent(p);
                 return -1;
             }
             p->last_null = 1;

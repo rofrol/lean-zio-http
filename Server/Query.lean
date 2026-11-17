@@ -13,10 +13,14 @@ the transaction back. Session state other than transactions (`SET`,
 session-level advisory locks, temporary tables) stays with the session and
 may be seen by later queries of any request; a query must not change it, nor
 deallocate prepared statements (`DEALLOCATE`, `DISCARD ALL`), which the pool
-caches per session. A query is never retried by the server: when its
-connection is lost, its answer is an error, and whether it took effect is
-unknown; a query the pool gives up on after it may have reached the
-database is answered `abandoned` (`Query.Result`). -/
+caches per session. A query is never retried by the server: a query the
+pool gives up on after it was handed to libpq (its connection lost, its
+deadline passed, its result too large) is answered `abandoned`
+(`Query.Result`), since it may have reached the database.
+
+Each query has a completion deadline (`Query.timeoutMs`), from its
+submission to the pool to its complete result, queueing and connecting
+included (README, "PostgreSQL", "Deadlines"). -/
 
 namespace Server
 
@@ -26,6 +30,13 @@ answers such a query with an error without sending it). -/
 structure Query where
   sql : String
   params : Array (Option String) := #[]
+  /-- The query's completion budget in milliseconds; `none` takes the
+  server's default (`--pg-query-ms`, 5 s). A value must be at least 1 and at
+  most the server's ceiling (`--pg-query-max-ms`, 5 s): any other is answered
+  `error "22023"` without sending the query. When the budget ends before the
+  query was sent, it is answered `error "57014"`; after, `abandoned "57014"`
+  (its session is closed, the server is not asked to cancel it). -/
+  timeoutMs : Option Nat := none
 
 /-- What PostgreSQL answered, in text form (the pool's client encoding is
 UTF-8). -/
@@ -34,14 +45,16 @@ inductive Query.Result where
   for NULL; both empty for a statement that returns no rows. -/
   | rows (columns : Array String) (rows : Array (Array (Option String)))
   /-- The statement failed or did not run. `sqlstate` is PostgreSQL's error
-  code; the pool's own failures use class 08 (connection exception: `08006`
-  when the connection was lost or could not be made, so the statement may or
-  may not have run), `54000` (a query the pool cannot send: a NUL character,
-  more than 65,535 parameters; it did not run) and `25000` (the statement
-  left a transaction open, which closing its session rolled back). An
-  `error` does not establish that the statement had no effect, nor that
-  sending it again is safe: class 08 may have an unknown outcome as well
-  (only `abandoned` says so structurally). -/
+  code (`57014` also for PostgreSQL's own `statement_timeout`); the pool's
+  own failures use `08006` (the connection could not be made, or was found
+  lost before the query was handed to libpq: it was not sent), `57014` (the
+  query's deadline passed before it was sent), `22023` (a `timeoutMs`
+  outside 1 to the server's ceiling; not sent), `54000` (a query the pool
+  cannot send: a NUL character, more than 65,535 parameters; it did not run)
+  and `25000` (the statement left a transaction open, which closing its
+  session rolled back). An `error` does not establish that the statement
+  had no effect, nor that sending it again is safe; an unknown outcome the
+  pool knows of is answered `abandoned`. -/
   | error (sqlstate : String) (message : String)
   /-- The pool abandoned the statement after it may have reached the
   database, and closed its session before the statement's end, so whether
@@ -50,8 +63,12 @@ inductive Query.Result where
   promises no rollback, and this answer never authorizes sending the
   statement again: a caller that does so needs its own means (an
   idempotent statement, a key it checks) to know that is safe. `sqlstate`
-  and `message` say why: `54000` for a result over `Query.maxResultBytes`
-  (the pool stops at the row that crosses the bound). -/
+  and `message` say why: `08006` for a connection lost after the query was
+  handed to libpq (an unsent buffer does not prove nothing reached the
+  server), `57014` for its deadline passing after that (the server is not
+  asked to cancel it: it may run on until its `statement_timeout`), `54000`
+  for a result over `Query.maxResultBytes` (the pool stops at the row that
+  crosses the bound). -/
   | abandoned (sqlstate : String) (message : String)
   deriving Inhabited
 

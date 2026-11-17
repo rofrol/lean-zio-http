@@ -34,8 +34,10 @@ const max_steps = 1000;
 
 /// A Lean value as the fake makes it: a query, rows, or an error.
 const Obj = struct {
-    kind: enum { query, rows, err },
+    kind: enum { query, rows, err, abandoned },
     sqlstate: [5]u8 = "     ".*,
+    /// query: Query.timeoutMs.
+    timeout_ms: ?u32 = null,
 };
 
 const Session = struct {
@@ -149,11 +151,32 @@ export fn ekk_pg_error(sqlstate: [*:0]const u8, _: [*:0]const u8) Lean {
     return newObj(o);
 }
 
+export fn ekk_pg_abandoned(sqlstate: [*:0]const u8, _: [*:0]const u8) Lean {
+    var o: Obj = .{ .kind = .abandoned };
+    @memcpy(&o.sqlstate, sqlstate[0..5]);
+    return newObj(o);
+}
+
 export fn ekk_pg_lost(_: ?*anyopaque) Lean {
     return newObj(.{ .kind = .err, .sqlstate = "08006".* });
 }
 
-export fn ekk_pg_start(_: [*:0]const u8) ?*anyopaque {
+export fn ekk_pg_lost_sent(_: ?*anyopaque) Lean {
+    return newObj(.{ .kind = .abandoned, .sqlstate = "08006".* });
+}
+
+/// pg.c's contract: none gives `dflt`, 1 to `ceiling` itself, else 0.
+export fn ekk_query_timeout_ms(q: Lean, dflt: c_uint, ceiling: c_uint) c_uint {
+    const p: *Obj = @ptrCast(@alignCast(q.?));
+    const ms = p.timeout_ms orelse return dflt;
+    return if (ms >= 1 and ms <= ceiling) ms else 0;
+}
+
+/// The startup options the fake's last session was started with.
+var started_options: ?[*:0]const u8 = null;
+
+export fn ekk_pg_start(_: [*:0]const u8, options: [*:0]const u8) ?*anyopaque {
+    started_options = options;
     fake.note(.start, fake.sessions + 1);
     if (fake.start.next("ekk_pg_start") == 0) return null;
     fake.sessions += 1;
@@ -247,6 +270,10 @@ fn query() Lean {
     return newObj(.{ .kind = .query });
 }
 
+fn queryMs(ms: u32) Lean {
+    return newObj(.{ .kind = .query, .timeout_ms = ms });
+}
+
 // ---- waiters ----
 
 /// The depth of `deliver` calls on the stack, and its maximum.
@@ -322,11 +349,16 @@ const Fixture = struct {
     npeers: usize = 0,
 
     fn init(self: *Fixture, nslots: usize) !void {
+        try self.initBudgets(nslots, .{});
+    }
+
+    fn initBudgets(self: *Fixture, nslots: usize, budgets: pg.Budgets) !void {
         fake = .{};
         depth = 0;
         max_depth = 0;
+        started_options = null;
         try self.loop.init(.{});
-        self.pool.init(&self.loop, "fake", self.slots[0..nslots], false);
+        self.pool.init(&self.loop, "fake", "fake options", budgets, self.slots[0..nslots], false);
     }
 
     /// A socketpair for the next session: returns the peer's end.
@@ -350,6 +382,22 @@ const Fixture = struct {
                 return error.NoProgress;
             }
             try self.loop.poll(.zero);
+        }
+    }
+
+    /// Steps the loop, each step blocking until an event, until `pred(ctx)`
+    /// holds: for a state the pool's deadline timer produces. The cap on a
+    /// step is the test's own bound (delay: test deadline: one wait for the
+    /// pool's timer, which the budgets below set to milliseconds); running
+    /// out fails the test.
+    fn untilTimer(self: *Fixture, ctx: anytype, comptime pred: fn (@TypeOf(ctx)) bool) !void {
+        var steps: usize = 0;
+        while (!pred(ctx)) : (steps += 1) {
+            if (steps == 10) {
+                fake.dump();
+                return error.NoProgress;
+            }
+            try self.loop.poll(.fromMilliseconds(1000));
         }
     }
 
@@ -871,4 +919,266 @@ test "e: a connect that succeeds serves the queue; the next connect starts only 
     try std.testing.expectEqual(.rows, d.got[0].kind);
     try std.testing.expectEqual(@as(usize, 2), fake.count.get(.start));
     try fx.deinit();
+}
+
+// ---- (f) deadlines ----
+
+/// Budgets for the deadline tests: the one under test in milliseconds, the
+/// others far beyond the test (delay: external deadline: the database
+/// budgets the pool enforces, here set by the test).
+const far: u32 = 600_000;
+
+fn sentAndBusy(fx: *Fixture, w: *TestWaiter, q: Lean) !c.fd_t {
+    const peer = try fx.pair();
+    fake.start.push(&.{1});
+    fake.connect_poll.push(&.{3});
+    fake.send.push(&.{0});
+    fake.flush.push(&.{0});
+    in_submit = true;
+    fx.pool.submit(&w.w, q);
+    in_submit = false;
+    try std.testing.expectEqual(.busy, slot0(fx).state);
+    return peer;
+}
+
+test "f: a query whose deadline passes in the queue fails with 57014, unsent and unlinked" {
+    var fx: Fixture = .{};
+    try fx.initBudgets(1, .{ .query_ms = 10, .query_max_ms = far, .connect_ms = far });
+    const peer = try fx.pair();
+    fake.start.push(&.{1});
+    fake.connect_poll.push(&.{ 1, 3 }); // wait to read, then connected
+    var a: TestWaiter = .{ .pool = &fx.pool };
+    a.submit();
+    try std.testing.expectEqual(.connecting, slot0(&fx).state);
+    try fx.untilTimer(&a, delivered);
+    try std.testing.expectEqual(.err, a.got[0].kind);
+    try std.testing.expectEqualSlices(u8, "57014", &a.got[0].sqlstate);
+    try std.testing.expect(fx.pool.head == null and fx.pool.tail == null);
+    try std.testing.expectEqual(@as(usize, 0), fake.count.get(.send));
+    // The connect goes on; its connection finds no query waiting.
+    try poke(peer);
+    try fx.until(&fx, slotIs(0, .idle));
+    try std.testing.expectEqual(@as(usize, 1), a.n);
+    try std.testing.expectEqual(@as(usize, 0), fake.count.get(.send));
+    try fx.deinit();
+}
+
+test "f: an expired query among others: only it leaves the queue, the others keep their order" {
+    var fx: Fixture = .{};
+    try fx.initBudgets(1, .{ .query_ms = far, .query_max_ms = far, .connect_ms = far });
+    const peer = try fx.pair();
+    fake.start.push(&.{1});
+    fake.connect_poll.push(&.{ 1, 3 });
+    var order: std.ArrayList(u8) = .empty;
+    defer order.deinit(std.testing.allocator);
+    var a: TestWaiter = .{ .pool = &fx.pool, .order = &order, .tag = 'a' };
+    var b: TestWaiter = .{ .pool = &fx.pool, .order = &order, .tag = 'b' };
+    var d: TestWaiter = .{ .pool = &fx.pool, .order = &order, .tag = 'd' };
+    a.submit();
+    fx.pool.submit(&b.w, queryMs(10));
+    d.submit();
+    try fx.untilTimer(&b, delivered);
+    try std.testing.expectEqualSlices(u8, "57014", &b.got[0].sqlstate);
+    try std.testing.expect(fx.pool.head == &a.w and a.w.next == &d.w and fx.pool.tail == &d.w);
+    // The connection runs a, then d.
+    fake.send.push(&.{ 0, 0 });
+    fake.flush.push(&.{ 0, 0 });
+    fake.consume.push(&.{ 1, 1 });
+    fake.collect.push(&.{ 1, 1 });
+    try poke(peer);
+    try fx.until(&fx, slotIs(0, .busy));
+    try poke(peer);
+    try fx.until(&a, delivered);
+    try poke(peer);
+    try fx.until(&d, delivered);
+    try std.testing.expectEqualStrings("bad", order.items);
+    try fx.deinit();
+}
+
+test "f: a busy query's deadline abandons it with 57014; its session is closed and never reused" {
+    var fx: Fixture = .{};
+    try fx.initBudgets(1, .{ .query_ms = 10, .query_max_ms = far, .connect_ms = far });
+    var w: TestWaiter = .{ .pool = &fx.pool };
+    const peer = try sentAndBusy(&fx, &w, query());
+    try std.testing.expectEqualStrings("fake options", std.mem.span(started_options.?));
+    var mark = fake.calls;
+    try fx.untilTimer(&w, delivered);
+    try std.testing.expectEqual(.abandoned, w.got[0].kind);
+    try std.testing.expectEqualSlices(u8, "57014", &w.got[0].sqlstate);
+    try fx.until(&fx, Fixture.allDisconnected);
+    // No PQcancel, no read: the session ends without waiting for the server.
+    try expectKinds(mark, &.{ .deliver, .finish });
+    // The session's socket is closed: a late answer has nowhere to go.
+    try std.testing.expectError(error.Write, poke(peer));
+    try std.testing.expectEqual(@as(usize, 1), w.n);
+
+    // The next query gets session 2.
+    _ = try fx.pair();
+    fake.start.push(&.{1});
+    fake.connect_poll.push(&.{3});
+    fake.send.push(&.{0});
+    fake.flush.push(&.{0});
+    mark = fake.calls;
+    fx.pool.submit(&w.w, queryMs(far));
+    for (fake.since(mark)) |e| try std.testing.expectEqual(@as(u32, 2), e.session);
+    fake.consume.push(&.{1});
+    fake.collect.push(&.{1});
+    try poke(fx.peers[1]);
+    try fx.until(&w, struct {
+        fn f(x: *TestWaiter) bool {
+            return x.n == 2;
+        }
+    }.f);
+    try std.testing.expectEqual(.rows, w.got[1].kind);
+    try fx.deinit();
+}
+
+test "f: a connect's deadline fails the queries waiting with 08006" {
+    var fx: Fixture = .{};
+    try fx.initBudgets(1, .{ .query_ms = far, .query_max_ms = far, .connect_ms = 10 });
+    _ = try fx.pair();
+    fake.start.push(&.{1});
+    fake.connect_poll.push(&.{1}); // waits to read; the server never answers
+    var a: TestWaiter = .{ .pool = &fx.pool };
+    var b: TestWaiter = .{ .pool = &fx.pool };
+    a.submit();
+    b.submit();
+    try fx.untilTimer(&b, delivered);
+    for ([_]*TestWaiter{ &a, &b }) |x| {
+        try std.testing.expectEqual(@as(usize, 1), x.n);
+        try std.testing.expectEqual(.err, x.got[0].kind);
+        try std.testing.expectEqualSlices(u8, "08006", &x.got[0].sqlstate);
+    }
+    try fx.until(&fx, Fixture.allDisconnected);
+    try std.testing.expectEqual(@as(usize, 1), fake.count.get(.finish));
+    try std.testing.expect(fx.pool.attempt == null);
+    try fx.deinit();
+}
+
+test "f: a waiter's own earlier deadline ends it while the connect runs on" {
+    var fx: Fixture = .{};
+    try fx.initBudgets(1, .{ .query_ms = 10, .query_max_ms = far, .connect_ms = far });
+    const peer = try fx.pair();
+    fake.start.push(&.{1});
+    fake.connect_poll.push(&.{ 1, 3 });
+    var a: TestWaiter = .{ .pool = &fx.pool };
+    a.submit();
+    try fx.untilTimer(&a, delivered);
+    try std.testing.expectEqualSlices(u8, "57014", &a.got[0].sqlstate);
+    try std.testing.expectEqual(.connecting, slot0(&fx).state);
+    try poke(peer);
+    try fx.until(&fx, slotIs(0, .idle));
+    try fx.deinit();
+}
+
+test "f: an expiry that comes after the completion changes nothing" {
+    var fx: Fixture = .{};
+    try fx.initBudgets(1, .{ .query_ms = far, .query_max_ms = far, .connect_ms = far });
+    var w: TestWaiter = .{ .pool = &fx.pool };
+    const peer = try sentAndBusy(&fx, &w, query());
+    try std.testing.expect(fx.pool.timer_due != null);
+    fake.consume.push(&.{1});
+    fake.collect.push(&.{1});
+    try poke(peer);
+    try fx.until(&w, delivered);
+    // Nothing runs: the timer is off.
+    try std.testing.expect(fx.pool.timer_due == null);
+    // A timer callback that arrives now (one already on its way when the
+    // completion cleared the timer) finds nothing due.
+    const mark = fake.calls;
+    fx.pool.timer.c.callback.?(&fx.loop, &fx.pool.timer.c);
+    try expectKinds(mark, &[_]Kind{});
+    try std.testing.expectEqual(.idle, slot0(&fx).state);
+    try std.testing.expectEqual(@as(usize, 1), w.n);
+    try std.testing.expect(fx.pool.timer_due == null);
+
+    // And one that arrives while another query runs, not yet due, leaves
+    // that query running and the timer armed for it.
+    fake.send.push(&.{0});
+    fake.flush.push(&.{0});
+    w.submit();
+    // The loop dequeues an early callback: the timer is no longer
+    // registered when the callback runs, and the callback re-arms it.
+    try std.testing.expect(fx.loop.clearTimer(&fx.pool.timer));
+    fx.pool.timer.c.callback.?(&fx.loop, &fx.pool.timer.c);
+    try std.testing.expectEqual(.busy, slot0(&fx).state);
+    try std.testing.expect(fx.pool.timer_due != null and fx.pool.timer_due.?.value == w.w.deadline.value);
+    fake.consume.push(&.{1});
+    fake.collect.push(&.{1});
+    try poke(peer);
+    try fx.until(&w, struct {
+        fn f(x: *TestWaiter) bool {
+            return x.n == 2;
+        }
+    }.f);
+    try std.testing.expectEqual(.rows, w.got[1].kind);
+    try fx.deinit();
+}
+
+test "f: a budget of 0 or above the ceiling is refused with 22023, unsent" {
+    var fx: Fixture = .{};
+    try fx.initBudgets(1, .{ .query_ms = 100, .query_max_ms = 200, .connect_ms = far });
+    var w: TestWaiter = .{ .pool = &fx.pool };
+    for ([_]u32{ 0, 201 }, 1..) |ms, n| {
+        in_submit = true;
+        fx.pool.submit(&w.w, queryMs(ms));
+        in_submit = false;
+        try std.testing.expectEqual(n, w.n);
+        try std.testing.expectEqual(.err, w.got[n - 1].kind);
+        try std.testing.expectEqualSlices(u8, "22023", &w.got[n - 1].sqlstate);
+    }
+    try std.testing.expectEqual(@as(usize, 2), w.during_submit);
+    try std.testing.expectEqual(@as(usize, 0), fake.count.get(.start));
+    try fx.deinit();
+}
+
+// ---- (g) a lost connection: sent or not ----
+
+test "g: a connection found failed before the query reached libpq fails it with error 08006" {
+    var fx: Fixture = .{};
+    try fx.init(1);
+    _ = try fx.pair();
+    fake.start.push(&.{1});
+    fake.connect_poll.push(&.{3});
+    fake.send.push(&.{3});
+    var w: TestWaiter = .{ .pool = &fx.pool };
+    w.submit();
+    try std.testing.expectEqual(.err, w.got[0].kind);
+    try std.testing.expectEqualSlices(u8, "08006", &w.got[0].sqlstate);
+    try fx.until(&fx, Fixture.allDisconnected);
+    try fx.deinit();
+}
+
+test "g: a connection lost after the query was handed to libpq abandons it with 08006" {
+    // send fails after handing it over (2), a flush fails, a read fails.
+    for (0..3) |how| {
+        var fx: Fixture = .{};
+        try fx.init(1);
+        const peer = try fx.pair();
+        fake.start.push(&.{1});
+        fake.connect_poll.push(&.{3});
+        var w: TestWaiter = .{ .pool = &fx.pool };
+        switch (how) {
+            0 => fake.send.push(&.{2}),
+            1 => {
+                fake.send.push(&.{0});
+                fake.flush.push(&.{-1});
+            },
+            else => {
+                fake.send.push(&.{0});
+                fake.flush.push(&.{0});
+                fake.consume.push(&.{0});
+            },
+        }
+        w.submit();
+        if (how == 2) {
+            try poke(peer);
+            try fx.until(&w, delivered);
+        }
+        try std.testing.expectEqual(@as(usize, 1), w.n);
+        try std.testing.expectEqual(.abandoned, w.got[0].kind);
+        try std.testing.expectEqualSlices(u8, "08006", &w.got[0].sqlstate);
+        try fx.until(&fx, Fixture.allDisconnected);
+        try fx.deinit();
+    }
 }

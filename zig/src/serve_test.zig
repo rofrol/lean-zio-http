@@ -314,10 +314,22 @@ export fn ekk_crash() void {
 export fn ekk_pg_error(_: [*:0]const u8, _: [*:0]const u8) ?*anyopaque {
     @panic("ekk_pg_error");
 }
+export fn ekk_pg_abandoned(_: [*:0]const u8, _: [*:0]const u8) ?*anyopaque {
+    @panic("ekk_pg_abandoned");
+}
 export fn ekk_pg_lost(_: ?*anyopaque) ?*anyopaque {
     @panic("ekk_pg_lost");
 }
-export fn ekk_pg_start(_: [*:0]const u8) ?*anyopaque {
+export fn ekk_pg_lost_sent(_: ?*anyopaque) ?*anyopaque {
+    @panic("ekk_pg_lost_sent");
+}
+export fn ekk_query_timeout_ms(_: ?*anyopaque, _: c_uint, _: c_uint) c_uint {
+    @panic("ekk_query_timeout_ms");
+}
+export fn ekk_pg_options(_: [*:0]const u8, _: c_uint, _: *?[*:0]u8) c_int {
+    @panic("ekk_pg_options: only ekk_serve calls it");
+}
+export fn ekk_pg_start(_: [*:0]const u8, _: [*:0]const u8) ?*anyopaque {
     @panic("ekk_pg_start");
 }
 export fn ekk_pg_connect_poll(_: *anyopaque) c_int {

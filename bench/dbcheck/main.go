@@ -29,7 +29,23 @@
 //     answers 200 on a fresh session;
 //   - database down: queries answer 503 while it is stopped, 200 once started;
 //   - shutdown: SIGTERM with a query waiting lets it finish, then the server
-//     exits with status 0 after printing "stopped".
+//     exits with status 0 after printing "stopped";
+//   - query deadline: a query whose budget ends while it waits on the lock
+//     is abandoned (504, 57014, "outcome unknown"), its session is closed
+//     without waiting for its backend, and the next query gets a fresh
+//     session; one whose budget ends while it waits in the pool's queue
+//     answers 504 with 57014 and no "outcome unknown", and the busy session
+//     it waited behind serves on; a budget of 0 or over the ceiling answers
+//     500 with 22023;
+//   - statement_timeout: PostgreSQL ends a statement past --pg-statement-ms
+//     itself (504, 57014, not abandoned) and the session serves on;
+//   - connect deadline: against a listener that never answers, a connect
+//     ends at --pg-connect-ms (503, 08006), and a query whose own budget
+//     ends first answers 504 with 57014 while the connect runs on.
+//
+// The budgets under test are short, set by each test; the other tests set
+// every database budget far beyond their run (`far`), since they hold
+// queries on locks for as long as they need.
 //
 // Exhaustion, restart and shutdown read the server's trace (--trace) to know
 // it has queued the queries, closed the old sessions or started its shutdown.
@@ -44,6 +60,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -76,10 +93,22 @@ type srv struct {
 	lines chan string
 }
 
-// start runs lsrv-db with `args` on a port the kernel picks, sets addr from
-// its "listening on" line, and returns once it has printed "ready".
+// The database budgets of the tests that do not test them, beyond any run
+// (delay: external deadline: the pool's database budgets, out of the way of
+// tests that hold queries on locks).
+var far = []string{"--pg-query-ms", "600000", "--pg-query-max-ms", "600000", "--pg-connect-ms", "600000",
+	"--pg-statement-ms", "600000"}
+
+// start runs lsrv-db with `args` and the private cluster's conninfo.
 func start(args ...string) *srv {
-	cmd := exec.Command(*server, append(args, "--port", "0", "--pg", *conninfo+" application_name=lsrv")...)
+	return startOn(*conninfo+" application_name=lsrv", append(append([]string{}, far...), args...)...)
+}
+
+// startOn runs lsrv-db with `args` against `pg` on a port the kernel picks,
+// sets addr from its "listening on" line, and returns once it has printed
+// "ready".
+func startOn(pg string, args ...string) *srv {
+	cmd := exec.Command(*server, append(args, "--port", "0", "--pg", pg)...)
 	cmd.Stdout = io.Discard
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
@@ -324,7 +353,8 @@ func testRestart() {
 	}
 	h.Close(ctx)
 	pgctl("restart", "-m", "fast")
-	expect("restart: the query in flight", <-inflight, 503, "")
+	// It was sent: the lost connection leaves its outcome unknown.
+	expect("restart: the query in flight", <-inflight, 503, "database error 08006, outcome unknown\n")
 	// The idle slot ends its session when the loop handles its EOF, which
 	// may come after the next request (best effort, README): wait for both.
 	s.await("restart: old sessions closed", 2, func(l string) bool { return l == "pg closed" })
@@ -456,6 +486,93 @@ func testShutdown() {
 	s.finish("shutdown")
 }
 
+// The budgets under test below (delay: external deadline: a query's or a
+// connect's budget, or PostgreSQL's statement_timeout, the test waits for
+// it to end).
+const short = "300"
+
+func testQueryDeadline() {
+	s := start("1", "--pg-conns", "1", "--trace", "--pg-query-max-ms", "600000")
+	c := connect()
+	expect("query deadline: a session opened", get("/db?id=42"), 200, world42)
+	pid := backendPid(c)
+	// Expiry in flight: the query waits on the lock past its budget.
+	l := lockHeld(12)
+	expect("query deadline: in flight", get("/lock?key=12&ms="+short), 504, "database error 57014, outcome unknown\n")
+	s.await("query deadline: the session closed", 1, func(l string) bool { return l == "pg closed" })
+	// No cancel was sent: the backend still waits on the lock until it is
+	// released, and ends when its answer finds the connection closed.
+	if !awaitWaiters(c, 1) {
+		fail("query deadline: the closed session's backend no longer waits")
+	}
+	l.Close(ctx)
+	if !awaitNoBackends(c) {
+		fail("query deadline: the closed session's backend never ended")
+	}
+	expect("query deadline: the next query", get("/db?id=42"), 200, world42)
+	if p := backendPid(c); p == pid {
+		fail("query deadline: backend %d serves again after its session expired", p)
+	}
+	pid = backendPid(c)
+
+	// Expiry in the queue: one slot, busy with a query waiting on a lock.
+	l = lockHeld(13)
+	busy := getAsync("/lock?key=13")
+	if !awaitWaiters(c, 1) {
+		fail("query deadline: the busy query never waited for the lock")
+	}
+	expect("query deadline: in the queue", get("/lock?key=14&ms="+short), 504, "database error 57014\n")
+	pending("query deadline: the busy query", busy)
+	l.Close(ctx)
+	expect("query deadline: the busy query", <-busy, 200, "released")
+	expect("query deadline: after the queue", get("/db?id=42"), 200, world42)
+	if p := backendPid(c); p != pid {
+		fail("query deadline: backend %d, want the busy session's %d", p, pid)
+	}
+
+	expect("query deadline: a budget of 0", get("/lock?key=15&ms=0"), 500, "database error 22023\n")
+	expect("query deadline: a budget over the ceiling", get("/lock?key=15&ms=600001"), 500, "database error 22023\n")
+	c.Close(ctx)
+	s.stop("query deadline")
+}
+
+func testStatementTimeout() {
+	s := start("1", "--pg-conns", "1", "--pg-statement-ms", short)
+	c := connect()
+	expect("statement_timeout: a session opened", get("/db?id=42"), 200, world42)
+	pid := backendPid(c)
+	l := lockHeld(16)
+	expect("statement_timeout: the statement ended by PostgreSQL", get("/lock?key=16"), 504, "database error 57014\n")
+	l.Close(ctx)
+	expect("statement_timeout: the next query", get("/db?id=42"), 200, world42)
+	if p := backendPid(c); p != pid {
+		fail("statement_timeout: backend %d, want the same session's %d", p, pid)
+	}
+	c.Close(ctx)
+	s.stop("statement_timeout")
+}
+
+func testConnectDeadline() {
+	// A listener that accepts no connection: the kernel completes the
+	// handshake, libpq sends its startup packet, and no answer comes.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		panic(err)
+	}
+	pg := fmt.Sprintf("hostaddr=127.0.0.1 port=%d sslmode=disable gssencmode=disable dbname=x user=x", ln.Addr().(*net.TCPAddr).Port)
+	s := startOn(pg, "1", "--pg-conns", "1", "--pg-connect-ms", short)
+	expect("connect deadline: the connect ends", get("/db?id=42"), 503, "database error 08006\n")
+	s.stop("connect deadline")
+
+	// The default connect budget (5 s) outlasts the query's.
+	s = startOn(pg, "1", "--pg-conns", "1")
+	expect("connect deadline: the query's own budget first", get("/lock?key=1&ms="+short), 504, "database error 57014\n")
+	// The connect still runs: closing the listener resets it, so the
+	// shutdown need not wait for its budget.
+	ln.Close()
+	s.stop("connect deadline")
+}
+
 func main() {
 	flag.Parse()
 	if *conninfo == "" || *pgdata == "" || *pglog == "" {
@@ -469,6 +586,8 @@ func main() {
 		{"results", testResults}, {"slow query", testSlowQuery}, {"exhaustion", testExhaustion},
 		{"restart", testRestart}, {"errors", testErrors},
 		{"schema change", testSchemaChange}, {"oversized", testOversized}, {"down", testDown}, {"shutdown", testShutdown},
+		{"query deadline", testQueryDeadline}, {"statement_timeout", testStatementTimeout},
+		{"connect deadline", testConnectDeadline},
 	} {
 		before := failures
 		t.run()

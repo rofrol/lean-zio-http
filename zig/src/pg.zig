@@ -8,12 +8,27 @@
 //
 // Rules the code below keeps:
 // - Every query gets exactly one result: rows, PostgreSQL's error, or a
-//   pool error (`08006` when the connection was lost or could not be made,
-//   `54000` for a query that cannot be sent), or the query abandoned
-//   (`Result.abandoned` `54000`: its result crossed Query.maxResultBytes,
-//   which closes its session, so its outcome is unknown). A query is never
-//   retried: once it may have reached the server, losing the connection or
-//   closing its session fails it.
+//   pool error (`08006` when the connection could not be made or was lost
+//   before the query was handed to libpq, `54000` for a query that cannot
+//   be sent, `22023` for a completion budget outside 1 to the ceiling,
+//   `57014` for a query whose deadline passed before it was sent), or the
+//   query abandoned (`Result.abandoned`: `08006` when the connection was
+//   lost after the query was handed to libpq, `57014` when its deadline
+//   passed after that, `54000` when its result crossed
+//   Query.maxResultBytes; each closes its session, so its outcome is
+//   unknown). A query is never retried: once it may have reached the
+//   server, losing the connection or closing its session fails it.
+// - Deadlines (README, "PostgreSQL"): each query has a completion deadline
+//   from its submission (queueing included) and the connect in flight one
+//   from its start; all are external database budgets. One timer per pool
+//   is armed for the earliest of them (`rearm`); its callback expires what
+//   is due by the clock at that moment and re-arms. An expiry is
+//   judged against the pool's current state (a waiter still queued, a slot
+//   still busy with that waiter, the slot still connecting), so an expiry
+//   that comes after the completion it raced finds nothing due and changes
+//   nothing; a completion that the loop runs before a due expiry wins, as
+//   for the connections' own deadlines. An expired busy session is
+//   disposed of (PQfinish, no PQcancel) and never serves another query.
 // - Waiters wait in FIFO order when no connection is idle (pool exhaustion,
 //   or a connect in flight); each waiter has at most one query
 //   (Conn.step_query), so the queue is bounded by the loop's connections.
@@ -22,9 +37,10 @@
 //   connect is not tied to a query. When it succeeds, the new idle
 //   connection serves the queue like any other; when it fails, every query
 //   waiting at that moment fails once with `08006`, and a query submitted
-//   later (also from those deliveries) may start the next connect. There are
-//   no timers, retries or backoff: this bounds concurrent connects per loop,
-//   not the rate of connects while the database stays down.
+//   later (also from those deliveries) may start the next connect. A connect
+//   ends at its deadline at the latest; there are no retries or backoff:
+//   this bounds concurrent connects per loop, not the rate of connects while
+//   the database stays down.
 // - zio's socket registry keeps a registration per descriptor until a
 //   `NetClose` removes it (and asserts nothing is parked on it), while libpq
 //   closes and may replace its own socket (PQfinish, PQconnectPoll). So the
@@ -41,8 +57,11 @@ const Session = opaque {};
 const Lean = ?*anyopaque; // a Lean object: Server.Query or Server.Query.Result
 
 extern fn ekk_pg_error(sqlstate: [*:0]const u8, message: [*:0]const u8) Lean;
+extern fn ekk_pg_abandoned(sqlstate: [*:0]const u8, message: [*:0]const u8) Lean;
 extern fn ekk_pg_lost(c: ?*Session) Lean;
-extern fn ekk_pg_start(conninfo: [*:0]const u8) ?*Session;
+extern fn ekk_pg_lost_sent(c: ?*Session) Lean;
+extern fn ekk_query_timeout_ms(q: Lean, dflt: c_uint, ceiling: c_uint) c_uint;
+extern fn ekk_pg_start(conninfo: [*:0]const u8, options: [*:0]const u8) ?*Session;
 extern fn ekk_pg_connect_poll(c: *Session) c_int;
 extern fn ekk_pg_socket(c: *Session) c_int;
 extern fn ekk_pg_finish(c: *Session) void;
@@ -62,8 +81,39 @@ pub extern fn ekk_pg_libpq_version() c_int;
 pub const Waiter = struct {
     query: Lean = null,
     next: ?*Waiter = null,
+    /// When the query's completion budget ends (`now`'s clock).
+    deadline: zio.Timestamp = .zero,
+    /// A result decided without a slot (an expiry in the queue, a budget
+    /// refused), waiting in the pool's `ready` list for its delivery.
+    result: Lean = null,
     deliver: *const fn (*Waiter, Lean) void,
 };
+
+/// The budgets of the pool's deadlines in milliseconds, each an external
+/// database budget (README, "PostgreSQL", "Deadlines"; Server.Transport
+/// options `--pg-query-ms`, `--pg-query-max-ms`, `--pg-connect-ms`).
+pub const Budgets = struct {
+    /// A query's completion budget when it names none (Query.timeoutMs).
+    query_ms: u32 = 5000,
+    /// The largest Query.timeoutMs a query may name.
+    query_max_ms: u32 = 5000,
+    /// A connect, from its start to a connection ready for queries.
+    connect_ms: u32 = 5000,
+};
+
+fn after(ms: u32, from: zio.Timestamp) zio.Timestamp {
+    return from.addDuration(zio.Duration.fromMilliseconds(ms));
+}
+
+/// The clock of the deadlines: the deadline timer's own (`ev.Timer.clock`,
+/// `.awake`), read fresh, not the loop's cached time.
+fn now() zio.Timestamp {
+    return zio.Timestamp.now(.awake);
+}
+
+fn due(t: zio.Timestamp, at: zio.Timestamp) bool {
+    return t.value <= at.value;
+}
 
 /// A slot's lifecycle. `connecting` is the pool's one connect in flight
 /// (`Pool.attempt`), for no query in particular; `busy` runs `waiter`'s
@@ -95,6 +145,10 @@ pub const Slot = struct {
     closer: ev.NetClose = undefined,
     /// The duplicate's `NetClose` is in flight.
     unregistering: bool = false,
+    /// connecting: when the connect's budget ends.
+    connect_deadline: zio.Timestamp = .zero,
+    /// The connect in flight ended by its deadline (its waiters' message).
+    connect_expired: bool = false,
 
     fn loop(self: *Slot) *ev.Loop {
         return self.pool.loop;
@@ -155,7 +209,9 @@ pub const Slot = struct {
         std.debug.assert(self.state == .disconnected and self.pool.attempt == null);
         self.pool.attempt = self;
         self.state = .connecting;
-        self.pg = ekk_pg_start(self.pool.conninfo);
+        self.connect_deadline = after(self.pool.budgets.connect_ms, now());
+        self.connect_expired = false;
+        self.pg = ekk_pg_start(self.pool.conninfo, self.pool.options);
         self.connectStep();
     }
 
@@ -180,7 +236,7 @@ pub const Slot = struct {
 
     /// The connect failed with no duplicate registered.
     fn connectFailed(self: *Slot) void {
-        self.pool.failWaiting(self.pg);
+        self.pool.failWaiting(self.pg, null);
         if (self.pg) |pg| ekk_pg_finish(pg);
         self.pg = null;
         self.state = .disconnected;
@@ -204,6 +260,14 @@ pub const Slot = struct {
                 self.state = .idle;
                 w.deliver(w, err);
                 self.pool.next(self);
+            },
+            3 => {
+                // The connection had failed before the query was handed to
+                // libpq: proven never sent.
+                const lost_err = ekk_pg_lost(self.pg);
+                self.waiter = null;
+                self.teardown();
+                w.deliver(w, lost_err);
             },
             else => self.lost(),
         }
@@ -296,15 +360,35 @@ pub const Slot = struct {
         if (self.state == .idle) self.pool.next(self);
     }
 
-    /// The connection failed while busy: the query fails with `08006`.
+    /// The connection failed while busy, after the query was handed to
+    /// libpq: it is abandoned with `08006` (it may have run).
     fn lost(self: *Slot) void {
         const w = self.waiter.?;
-        const err = ekk_pg_lost(self.pg);
+        const err = ekk_pg_lost_sent(self.pg);
         if (self.acc) |a| ekk_query_drop(a);
         self.acc = null;
         self.waiter = null;
         self.teardown();
         w.deliver(w, err);
+    }
+
+    /// The query's deadline passed while busy: its session is disposed of
+    /// (never reused, no PQcancel) and the query abandoned with `57014`,
+    /// delivered from the pool's `ready` list.
+    fn expire(self: *Slot) void {
+        const w = self.waiter.?;
+        if (self.acc) |a| ekk_query_drop(a);
+        self.acc = null;
+        self.waiter = null;
+        self.teardown();
+        self.pool.ready(w, ekk_pg_abandoned("57014", "the query's deadline passed; its session was closed, so whether it took effect is unknown"));
+    }
+
+    /// The connect's deadline passed: its session ends like a failed one,
+    /// and `finished` fails the queries waiting with `08006`.
+    fn connectExpire(self: *Slot) void {
+        self.connect_expired = true;
+        self.teardown();
     }
 
     /// Ends the connection: retires its polls, unregisters the duplicate,
@@ -330,7 +414,7 @@ pub const Slot = struct {
         // A connect step that ended in `closing` (connectFailedAfterPoll):
         // its poll failed, so libpq has no message worth reporting.
         const failed = self.pool.attempt == self;
-        if (failed) self.pool.failWaiting(null);
+        if (failed) self.pool.failWaiting(null, if (self.connect_expired) "the connect's deadline passed (--pg-connect-ms)" else null);
         if (self.pg) |pg| {
             ekk_pg_finish(pg);
             if (self.pool.trace) std.debug.print("pg closed\n", .{});
@@ -357,9 +441,21 @@ pub const Slot = struct {
 pub const Pool = struct {
     loop: *ev.Loop,
     conninfo: [*:0]const u8,
+    /// The startup `options` of every session (pg.c, ekk_pg_options):
+    /// statement_timeout among them.
+    options: [*:0]const u8,
+    budgets: Budgets,
     slots: []Slot,
     head: ?*Waiter = null,
     tail: ?*Waiter = null,
+    /// Waiters whose result is decided (`Waiter.result`), delivered by
+    /// `dispatch` in order.
+    ready_head: ?*Waiter = null,
+    ready_tail: ?*Waiter = null,
+    /// The deadline timer, armed for `timer_due` while that is set; its
+    /// callback clears it.
+    timer: ev.Timer = undefined,
+    timer_due: ?zio.Timestamp = null,
     /// The slot whose connect is in flight: at most one per pool. It stays
     /// set while that connect's failure is delivered, so a query submitted
     /// from a delivery waits for the next connect instead of joining it.
@@ -375,18 +471,37 @@ pub const Pool = struct {
     /// Prints `pg closed` when a slot has ended its session (tests).
     trace: bool,
 
-    pub fn init(self: *Pool, loop: *ev.Loop, conninfo: [*:0]const u8, slots: []Slot, trace: bool) void {
-        self.* = .{ .loop = loop, .conninfo = conninfo, .slots = slots, .trace = trace };
+    pub fn init(self: *Pool, loop: *ev.Loop, conninfo: [*:0]const u8, options: [*:0]const u8, budgets: Budgets, slots: []Slot, trace: bool) void {
+        self.* = .{ .loop = loop, .conninfo = conninfo, .options = options, .budgets = budgets, .slots = slots, .trace = trace };
+        self.timer = ev.Timer.init(.none);
+        self.timer.c.callback = timerCb;
+        self.timer.c.userdata = self;
         for (slots) |*s| s.* = .{ .pool = self };
     }
 
     /// Runs query `q` (owned) for `w`; the result reaches `w.deliver`, at
-    /// once when there is no slot to run it at all.
+    /// once when there is no slot to run it at all. Its completion deadline
+    /// starts now.
     pub fn submit(self: *Pool, w: *Waiter, q: Lean) void {
-        std.debug.assert(w.query == null and w.next == null);
-        w.query = q;
-        self.enqueue(w);
+        std.debug.assert(w.query == null and w.next == null and w.result == null);
+        const ms = ekk_query_timeout_ms(q, self.budgets.query_ms, self.budgets.query_max_ms);
+        if (ms == 0) {
+            ekk_query_drop(q);
+            self.ready(w, ekk_pg_error("22023", "Query.timeoutMs must be at least 1 and at most the server's ceiling (--pg-query-max-ms)"));
+        } else {
+            w.deadline = after(ms, now());
+            w.query = q;
+            self.enqueue(w);
+        }
         self.dispatch();
+    }
+
+    /// Queues `w` for the delivery of `r` (owned) by `dispatch`.
+    fn ready(self: *Pool, w: *Waiter, r: Lean) void {
+        std.debug.assert(w.next == null and w.result == null);
+        w.result = r;
+        if (self.ready_tail) |t| t.next = w else self.ready_head = w;
+        self.ready_tail = w;
     }
 
     fn enqueue(self: *Pool, w: *Waiter) void {
@@ -402,13 +517,24 @@ pub const Pool = struct {
         return w;
     }
 
-    /// Gives waiting queries to idle connections; when queries still wait,
-    /// starts a connect unless one is in flight.
+    /// Delivers the results decided without a slot, gives waiting queries
+    /// to idle connections, and when queries still wait starts a connect
+    /// unless one is in flight; then re-arms the deadline timer.
     fn dispatch(self: *Pool) void {
         if (self.dispatching) return;
         self.dispatching = true;
         defer self.dispatching = false;
-        while (self.head != null) {
+        while (true) {
+            if (self.ready_head) |w| {
+                self.ready_head = w.next;
+                if (self.ready_head == null) self.ready_tail = null;
+                w.next = null;
+                const r = w.result;
+                w.result = null;
+                w.deliver(w, r);
+                continue;
+            }
+            if (self.head == null) break;
             if (self.slots.len == 0) {
                 // No database configured (--pg): fail each query. Through
                 // this loop, a handler that asks again on the error does not
@@ -432,6 +558,72 @@ pub const Pool = struct {
         if (self.stopping and self.head == null) {
             for (self.slots) |*s| if (s.state == .idle) s.teardown();
         }
+        self.rearm();
+    }
+
+    /// Arms the deadline timer for the earliest deadline still running: a
+    /// queued query's, a busy slot's query's, the connect's. A timer whose
+    /// callback is already on its way is left to it: that callback re-arms.
+    fn rearm(self: *Pool) void {
+        var next_due: ?zio.Timestamp = null;
+        var it = self.head;
+        while (it) |w| : (it = w.next) next_due = earliest(next_due, w.deadline);
+        for (self.slots) |*s| switch (s.state) {
+            .busy => next_due = earliest(next_due, s.waiter.?.deadline),
+            .connecting => next_due = earliest(next_due, s.connect_deadline),
+            else => {},
+        };
+        if (self.timer_due) |d| {
+            if (next_due) |n| if (n.value == d.value) return;
+            if (!self.loop.clearTimer(&self.timer)) return;
+            self.timer_due = null;
+        }
+        if (next_due) |n| {
+            self.timer_due = n;
+            self.loop.setTimer(&self.timer, .{ .deadline = n });
+        }
+    }
+
+    fn earliest(a: ?zio.Timestamp, b: zio.Timestamp) zio.Timestamp {
+        const x = a orelse return b;
+        return if (b.value < x.value) b else x;
+    }
+
+    /// The deadline timer ended: everything due by the clock now
+    /// expires. A queued query is unlinked and answered `57014` (never
+    /// sent); a busy slot's query is abandoned and its session disposed of
+    /// (`Slot.expire`); the connect in flight ends (`Slot.connectExpire`).
+    /// Deliveries run from `dispatch`, after the state is repaired; one a
+    /// connect's end makes at once (`failWaiting`) may submit, and that
+    /// query waits for the `dispatch` below.
+    fn timerCb(_: *ev.Loop, c: *ev.Completion) void {
+        const self: *Pool = @ptrCast(@alignCast(c.userdata.?));
+        self.timer_due = null;
+        std.debug.assert(!self.dispatching);
+        self.dispatching = true;
+        const t = now();
+        var prev: ?*Waiter = null;
+        var it = self.head;
+        while (it) |w| {
+            it = w.next;
+            if (!due(w.deadline, t)) {
+                prev = w;
+                continue;
+            }
+            if (prev) |p| p.next = w.next else self.head = w.next;
+            if (self.tail == w) self.tail = prev;
+            w.next = null;
+            ekk_query_drop(w.query);
+            w.query = null;
+            self.ready(w, ekk_pg_error("57014", "the query's deadline passed before it was sent"));
+        }
+        for (self.slots) |*s| switch (s.state) {
+            .busy => if (due(s.waiter.?.deadline, t)) s.expire(),
+            .connecting => if (due(s.connect_deadline, t)) s.connectExpire(),
+            else => {},
+        };
+        self.dispatching = false;
+        self.dispatch();
     }
 
     fn find(self: *Pool, state: SlotState) ?*Slot {
@@ -440,9 +632,10 @@ pub const Pool = struct {
     }
 
     /// The connect in flight failed: every query waiting now fails once with
-    /// `08006` (`pg`'s message when given). A query submitted from one of
-    /// these deliveries joins a fresh queue, for the next connect.
-    fn failWaiting(self: *Pool, pg: ?*Session) void {
+    /// `08006` (`message`, else `pg`'s message when given). A query
+    /// submitted from one of these deliveries joins a fresh queue, for the
+    /// next connect.
+    fn failWaiting(self: *Pool, pg: ?*Session, message: ?[*:0]const u8) void {
         std.debug.assert(self.attempt != null);
         var it = self.head;
         self.head = null;
@@ -452,7 +645,7 @@ pub const Pool = struct {
             w.next = null;
             ekk_query_drop(w.query);
             w.query = null;
-            w.deliver(w, ekk_pg_lost(pg));
+            w.deliver(w, if (message) |m| ekk_pg_error("08006", m) else ekk_pg_lost(pg));
         }
     }
 
