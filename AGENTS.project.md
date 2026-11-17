@@ -70,3 +70,7 @@ PostgreSQL glue (`zig/src/pg.c`, `zig/src/pg_glue_test.c`) and at each
 update of libpq; it is not part of every item's gate (decided 2026-11-17,
 item oruxe4; whether it joins the gate is a later decision on its measured
 time and disk use).
+The PostgreSQL checkout it takes as PGSRC lives at
+`${XDG_CACHE_HOME:-~/.cache}/lean-zio-http/postgresql`, next to the script's
+libpq cache; `git -C` it `fetch --tags` before a run, and clone
+`https://git.postgresql.org/git/postgresql.git` there only when it is missing.
