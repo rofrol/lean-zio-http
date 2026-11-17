@@ -16,3 +16,5 @@ Question: which start should the head budget of a pipelined request have?
 - (b) Start it at the first byte of that request, which needs the loop to
   report the time bytes arrived (or Lean to carry a "head started" mark
   across the write phase) and a second deadline alive during writing.
+
+Decided 2026-11-17 by the coordinating session with sol (consult round 20261117-101429-40ca), under the user's delegation: option (b). The settled contract starts a later request's head budget at its first byte, and the older wording about when reading starts does not override that. Keep the head-start timestamp across writing, with its own head deadline and generation-checked expiry in Conn.step. State where the ingress timestamp comes from: stamping when Lean finally consumes bytes that were already buffered is not enough. Force a partial pipelined head behind a blocked response, and check that finishing the response neither starts nor resets that head's budget.
