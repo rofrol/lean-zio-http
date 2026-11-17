@@ -19,7 +19,7 @@ Checked 2026-11-17 with sol (consult round 20261117-011832-74e7) under the user'
 2026-11-17: the epoll PostgreSQL pool tests moved to ogcdwm, which runs them on the 2010 MacBook as diagnostics. This item keeps only the performance acceptance runs.
 
 Decided by the user 2026-11-17: option 2, run on vps.frolow.dev. This is the user's consent to load tests on that production host for this item only. The coordinating session was told beforehand, and it said, that the load generator must share the server's 2 vCPUs there, so the results understate the server; the user chose the VPS knowing that. Conditions set by the coordinating session:
-- Run at a quiet hour for ekklesiai.org (night, Europe/Warsaw). Tell the ekklesiai.org session before the start and after the end, through the coordinating session.
+- Any time: the user said on 2026-11-17 that nobody uses the VPS yet, so there is no quiet hour to wait for. Tell the ekklesiai.org session before the start and after the end, through the coordinating session.
 - Never stop, restart or reconfigure the site's own services, database or firewall. Use ports and processes of the run's own, and remove everything the run installed or started when it ends.
 - Stop as soon as the site's responses fail or slow down visibly (check its health URL between runs). Record that and do not resume without the user.
 - Report every figure as measured with the generator on the same 2 vCPUs: a lower bound and a diagnostic, not a clean D2 acceptance. The README says so next to the numbers.
