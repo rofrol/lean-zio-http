@@ -1,6 +1,5 @@
 ## Next, in order
 
-dv6ikn Decide when a pipelined request's head budget starts
 qtvoaq Check whether an accept on the shared listening socket can complete on another loop's thread
 znioju Test a write deadline expiring during a partial send, in both orders
 5lkloz Test a connection whose close completes before a retired timer's callback
@@ -16,6 +15,9 @@ grjqox Move dusty-hello's zio pin to the server's (830564437b2c)
 u4moqo Move the toolchain to the first nightly with lean4 PR 16417 (Std.Http RFC fixes)
 
 ## Proposed
+
+qyqvew Should a pipelined head's budget also start at its first byte while the previous request's query runs?
+pt5vje Should a complete pipelined head held in the kernel survive the end of its head budget during a slow write?
 
 ## Needs a decision
 
