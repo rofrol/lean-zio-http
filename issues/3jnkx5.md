@@ -11,3 +11,12 @@ Checked 2026-11-16 with sol (consult round 20261116-145342-a8e2): this choice ch
 Checked 2026-11-17 with sol (consult round 20261117-011832-74e7) under the user's delegation: stays with the user: needs handler completion and connect budgets, whether a cancel is acknowledged (and whether PQcancel itself can block), the transaction or session disposition and shutdown semantics; no value is justified yet.
 
 Related (bx6zh5, closed 2026-11-17): a failed coalesced connect fails every waiting query even when busy healthy connections could serve them later. Keeping waiters instead was rejected because, without query deadlines, an open connection is no evidence of eventual capacity. Once deadlines are decided here, revisit whether waiters may wait for open connections.
+
+Decided 2026-11-17 by the coordinating session with sol (consult round 20261117-090011-f37f), as the user delegated that day. Defaults, all configurable, each an external database budget stated next to its value:
+- query completion: 5 s from pool submission to the complete result, queueing included; a handler may ask for another budget up to a configurable ceiling, initially 5 s;
+- connect: 5 s from the start of the attempt, enforced around libpq's asynchronous polling, since connect_timeout does not bound that API; a waiter keeps its own earlier query deadline;
+- PostgreSQL statement_timeout: 4 s, set on each session before application queries.
+Submission, completion, connect failure and expiry are pool events with operation generations. Prove exactly-once handler completion, removal of an expired waiter, that a stale event changes nothing, and that a timed-out session is never reused. On query expiry, fail the handler and dispose of the session without waiting on PQcancel. Answer 504 if no header has been sent yet, otherwise close. A write that was running may have committed, so report an unknown outcome (ycpzlt's signal) and never replay it.
+Shutdown stops admission, closes idle connections and lets admitted work finish within its budgets and ytzycm's 10 s drain; when the drain expires, everything still open is disposed of.
+After that, revisit bx6zh5: a failed connect may keep its waiters only while healthy busy sessions exist, and only up to those waiters' own deadlines.
+Order of commits: pool deadlines and session disposal with database integration tests, then shutdown, then the waiter change.
