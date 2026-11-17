@@ -15,3 +15,7 @@ cost is spread over N rows while the bound still holds within one chunk
 the minimum (now 14.6/15.1/16), which is the owner's call: a raised
 requirement for deployments versus the measured cost on large results.
 Option B of qsqb5f's options.
+
+Checked 2026-11-17 with sol (consult round 20261117-065930-4e87): stays with the user, because it raises the libpq minimum ekklesiai.org must deploy (17). Before implementation it also needs a chunk-size policy with tests that establish the memory bound (oversized single rows included; rejecting a chunk libpq already built does not keep the bound), and throughput, CPU and peak-memory comparisons with single-row mode.
+Question: Raise the minimum libpq to 17 to collect rows in chunks?
+Options: keep single-row mode and the current minimum (14.6/15.1/16+) | raise the minimum to 17 once the VPS has it, then evaluate chunked mode as described
