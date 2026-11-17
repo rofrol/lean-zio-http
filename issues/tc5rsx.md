@@ -7,3 +7,5 @@ Seen in aazqxm: `ekk_pg_collect` (zig/src/pg.c) receives each statement result w
 Question: Should results be received incrementally (libpq chunked-rows mode, PostgreSQL 17+) with the session disposed of on overflow, or keep whole-result buffering?
 Options: incremental with session disposal on overflow, after a compatibility review | keep whole-result buffering and document the cost
 Checked 2026-11-16 with sol (consult round 20261116-145342-a8e2): this choice changes a contract, failure behavior or architecture, so it stays with the user; recommendation first.
+
+Decided 2026-11-17 by the coordinating session with sol (consult round 20261117-011832-74e7), under the user's delegation of the same day to decide the open questions with sol: investigation only: compare single-row and chunked-rows modes across the libpq versions supported, including oversized single fields and rows and libpq's transient buffering, and propose an overflow and session contract as a new Needs-a-decision item. No implementation in this item.
