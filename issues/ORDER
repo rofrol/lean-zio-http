@@ -1,6 +1,5 @@
 ## Next, in order
 
-mpimfx Decide whether to allocate a response with the capacity it needs
 4ia52d Count each row and field in Query.maxResultBytes
 qsqb5f How a PostgreSQL result over Query.maxResultBytes is received and how it ends the session
 kvnm3u Decide whether the type, not a comment, should keep the clock out of the adapter's kept state
