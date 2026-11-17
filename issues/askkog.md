@@ -14,3 +14,5 @@ Question: run the script once with a fresh PostgreSQL checkout (`git clone
 https://git.postgresql.org/git/postgresql.git`, about 600 MB) to confirm the
 whole script on the 17+ lines, or accept the direct runs above?
 Options: run it now (needs the checkout) | accept the direct runs until the next libpq update
+
+Decided 2026-11-17 by the coordinating session: run it now. The premise was wrong: a PostgreSQL checkout exists at ~/.cache/lean-zio-http/postgresql, the one 3jnkx5's gate passed to libpq-lines.sh. Run `./libpq-lines.sh ~/.cache/lean-zio-http/postgresql` (`git -C ... fetch --tags` first) on main and record the per-release lines in the finishing commit. If a release fails, find the cause before anything else. Also make AGENTS.project.md name where the checkout lives (as a generic cache path, not a user path) so the next run finds it.
