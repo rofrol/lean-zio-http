@@ -5,11 +5,11 @@ u4moqo Move the toolchain to the first nightly with lean4 PR 16417 (Std.Http RFC
 znorfg Should the transport tests' cleanup and leak report get a committed check of their own?
 ogcdwm Should the transport tests run on Linux, so the Unix-domain parked-send test is checked on epoll and io_uring?
 ncvxfx Should a query whose deadline expires during the statement Close keep its known error?
+im7c5q Should dusty-hello give dusty the real zio module instead of its stub?
 
 ## Proposed
 
 q2g4am Act on leanprover/lean4's answers to the Std.Http questions 16522 and 16523
-im7c5q Should dusty-hello give dusty the real zio module instead of its stub?
 
 ## Needs a decision
 
