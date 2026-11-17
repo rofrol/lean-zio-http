@@ -1,6 +1,5 @@
 ## Next, in order
 
-se4hhx Should a transport test force a send that stays in the kernel when its write deadline expires?
 ycpzlt Should Server.Query carry a structured "outcome unknown" signal for a query the server abandoned?
 3jnkx5 Deadlines for PostgreSQL queries, connection attempts and shutdown in the Lean server
 lgxdi7 Prepare the upstream question for mxzlsx (Std.Http H1 reparses an unfinished field line)
@@ -14,6 +13,8 @@ u4moqo Move the toolchain to the first nightly with lean4 PR 16417 (Std.Http RFC
 znorfg Should the transport tests' cleanup and leak report get a committed check of their own?
 
 ## Proposed
+
+ogcdwm Should the transport tests run on Linux, so the Unix-domain parked-send test is checked on epoll and io_uring?
 
 ## Needs a decision
 
