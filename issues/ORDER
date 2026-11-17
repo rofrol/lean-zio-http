@@ -1,6 +1,7 @@
 ## Next, in order
 
 mzqamr Should serve.zig run on epoll on Linux, or be made correct under io_uring, zio's Linux default?
+emb2ob Make the transport tests' TCP send-buffer premises hold on Linux
 ogcdwm Should the transport tests run on Linux, so the Unix-domain parked-send test is checked on epoll and io_uring?
 53rwgc Linux acceptance runs for the Lean HTTP server
 ncvxfx Should a query whose deadline expires during the statement Close keep its known error?
