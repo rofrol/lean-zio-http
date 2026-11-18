@@ -11,3 +11,5 @@ Options:
 Recommendation: decide after the accept fix and a re-measurement, since the arena's current figures cover only half the connections.
 
 Considered 2026-11-17 by the coordinating session with sol (consult call 36443c1b): later, third, after remeasurement. A change to the core's step contract needs tests of ordering, partial writes, bounded buffers and backpressure.
+
+Decided 2026-11-19 by the coordinating session with sol, argon and hydrogen (consult round 20261119-003634-0938; calls 6335ef0f, 373e193f, c47aa49a), at the user's request to decide the queue's order with the models: approved, third, after owgate. Batch the responses to the complete requests already in the receive buffer into the out_cap-bounded out buffer and send once. Conditions: tests (or proofs) of response order, partial writes, the out_cap bound and backpressure in Conn.step; local verification only (./check.sh, ./bench.sh, ./linux-check.sh), no VPS load run; no sleep, retry or delay. A later remeasurement on real hardware happens once, together, after 4bngph, owgate and paarzq, preferably as 2ltibq's clean run.
