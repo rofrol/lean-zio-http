@@ -1,6 +1,5 @@
 ## Next, in order
 
-3pund6 Decide what follows from the classification of Linux pending-connection accept errnos (xihdtw)
 laxhsb Find why the sending-memory boundary scenario once missed a connection in lsof's reading on macOS
 bfvj2q Run the memory scenarios that wait on socket queues on Linux
 4bngph Move the toolchain to the first nightly with lean4 PR 16562 and set maxPathSegments and maxQueryParams in the H1 adapter
@@ -16,3 +15,4 @@ owgate Find where H1's parse spends 40 % of lsrv-arena's CPU (about 4-6 µs per 
 
 yvladm Decide whether per-loop PostgreSQL pools should share connections across loops
 2ltibq Run a clean D2 acceptance of the Lean HTTP server with the load generator on cores of its own
+3pund6 Decide what follows from the classification of Linux pending-connection accept errnos (xihdtw)
