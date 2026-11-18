@@ -22,3 +22,29 @@ Options: keep exiting and keep the item open as a bounded finding | ask zio upst
 Checked 2026-11-17 with sol (consult round 20261117-011832-74e7) under the user's delegation: deferred: keep today's exit and the bounded kernel finding; asking zio upstream needs the user's go. No local workaround.
 
 Decided 2026-11-18 by the coordinating session with sol, argon and hydrogen (consult round 20261118-181941-5f8f; calls 4a23f520, e4c9a8ea, 272fc555), under the user's delegation of 2026-11-18 to decide the remaining open questions with the models: approved (all three agree): keep today's exit on these errnos and the bounded kernel finding in README; no local workaround. Ask zio upstream with one issue on https://github.com/lalinsky/zio from the user's gh account: the mappings (src/os/base.zig unexpectedError for ENETUNREACH, EHOSTUNREACH, EHOSTDOWN, ENONET, ENOPROTOOPT; src/os/net.zig errnoToAcceptError EOPNOTSUPP -> OperationNotSupported) at the pinned commit and HEAD; accept(2)'s retry note; the Linux sources read (v5.4, v6.1, mainline aebb727: inet_accept returns only inet_csk_accept's EINVAL, EAGAIN or wait errors, also through io_uring); that there is no reproducer and other kernels and security-module hooks were not read; the question whether these should get named accept errors or stay Unexpected as documented behavior. No man-pages report. Tell ekklesiai.org's session the finding and the issue link for its decision record 0001. Track the answer in this item; a confirmed bug follows Rule 6 (fork and PR).
+
+Blocked 2026-11-18: posting the issue (`gh issue create -R lalinsky/zio --body-file ...`) was denied by Claude Code's auto-mode classifier ("Unsanctioned Communication"). Not retried. Checked first: the mapping is unchanged at zio 53ed3c3, which is also upstream HEAD (src/os/net.zig errnoToAcceptError lines 896-913; src/os/base.zig unexpectedError line 40); no existing zio issue matches (gh search: "accept errno", ENETUNREACH, errnoToAcceptError); the accept(2) quote was checked against man7.org.
+
+Question: Will you post the drafted zio issue below yourself, or allow this session to post it (a permission rule for `gh issue create -R lalinsky/zio`)?
+Options: allow the session to post it | post it yourself (gh issue create -R lalinsky/zio --title TITLE --body-file FILE) | don't ask upstream, keep the bounded finding
+
+Draft title: errnoToAcceptError: should Linux's pending-connection errnos (ENETUNREACH, EHOSTUNREACH, EHOSTDOWN, ENONET, ENOPROTOOPT, EOPNOTSUPP) stay Unexpected?
+
+Draft body:
+
+    A question about `errnoToAcceptError` on Linux, not a reported failure: we have no reproducer.
+    
+    At 53ed3c3 (current HEAD), `errnoToAcceptError` in `src/os/net.zig` maps these errnos on non-Windows targets:
+    
+    - `ENETUNREACH`, `EHOSTUNREACH`, `EHOSTDOWN`, `ENONET` and `ENOPROTOOPT` fall through to `else => unexpectedError(e)`. That returns `error.Unexpected` and logs "please file a bug report".
+    - `EOPNOTSUPP` maps to `error.OperationNotSupported`.
+    
+    Linux's accept(2) lists all six as errors of a *pending* connection, not of the listening socket: "Linux accept() (and accept4()) passes already-pending network errors on the new socket as an error code from accept(). ... For reliable operation the application should detect the network errors defined for the protocol after accept() and treat them like EAGAIN by retrying. In the case of TCP/IP, these are ENETDOWN, EPROTO, ENOPROTOOPT, EHOSTDOWN, ENONET, EHOSTUNREACH, EOPNOTSUPP, and ENETUNREACH."
+    
+    A caller can't tell these apart from a broken listener. `Unexpected` and `OperationNotSupported` also cover errors of the listening socket itself. If the caller re-arms on them, a persistent listener error loops forever. If it treats them as fatal, it exits on what accept(2) calls a transient error of one peer. `ENETDOWN` and `EPROTO` already get named errors (`NetworkDown`, `ProtocolFailure`), so a caller can retry on those two.
+    
+    We read the TCP accept path in Linux v5.4, v6.1 and mainline aebb727. There, `inet_accept` returns only the error of `inet_csk_accept`, which fails only with `EINVAL` (not listening), `EAGAIN`, or the error of its wait for a connection. That holds for IPv4 and IPv6, and also through io_uring's accept. So on those kernels these errnos seem unreachable for TCP. We have not read other kernel versions, other protocols, or security modules' accept hooks.
+    
+    Question: are these six meant to stay `Unexpected` / `OperationNotSupported`? If so, could the docs say so? Or should they get a named, retryable accept error, like `NetworkDown` and `ProtocolFailure`? We'd like to rely on what zio documents rather than on our reading of the kernel.
+    
+    Context: our server ([lean-zio-http](https://github.com/rofrol/lean-zio-http), README "Accept errors") currently exits on these errors and documents why.
