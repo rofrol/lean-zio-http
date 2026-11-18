@@ -49,6 +49,14 @@
 //   ends at its deadline at the latest; there are no retries or backoff:
 //   this bounds concurrent connects per loop, not the rate of connects while
 //   the database stays down.
+// - A chain of completions that the pool makes synchronously (a delivery
+//   whose handler submits again and is answered at once: no slots, the
+//   database down, a query that cannot be sent) runs inline for about
+//   `chain_inline` completions per turn of the loop; the rest of it goes on
+//   in a later turn of the loop (`yieldChain`), so a long chain does not
+//   hold the loop's other ready work, and it may outlive the `submit` that
+//   started it. Decided 2026-11-18, item rtkla3. Only the shutdown's
+//   `abort` runs its chain to the end (`abort`).
 // - zio's socket registry keeps a registration per descriptor until a
 //   `NetClose` removes it (and asserts nothing is parked on it), while libpq
 //   closes and may replace its own socket (PQfinish, PQconnectPoll). So the
@@ -108,6 +116,17 @@ pub const Budgets = struct {
     /// A connect, from its start to a connection ready for queries.
     connect_ms: u32 = 5000,
 };
+
+/// The completions one run of `Pool.dispatch` delivers before it hands the
+/// rest of a synchronous chain to the loop's next turn (`Pool.yieldChain`).
+/// A count, not a time. 64: a handler that asks again on an error a few
+/// times (a short chain) finishes inline, with no extra turn of the loop,
+/// while a turn runs about 64 handler steps of a long chain before the
+/// loop serves its other ready work (the bound is checked between steps,
+/// and one step may deliver several results: a failed connect answers
+/// every query waiting): the same bound serve.zig puts on the accepts of
+/// one callback (`default_accept_batch`), for the same reason.
+pub const chain_inline: u32 = 64;
 
 fn after(ms: u32, from: zio.Timestamp) zio.Timestamp {
     return from.addDuration(zio.Duration.fromMilliseconds(ms));
@@ -300,7 +319,7 @@ pub const Slot = struct {
                 // Not sent; the connection is unchanged.
                 self.waiter = null;
                 self.state = .idle;
-                w.deliver(w, err);
+                self.pool.complete(w, err);
                 self.pool.next(self);
             },
             3 => {
@@ -309,7 +328,7 @@ pub const Slot = struct {
                 const lost_err = ekk_pg_lost(self.pg);
                 self.waiter = null;
                 self.teardown();
-                w.deliver(w, lost_err);
+                self.pool.complete(w, lost_err);
             },
             else => self.lost(),
         }
@@ -408,7 +427,7 @@ pub const Slot = struct {
             self.pool.connect_failed = false;
             self.state = .idle;
         }
-        w.deliver(w, result);
+        self.pool.complete(w, result);
         if (self.state == .idle) self.pool.next(self);
     }
 
@@ -424,7 +443,7 @@ pub const Slot = struct {
         self.acc = null;
         self.waiter = null;
         self.teardown();
-        w.deliver(w, err);
+        self.pool.complete(w, err);
     }
 
     /// The query's deadline passed while busy (or the shutdown drain ended):
@@ -540,17 +559,32 @@ pub const Pool = struct {
     /// a busy session gets a complete answer from the database (`collect`)
     /// or none is busy any more (`dispatch` then fails the queue).
     connect_failed: bool = false,
+    /// Completions delivered (`complete`) since the outermost run of
+    /// `dispatch` began, or while a yielded chain waits, since `contCb`
+    /// began; at `chain_inline` the run yields (`yieldChain`).
+    delivered: u32 = 0,
+    /// The turn that goes on with a chain `dispatch` yielded: in the loop,
+    /// notified, while `cont_armed` (`contCb`). The queue and the ready
+    /// list are the record of what is left; this only brings the turn.
+    cont: ev.Async = undefined,
+    cont_armed: bool = false,
     /// Prints `pg closed` when a slot has ended its session (tests).
     trace: bool,
 
+    /// The pool must not move afterwards: its slots and `cont` point to it.
     pub fn init(self: *Pool, loop: *ev.Loop, conninfo: [*:0]const u8, options: [*:0]const u8, budgets: Budgets, slots: []Slot, trace: bool) void {
         self.* = .{ .loop = loop, .conninfo = conninfo, .options = options, .budgets = budgets, .slots = slots, .trace = trace };
+        self.cont = ev.Async.init();
+        self.cont.c.callback = contCb;
+        self.cont.c.userdata = self;
         for (slots) |*s| s.* = .{ .pool = self };
     }
 
-    /// Runs query `q` (owned) for `w`; the result reaches `w.deliver`, at
-    /// once when there is no slot to run it at all. Its completion deadline
-    /// starts now.
+    /// Runs query `q` (owned) for `w`; the result reaches `w.deliver`, from
+    /// this call when the pool answers it at once (no slot to run it at
+    /// all, the database down), unless this call's chain of such answers is
+    /// already `chain_inline` long: then from a later turn of the loop
+    /// (`yieldChain`). Its completion deadline starts now.
     pub fn submit(self: *Pool, w: *Waiter, q: Lean) void {
         std.debug.assert(w.query == null and w.next == null and w.result == null);
         const ms = ekk_query_timeout_ms(q, self.budgets.query_ms, self.budgets.query_max_ms);
@@ -576,6 +610,13 @@ pub const Pool = struct {
         self.ready_tail = w;
     }
 
+    /// Delivers `r` (owned) to `w`, counted for `dispatch`'s bound on a
+    /// synchronous chain. Every result reaches its waiter through here.
+    fn complete(self: *Pool, w: *Waiter, r: Lean) void {
+        self.delivered +|= 1;
+        w.deliver(w, r);
+    }
+
     fn enqueue(self: *Pool, w: *Waiter) void {
         if (self.tail) |t| t.next = w else self.head = w;
         self.tail = w;
@@ -591,19 +632,37 @@ pub const Pool = struct {
 
     /// Delivers the results decided without a slot, gives waiting queries
     /// to idle connections, and when queries still wait starts a connect
-    /// unless one is in flight; then re-arms the deadline timer.
+    /// unless one is in flight; then re-arms the deadline timer. Once this
+    /// run has delivered `chain_inline` results and work is left, the rest
+    /// waits for a later turn of the loop (`yieldChain`); a shutdown's
+    /// `abort` runs to the end instead.
     fn dispatch(self: *Pool) void {
         if (self.dispatching) return;
         self.dispatching = true;
         defer self.dispatching = false;
+        // While a yielded chain waits for its turn (`cont_armed`), the count
+        // goes on: a submit from another callback in the meantime queues
+        // behind the chain instead of running a further `chain_inline` of it
+        // ahead of the loop's other ready work; `contCb` starts the count
+        // afresh.
+        if (!self.cont_armed) self.delivered = 0;
         while (true) {
+            // After `abort`, serve.zig's drain closes every connection, and
+            // a connection whose query is still in the pool must not be
+            // closed (`Conn.cut`): so an aborted pool never yields.
+            if (self.delivered >= chain_inline and !self.aborted and
+                (self.ready_head != null or self.head != null))
+            {
+                self.yieldChain();
+                break;
+            }
             if (self.ready_head) |w| {
                 self.ready_head = w.next;
                 if (self.ready_head == null) self.ready_tail = null;
                 w.next = null;
                 const r = w.result;
                 w.result = null;
-                w.deliver(w, r);
+                self.complete(w, r);
                 continue;
             }
             if (self.connect_failed and self.find(.busy) == null) {
@@ -625,7 +684,7 @@ pub const Pool = struct {
                 const w = self.dequeue().?;
                 ekk_query_drop(w.query);
                 w.query = null;
-                w.deliver(w, ekk_pg_error("08006", "no database is configured (--pg)"));
+                self.complete(w, ekk_pg_error("08006", "no database is configured (--pg)"));
                 continue;
             }
             if (self.find(.idle)) |slot| {
@@ -642,6 +701,33 @@ pub const Pool = struct {
             for (self.slots) |*s| if (s.state == .idle) s.teardown();
         }
         self.rearm();
+    }
+
+    /// Puts the rest of a chain on the loop's runnable queue: `cont`, added
+    /// and notified, completes at the loop's next check of its handles, and
+    /// a completion queued while the loop runs callbacks waits for the next
+    /// tick (pinned 53ed3c377317, src/ev/completion.zig `Async.Pending`;
+    /// src/ev/loop.zig `processCompletions`: "Drain only what was queued at
+    /// entry ... The rest runs next tick"), so the loop serves the other
+    /// work that is ready before the chain goes on. An armed handle keeps
+    /// `Loop.run` from returning (`Loop.done`), so the rest of the chain is
+    /// always delivered. Re-adding `cont` from its own callback is what
+    /// serve.zig's `LoopCtx.readyCb` does with `wake`, on the same
+    /// documentation.
+    fn yieldChain(self: *Pool) void {
+        if (self.cont_armed) return;
+        self.cont_armed = true;
+        self.loop.add(&self.cont.c);
+        self.cont.notify();
+    }
+
+    /// A later turn of the loop: the chain `dispatch` yielded goes on.
+    fn contCb(lp: *ev.Loop, c: *ev.Completion) void {
+        const self: *Pool = @ptrCast(@alignCast(c.userdata.?));
+        ownLoop(lp, self.loop);
+        self.cont_armed = false;
+        self.delivered = 0;
+        self.dispatch();
     }
 
     /// Arms the deadline timer for the earliest deadline still running: a
@@ -773,7 +859,7 @@ pub const Pool = struct {
             w.next = null;
             ekk_query_drop(w.query);
             w.query = null;
-            w.deliver(w, if (message) |m| ekk_pg_error("08006", m) else ekk_pg_lost(pg));
+            self.complete(w, if (message) |m| ekk_pg_error("08006", m) else ekk_pg_lost(pg));
         }
     }
 
@@ -795,7 +881,9 @@ pub const Pool = struct {
     /// (`Slot.expire`), the connect in flight ends, and from
     /// now on `submit` answers every query at once, unsent. Every result is
     /// delivered before this returns; a delivery that submits is answered
-    /// in the same run of `dispatch`.
+    /// in the same run of `dispatch`, which here does not yield however
+    /// long the chain (`chain_inline`), since the drain closes every
+    /// connection right after this returns (serve.zig, `drainCb`).
     pub fn abort(self: *Pool) void {
         std.debug.assert(!self.dispatching);
         self.stopping = true;

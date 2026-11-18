@@ -552,7 +552,11 @@ else meanwhile; the loop serves its other connections (`Conn.step_query`,
   queued (a Close) flushed before its results are awaited and a connection
   lost then delivering the query's answer, a session ended
   (COPY) with both polls outstanding, synchronous chains of 10,000
-  failing queries (no slots, the database down) that stay iterative,
+  failing queries (no slots, the database down) that stay iterative and
+  let a receive ready on the same loop run before they end, each result
+  delivered once, a query submitted while one waits for its turn queued
+  behind it (and, after the drain's end, also one already waiting, run
+  to their end at once),
   deadlines (an expiry in the queue unlinks only that query, a busy
   query's expiry closes its session without reading, which never serves
   again, a connect's deadline fails its waiters, a waiter's own earlier
@@ -598,8 +602,13 @@ else meanwhile; the loop serves its other connections (`Conn.step_query`,
   and runs an `INSERT ... RETURNING` over the bound (abandoned with
   `54000`, the session closed, the insert wholly applied or not at all).
   A chain of queries that fail synchronously, each asked again from its
-  error, runs entirely inside the `submit` that started it: the loop serves
-  nothing else until the chain ends.
+  error, runs inside the `submit` that started it for its first
+  `chain_inline` (64) results; the rest goes on from later turns of the
+  loop, which serves its other ready work in between, so a long chain may
+  outlive the `submit` that started it (decided 2026-11-18, item rtkla3;
+  `zig/src/pg.zig`, `chain_inline` and `Pool.yieldChain`). After the
+  shutdown's drain has ended (`Pool.abort`) a chain runs to its end at
+  once, since the drain then closes every connection.
 - **Bounded only in part:** the pool gathers at most `Query.maxResultBytes`
   of a result, but libpq copies a chunk's rows into its own result before
   the pool sees them: the chunk that holds the row crossing the bound, up

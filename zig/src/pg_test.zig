@@ -298,6 +298,8 @@ const TestWaiter = struct {
     /// The results delivered, in order (first 32), and how many.
     got: [32]Obj = undefined,
     n: usize = 0,
+    /// The last result delivered.
+    last: ?Obj = null,
     /// Deliveries made while a top-level `submit` was running.
     during_submit: usize = 0,
     /// Queries to submit again from `deliver`, one per delivery.
@@ -324,6 +326,7 @@ const TestWaiter = struct {
         }
         const o = freeObj(r);
         if (self.n < self.got.len) self.got[self.n] = o;
+        self.last = o;
         self.n += 1;
         if (in_submit) self.during_submit += 1;
         if (self.order) |list| list.append(std.testing.allocator, self.tag) catch @panic("out of memory");
@@ -856,21 +859,95 @@ test "c: COPY ends the session with both polls outstanding; the next query gets 
 
 const chain = 10_000;
 
-test "d: zero slots: a chain of failures stays iterative and runs inside one submit" {
-    var fx: Fixture = .{};
-    try fx.init(0);
+/// Another connection's work on the same loop: a receive whose bytes are
+/// there before a chain starts. Its callback records how many results the
+/// chain had delivered when the loop ran it.
+const Bystander = struct {
+    fds: [2]c.fd_t = undefined,
+    recv: ev.NetRecv = undefined,
+    buf: [1]u8 = undefined,
+    iov: [1]zio.os.iovec = undefined,
+    closer: ev.NetClose = undefined,
+    closed: bool = false,
+    watched: *const TestWaiter,
+    seen: ?usize = null,
+
+    fn start(self: *Bystander, loop: *ev.Loop) !void {
+        if (socketpair(c.AF.UNIX, c.SOCK.STREAM, 0, &self.fds) != 0) return error.Socketpair;
+        const nonblock: c_int = @bitCast(c.O{ .NONBLOCK = true });
+        for (self.fds) |fd| _ = c.fcntl(fd, c.F.SETFL, nonblock);
+        try poke(self.fds[1]);
+        self.recv = ev.NetRecv.init(self.fds[0], .fromSlice(&self.buf, &self.iov), .{});
+        self.recv.c.callback = received;
+        self.recv.c.userdata = self;
+        loop.add(&self.recv.c);
+    }
+
+    fn received(_: *ev.Loop, comp: *ev.Completion) void {
+        const self: *Bystander = @ptrCast(@alignCast(comp.userdata.?));
+        _ = self.recv.getResult() catch @panic("the bystander's receive failed");
+        self.seen = self.watched.n;
+    }
+
+    /// Unregisters and closes the loop's end, then the peer's.
+    fn finish(self: *Bystander, fx: *Fixture) !void {
+        self.closer = ev.NetClose.init(self.fds[0]);
+        self.closer.c.callback = closedCb;
+        self.closer.c.userdata = self;
+        fx.loop.add(&self.closer.c);
+        try fx.until(self, struct {
+            fn f(x: *Bystander) bool {
+                return x.closed;
+            }
+        }.f);
+        _ = close(self.fds[1]);
+    }
+
+    fn closedCb(_: *ev.Loop, comp: *ev.Completion) void {
+        const self: *Bystander = @ptrCast(@alignCast(comp.userdata.?));
+        self.closed = true;
+    }
+};
+
+fn chainDone(w: *TestWaiter) bool {
+    return w.n >= chain;
+}
+
+/// A chain of `chain` failing queries asked from one `submit`, each asked
+/// again from its error, with another connection's receive ready on the same
+/// loop before it starts (item rtkla3): `pg.chain_inline` results are
+/// delivered inside the `submit`, the rest from later turns of the loop, the
+/// receive's callback runs while the chain is still going, every result is
+/// delivered exactly once, and no delivery happens inside another.
+fn yieldingChain(fx: *Fixture) !void {
     var w: TestWaiter = .{ .pool = &fx.pool, .again = chain - 1 };
+    var b: Bystander = .{ .watched = &w };
+    try b.start(&fx.loop);
     w.submit();
+    try std.testing.expectEqual(@as(usize, pg.chain_inline), w.n);
+    try std.testing.expectEqual(@as(usize, pg.chain_inline), w.during_submit);
+    try std.testing.expect(fx.pool.cont_armed);
+    try fx.until(&w, chainDone);
+    // The receive was ready before the chain began, and ran after its
+    // inline part and before its end.
+    const seen = b.seen orelse return error.BystanderNeverRan;
+    try std.testing.expect(seen >= pg.chain_inline and seen < chain);
+    try fx.idle();
     try std.testing.expectEqual(@as(usize, chain), w.n);
+    try std.testing.expect(!fx.pool.cont_armed);
     try std.testing.expectEqualSlices(u8, "08006", &w.got[31].sqlstate);
     try std.testing.expectEqual(@as(u32, 1), max_depth);
-    // Evidence for the scheduling question: the whole chain ran before
-    // `submit` returned, so the loop got no turn in between.
-    try std.testing.expectEqual(@as(usize, chain), w.during_submit);
+    try b.finish(fx);
+}
+
+test "d: zero slots: a long chain of failures yields to the loop's other ready work" {
+    var fx: Fixture = .{};
+    try fx.init(0);
+    try yieldingChain(&fx);
     try fx.deinit();
 }
 
-test "d: the database down: synchronous connect failures stay iterative and run inside one submit" {
+test "d: the database down: a long chain of connect failures yields to the loop's other ready work" {
     // Both ways a connect fails at once: PQconnectStart fails (no session),
     // or the first PQconnectPoll does.
     for ([_]c_int{ 0, 1 }) |start| {
@@ -878,12 +955,7 @@ test "d: the database down: synchronous connect failures stay iterative and run 
         try fx.init(2);
         fake.start.repeat = start;
         fake.connect_poll.repeat = 0;
-        var w: TestWaiter = .{ .pool = &fx.pool, .again = chain - 1 };
-        w.submit();
-        try std.testing.expectEqual(@as(usize, chain), w.n);
-        try std.testing.expectEqualSlices(u8, "08006", &w.got[31].sqlstate);
-        try std.testing.expectEqual(@as(u32, 1), max_depth);
-        try std.testing.expectEqual(@as(usize, chain), w.during_submit);
+        try yieldingChain(&fx);
         try std.testing.expectEqual(@as(usize, chain), fake.count.get(.start));
         try std.testing.expectEqual(@as(usize, if (start == 1) chain else 0), fake.count.get(.finish));
         fake.start.repeat = null;
@@ -892,6 +964,65 @@ test "d: the database down: synchronous connect failures stay iterative and run 
         fx.loop.deinit();
         try std.testing.expectEqual(@as(i64, 0), fake.live);
     }
+}
+
+test "d: a submit while a yielded chain waits queues behind it, not ahead of the loop's other work" {
+    // Another connection's callback submits in the turn the chain yielded
+    // in: the pool answers nothing more until the chain's own turn.
+    var fx: Fixture = .{};
+    try fx.init(0);
+    var w: TestWaiter = .{ .pool = &fx.pool, .again = chain - 1 };
+    var v: TestWaiter = .{ .pool = &fx.pool };
+    w.submit();
+    try std.testing.expectEqual(@as(usize, pg.chain_inline), w.n);
+    v.submit();
+    try std.testing.expectEqual(@as(usize, pg.chain_inline), w.n);
+    try std.testing.expectEqual(@as(usize, 0), v.n);
+    try fx.until(&w, chainDone);
+    try fx.idle();
+    try std.testing.expectEqual(@as(usize, chain), w.n);
+    try std.testing.expectEqual(@as(usize, 1), v.n);
+    try std.testing.expectEqualSlices(u8, "08006", &v.got[0].sqlstate);
+    try std.testing.expectEqual(@as(u32, 1), max_depth);
+    try fx.deinit();
+}
+
+test "d: the drain's end while a yielded chain waits answers the rest of it at once" {
+    var fx: Fixture = .{};
+    try fx.init(0);
+    var w: TestWaiter = .{ .pool = &fx.pool, .again = chain - 1 };
+    w.submit();
+    try std.testing.expectEqual(@as(usize, pg.chain_inline), w.n);
+    try std.testing.expect(fx.pool.cont_armed);
+    fx.pool.abort();
+    try std.testing.expectEqual(@as(usize, chain), w.n);
+    try std.testing.expectEqualSlices(u8, "57014", &w.last.?.sqlstate);
+    // The turn already on its way finds nothing left.
+    try fx.until(&fx.pool, struct {
+        fn f(x: *pg.Pool) bool {
+            return !x.cont_armed;
+        }
+    }.f);
+    try fx.idle();
+    try std.testing.expectEqual(@as(usize, chain), w.n);
+    try std.testing.expectEqual(@as(u32, 1), max_depth);
+    try fx.deinit();
+}
+
+test "d: after the drain's end a chain runs to its end inside the submit" {
+    // serve.zig closes every connection right after `abort`, so the pool
+    // must not leave any of a chain for a later turn then.
+    var fx: Fixture = .{};
+    try fx.init(0);
+    fx.pool.abort();
+    var w: TestWaiter = .{ .pool = &fx.pool, .again = chain - 1 };
+    w.submit();
+    try std.testing.expectEqual(@as(usize, chain), w.n);
+    try std.testing.expectEqual(@as(usize, chain), w.during_submit);
+    try std.testing.expect(!fx.pool.cont_armed);
+    try std.testing.expectEqualSlices(u8, "57014", &w.got[31].sqlstate);
+    try std.testing.expectEqual(@as(u32, 1), max_depth);
+    try fx.deinit();
 }
 
 test "d: two chains submitted during one dispatch alternate in FIFO order" {
