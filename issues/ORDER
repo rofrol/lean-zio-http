@@ -1,6 +1,5 @@
 ## Next, in order
 
-akj76n Measure lean-db against Go at one connection on the deployed host before deciding on spinning before parking
 3pund6 Decide what follows from the classification of Linux pending-connection accept errnos (xihdtw)
 bfvj2q Run the memory scenarios that wait on socket queues on Linux
 4bngph Move the toolchain to the first nightly with lean4 PR 16562 and set maxPathSegments and maxQueryParams in the H1 adapter
