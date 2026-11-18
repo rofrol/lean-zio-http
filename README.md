@@ -925,8 +925,11 @@ pipelined GETs of the fixture's largest response, then an unfinished
 request) and never reads, measured with either parser from 50 to 100 such
 connections (from none to 100 it also counts an apparent fixed component of
 about 500 KiB; more connections made macOS deny network memory for the
-stalled responses the kernel holds). The socket queues, read with lsof,
-show before each measurement that the server has read all 8,192 bytes and
+stalled responses the kernel holds). The socket queues, read with lsof
+on macOS and from `/proc/PID/net/tcp` and `tcp6` on Linux (each process's
+own namespace, only the sockets among its descriptors, after a check
+against connections whose queues are known: `checkQueues`), show before
+each measurement that the server has read all 8,192 bytes and
 after it that it has not sent all the responses; from that, each connection
 was sending a whole response with at least 7,300 bytes buffered, unless its
 bytes arrived in two receives and Lean had not yet been handed the second at
@@ -957,9 +960,22 @@ still-resident pages of freed blocks (such as the initial `inCap` buffer)
 and Lean's small per-connection objects. The snapshots are taken one after
 the other, just before the resident set sample, not at one instant, and the
 inspection may perturb the process; the resident set per connection with
-and without them overlaps (90.6 to 91.5 against 90.6 to 90.9). macOS only:
-elsewhere the scenario is skipped, as are those that read the socket
-queues.
+and without them overlaps (90.6 to 91.5 against 90.6 to 90.9). The
+snapshots are macOS only.
+
+On Linux (the check container, `linux/Dockerfile`, OrbStack's arm64 VM,
+2026-11-18, item kaslrv) the scenario ran on epoll and io_uring: 85.0 to
+88.0 KiB per added connection with either parser (twenty runs), Lean's
+mimalloc arena 68 to 71 KiB of it and glibc's malloc 17 KiB
+(`/proc/PID/smaps`). `bench/boundary` turns transparent huge pages off for
+itself and the servers it starts (`disableTHP`, checked before each
+resident set sample): with them on (the host's `madvise`), the arena grew
+in 2 MiB steps, 41 KiB per connection over the 50 added, and the scenario
+read 58 or 99 KiB. The memory scenarios measure what a connection holds
+under base pages, not the resident set of a server with huge pages, which
+can hold memory in 2 MiB units. The scenarios that wait on the socket
+queues with `awaitRead` (`lsofSettle`) stay macOS only, skipped elsewhere;
+this one is skipped on systems other than macOS and Linux.
 
 ## Fragmented requests (decision D1)
 

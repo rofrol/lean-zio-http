@@ -19,12 +19,14 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -643,8 +645,12 @@ func crashPoint(path, crashArg string, n, most int, args ...string) (string, err
 	return fmt.Sprintf("client saw %d response bytes, %q; restarted server: %s", len(got), s.output[2], summary), err
 }
 
-// rssKiB is the resident set size of process pid, from ps(1).
+// rssKiB is the resident set size of process pid, from ps(1), taken with
+// transparent huge pages off (disableTHP).
 func rssKiB(pid int) (int, error) {
+	if err := thpOff(pid); err != nil {
+		return 0, err
+	}
 	out, err := exec.Command("ps", "-o", "rss=", "-p", strconv.Itoa(pid)).Output()
 	if err != nil {
 		return 0, err
@@ -718,9 +724,14 @@ func memory(path string) (string, error) {
 // tcpQueues maps each established TCP connection of processes `pids`, by
 // its "local->foreign" address pair, to its receive and send queue lengths:
 // bytes the kernel holds that the process has not read, and bytes the process
-// wrote that the peer has not acknowledged. From lsof(8)'s -T q (QR, QS);
-// macOS's `netstat -an -p tcp` lists no TCP sockets (seen on Darwin 27.2).
+// wrote that the peer has not acknowledged. On macOS from lsof(8)'s -T q (QR,
+// QS); macOS's `netstat -an -p tcp` lists no TCP sockets (seen on Darwin
+// 27.2). On Linux from /proc (procQueues). checkQueues checks either against
+// connections whose queues are known.
 func tcpQueues(pids ...int) (map[string][2]int, error) {
+	if runtime.GOOS == "linux" {
+		return procQueues(pids)
+	}
 	ps := make([]string, len(pids))
 	for i, p := range pids {
 		ps[i] = strconv.Itoa(p)
@@ -762,19 +773,263 @@ func tcpQueues(pids ...int) (map[string][2]int, error) {
 	return qs, nil
 }
 
-// awaitBytes waits until c has received data it has not read, without
-// reading it (a peek), so the receive window it advertises stays as small.
-func awaitBytes(c *net.TCPConn) error {
+// procQueues is tcpQueues on Linux. Each process's sockets are read from
+// /proc/PID/net/tcp and tcp6, which list the sockets of that process's
+// network namespace, and kept when established (st 01) and when their inode
+// is one of the process's descriptors (/proc/PID/fd, "socket:[INODE]"), so
+// a connection is attributed to the process that holds it, not only to its
+// addresses. rx_queue is rcv_nxt - copied_seq and tx_queue is write_seq -
+// snd_una (get_tcp4_sock in Linux's net/ipv4/tcp_ipv4.c, and
+// get_tcp6_sock): bytes received and not read, and bytes written and not
+// acknowledged, as lsof's QR and QS. An IPv4-mapped IPv6 address is
+// written as IPv4, as Go writes it.
+func procQueues(pids []int) (map[string][2]int, error) {
+	qs := map[string][2]int{}
+	for _, pid := range pids {
+		dir := fmt.Sprintf("/proc/%d/fd", pid)
+		fds, err := os.ReadDir(dir)
+		if err != nil {
+			return nil, err
+		}
+		inodes := map[string]bool{}
+		for _, fd := range fds {
+			l, err := os.Readlink(filepath.Join(dir, fd.Name()))
+			if errors.Is(err, os.ErrNotExist) {
+				continue // closed since the listing
+			}
+			if err != nil {
+				return nil, err
+			}
+			if in, ok := strings.CutPrefix(l, "socket:["); ok {
+				inodes[strings.TrimSuffix(in, "]")] = true
+			}
+		}
+		for _, table := range []string{"tcp", "tcp6"} {
+			name := fmt.Sprintf("/proc/%d/net/%s", pid, table)
+			data, err := os.ReadFile(name)
+			if table == "tcp6" && errors.Is(err, os.ErrNotExist) {
+				continue // a kernel without IPv6
+			}
+			if err != nil {
+				return nil, err
+			}
+			lines := strings.Split(string(data), "\n")
+			for _, line := range lines[1:] { // after the heading
+				// sl local_address rem_address st tx_queue:rx_queue tr:tm->when
+				// retrnsmt uid timeout inode ...
+				f := strings.Fields(line)
+				if len(f) == 0 {
+					continue
+				}
+				if len(f) < 10 {
+					return nil, fmt.Errorf("%s line %q", name, line)
+				}
+				if f[3] != "01" || !inodes[f[9]] {
+					continue
+				}
+				local, err1 := procAddr(f[1])
+				remote, err2 := procAddr(f[2])
+				tx, rx, ok := strings.Cut(f[4], ":")
+				t, err3 := strconv.ParseUint(tx, 16, 32)
+				r, err4 := strconv.ParseUint(rx, 16, 32)
+				if err := errors.Join(err1, err2, err3, err4); err != nil || !ok {
+					return nil, fmt.Errorf("%s line %q: %v", name, line, err)
+				}
+				qs[local+"->"+remote] = [2]int{int(r), int(t)}
+			}
+		}
+	}
+	return qs, nil
+}
+
+// procAddr reads an address of /proc/net/tcp or tcp6, "ADDR:PORT" in hex:
+// the address as 32-bit words, each the network-order bytes read as a
+// native-order integer, and the port as a number.
+func procAddr(s string) (string, error) {
+	h, p, ok := strings.Cut(s, ":")
+	port, err := strconv.ParseUint(p, 16, 16)
+	if !ok || err != nil || (len(h) != 8 && len(h) != 32) {
+		return "", fmt.Errorf("address %q", s)
+	}
+	b := make([]byte, len(h)/2)
+	for i := 0; i < len(h); i += 8 {
+		w, err := strconv.ParseUint(h[i:i+8], 16, 32)
+		if err != nil {
+			return "", fmt.Errorf("address %q", s)
+		}
+		binary.NativeEndian.PutUint32(b[i/2:], uint32(w))
+	}
+	a, _ := netip.AddrFromSlice(b)
+	return netip.AddrPortFrom(a.Unmap(), uint16(port)).String(), nil
+}
+
+// checkQueues checks tcpQueues against connections of this process, over
+// loopback, whose queues are known, before a scenario relies on it: each of
+// three servers has not read k bytes its client wrote (1,000, 2,000 and
+// 3,000; awaitBytes shows they arrived) and has written nothing, so its
+// socket must show exactly k unread and nothing unacknowledged, and its
+// client's nothing unread. A fourth server, with a send buffer far larger
+// than its client's receive buffer, writes until its send would block to a
+// client that writes nothing and never reads: of the w bytes it wrote, its
+// socket's unacknowledged and the client's unread (from a second, later
+// reading, as in memoryFull) must each be more than none and at most w, and
+// together at least w (a byte received and not yet acknowledged counts
+// twice), and the client must have nothing unacknowledged.
+func checkQueues() error {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return err
+	}
+	defer ln.Close()
+	var cs, ss []*net.TCPConn
+	defer func() {
+		for _, c := range append(cs, ss...) {
+			c.Close()
+		}
+	}()
+	// The clients' receive buffer is set before the handshake, so the window
+	// they advertise is as small.
+	d := net.Dialer{Control: func(_, _ string, rc syscall.RawConn) error {
+		var serr error
+		err := rc.Control(func(fd uintptr) {
+			serr = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_RCVBUF, 8192)
+		})
+		return errors.Join(err, serr)
+	}}
+	for range 4 {
+		c, err := d.Dial("tcp", ln.Addr().String())
+		if err != nil {
+			return err
+		}
+		cs = append(cs, c.(*net.TCPConn))
+		s, err := ln.Accept() // the connection just dialled: one at a time
+		if err != nil {
+			return err
+		}
+		ss = append(ss, s.(*net.TCPConn))
+	}
+	sizes := []int{1000, 2000, 3000}
+	for i, k := range sizes {
+		if _, err := cs[i].Write(bytes.Repeat([]byte{'a'}, k)); err != nil {
+			return err
+		}
+		if err := awaitBytes(ss[i], k); err != nil {
+			return err
+		}
+	}
+	if err := ss[3].SetWriteBuffer(1 << 20); err != nil {
+		return err
+	}
+	w, err := fillSend(ss[3])
+	if err != nil {
+		return err
+	}
+	first, err := tcpQueues(os.Getpid())
+	if err != nil {
+		return err
+	}
+	later, err := tcpQueues(os.Getpid())
+	if err != nil {
+		return err
+	}
+	pair := func(i int, qs map[string][2]int) (c, s [2]int, err error) {
+		cl, sv := cs[i].LocalAddr().String(), cs[i].RemoteAddr().String()
+		c, ok1 := qs[cl+"->"+sv]
+		s, ok2 := qs[sv+"->"+cl]
+		if !ok1 || !ok2 {
+			err = fmt.Errorf("control connection %d (%s): not among the established connections read", i, cl)
+		}
+		return
+	}
+	for i, k := range sizes {
+		c, s, err := pair(i, first)
+		if err != nil {
+			return err
+		}
+		if s[0] != k || s[1] != 0 || c[0] != 0 {
+			return fmt.Errorf("control connection %d: the server's queues read %d unread and %d unacknowledged, the client's %d unread; want %d, 0 and 0", i, s[0], s[1], c[0], k)
+		}
+	}
+	_, s, err := pair(3, first)
+	if err != nil {
+		return err
+	}
+	c, _, err := pair(3, later)
+	if err != nil {
+		return err
+	}
+	if s[1] == 0 || s[1] > w || c[0] == 0 || c[0] > w || s[1]+c[0] < w || c[1] != 0 {
+		// The kernel may cap or grow either buffer (Linux: net.core.wmem_max;
+		// macOS grows the receive buffer): a receiver that took every byte
+		// leaves nothing unacknowledged, so the sizes it took are reported.
+		return fmt.Errorf("control connection 3: %d bytes written; the server's queue reads %d unacknowledged, the client's %d unread and %d unacknowledged (send buffer %s, receive buffer %s)", w, s[1], c[0], c[1], sockBuffer(ss[3], syscall.SO_SNDBUF), sockBuffer(cs[3], syscall.SO_RCVBUF))
+	}
+	return nil
+}
+
+// sockBuffer describes c's socket option opt (SO_SNDBUF or SO_RCVBUF) as
+// the kernel took it: its size, or why it could not be read.
+func sockBuffer(c *net.TCPConn, opt int) string {
+	rc, err := c.SyscallConn()
+	if err != nil {
+		return "unread: " + err.Error()
+	}
+	var v int
+	var gerr error
+	err = rc.Control(func(fd uintptr) {
+		v, gerr = syscall.GetsockoptInt(int(fd), syscall.SOL_SOCKET, opt)
+	})
+	if err := errors.Join(err, gerr); err != nil {
+		return "unread: " + err.Error()
+	}
+	return strconv.Itoa(v) + " bytes"
+}
+
+// fillSend writes to c until its send would block and returns the bytes it
+// wrote.
+func fillSend(c *net.TCPConn) (int, error) {
+	rc, err := c.SyscallConn()
+	if err != nil {
+		return 0, err
+	}
+	b := make([]byte, 65536)
+	w := 0
+	var werr error
+	err = rc.Write(func(fd uintptr) bool {
+		for {
+			n, err := syscall.Write(int(fd), b)
+			if err == syscall.EAGAIN {
+				return true
+			}
+			if err != nil {
+				werr = err
+				return true
+			}
+			w += n
+		}
+	})
+	if err == nil {
+		err = werr
+	}
+	return w, err
+}
+
+// awaitBytes waits until c has received at least k bytes it has not read,
+// without reading them (a peek), so the receive window it advertises stays
+// as small. The peer must not close before it sent k bytes: after fewer and
+// the end of the stream, no arrival makes c readable again.
+func awaitBytes(c *net.TCPConn, k int) error {
 	rc, err := c.SyscallConn()
 	if err != nil {
 		return err
 	}
 	var n int
 	var perr error
-	b := make([]byte, 1)
+	b := make([]byte, k)
 	err = rc.Read(func(fd uintptr) bool {
 		n, _, perr = syscall.Recvfrom(int(fd), b, syscall.MSG_PEEK)
-		return perr != syscall.EAGAIN
+		// Fewer than k: wait for the next arrival, which makes c readable.
+		return perr != syscall.EAGAIN && !(perr == nil && n > 0 && n < k)
 	})
 	if err == nil {
 		err = perr
@@ -844,15 +1099,19 @@ func memSnapshot(pid, conns int) error {
 // from the socket but not yet handed to Lean at the measurement, which then
 // held its second part in the loop's receive buffer and no response. The
 // queues show what the sockets hold, not the connection's state; only an
-// acknowledgement from the server would. macOS only (lsof's queue sizes).
+// acknowledgement from the server would. On macOS and Linux (tcpQueues),
+// after checkQueues.
 func memoryFull(path string) (string, error) {
 	// 100 connections: the kernel holds hundreds of KB of stalled responses
 	// per connection, and 200 already made macOS deny network memory
 	// ("requests for memory denied" in netstat -m), 1,000 to a failed send.
 	const n = 100
 	const gets = 100
-	if runtime.GOOS != "darwin" {
-		return "skipped: the socket queues are read with lsof's -T q, checked on macOS only", nil
+	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
+		return "skipped: the socket queues are read on macOS and Linux only", nil
+	}
+	if err := checkQueues(); err != nil {
+		return "", fmt.Errorf("the socket queues read wrong: %w", err)
 	}
 	s, err := start(path, "1", "--max-conns", "1100")
 	if err != nil {
@@ -916,7 +1175,7 @@ func memoryFull(path string) (string, error) {
 			if _, err := io.WriteString(c, payload); err != nil {
 				return err
 			}
-			if err := awaitBytes(c); err != nil {
+			if err := awaitBytes(c, 1); err != nil {
 				return fmt.Errorf("first response byte: %w", err)
 			}
 			return nil
@@ -927,14 +1186,14 @@ func memoryFull(path string) (string, error) {
 		for _, side := range []int{0, 1} {
 			qs, err := tcpQueues(s.cmd.Process.Pid, os.Getpid())
 			if err != nil {
-				return 0, fmt.Errorf("lsof: %w", err)
+				return 0, fmt.Errorf("socket queues: %w", err)
 			}
 			for i, c := range conns[:hi] {
 				cl, sv := c.LocalAddr().String(), c.RemoteAddr().String()
 				cq, ok1 := qs[cl+"->"+sv]
 				sq, ok2 := qs[sv+"->"+cl]
 				if !ok1 || !ok2 {
-					return 0, fmt.Errorf("connection %d (%s): not among lsof's established connections", i, cl)
+					return 0, fmt.Errorf("connection %d (%s): not among the established connections read", i, cl)
 				}
 				if side == 0 && cq[1] != 0 {
 					return 0, fmt.Errorf("connection %d: %d bytes of the client's unacknowledged", i, cq[1])
@@ -969,11 +1228,11 @@ func memoryFull(path string) (string, error) {
 	// was read (a byte received and not yet acknowledged counts twice).
 	after, err := tcpQueues(s.cmd.Process.Pid, os.Getpid())
 	if err != nil {
-		return "", fmt.Errorf("lsof: %w", err)
+		return "", fmt.Errorf("socket queues: %w", err)
 	}
 	later, err := tcpQueues(s.cmd.Process.Pid, os.Getpid())
 	if err != nil {
-		return "", fmt.Errorf("lsof: %w", err)
+		return "", fmt.Errorf("socket queues: %w", err)
 	}
 	least := write // the fewest bytes any connection held buffered
 	for i, c := range conns {
@@ -981,7 +1240,7 @@ func memoryFull(path string) (string, error) {
 		cq, ok1 := later[cl+"->"+sv]
 		sq, ok2 := after[sv+"->"+cl]
 		if !ok1 || !ok2 {
-			return "", fmt.Errorf("connection %d (%s): not among lsof's established connections", i, cl)
+			return "", fmt.Errorf("connection %d (%s): not among the established connections read", i, cl)
 		}
 		sent := cq[0] + sq[1]
 		if sent >= (gets-1)*respSize {
@@ -1058,7 +1317,7 @@ func awaitRead(pid int, conns []*net.TCPConn) error {
 // without the fixed component. args go to the server.
 func held(path string, args []string, n int, lsofSettle bool, hold func(c *net.TCPConn) error) (string, error) {
 	if lsofSettle && runtime.GOOS != "darwin" {
-		return "skipped: the socket queues are read with lsof's -T q, checked on macOS only", nil
+		return "skipped: the socket queues it waits on are read with lsof, on macOS only (Linux's are qualified for the scenario with 100 connections sending responses only)", nil
 	}
 	s, err := start(path, append(args, "--max-conns", strconv.Itoa(n+100))...)
 	if err != nil {
@@ -1324,6 +1583,10 @@ func main() {
 	flag.StringVar(&memSnapDir, "memsnap", "", "directory for the server's allocator statistics (vmmap, heap) at the measurements of the scenario with 100 connections sending responses; macOS only")
 	only := flag.String("only", "", "run only the scenarios whose name contains this text")
 	flag.Parse()
+	if err := disableTHP(); err != nil {
+		fmt.Println("FAIL", err)
+		os.Exit(1)
+	}
 	scenarios := []scenario{
 		{"large responses, operations of at most 7 bytes", []string{"2", "--chunk", "7", "--trace"}, false, exchanges(8), nil, false},
 		{"large responses, full-size operations", []string{"2", "--trace"}, false, exchanges(16), nil, false},
