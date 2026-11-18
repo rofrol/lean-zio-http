@@ -4,6 +4,7 @@
 rtkla3 Whether a handler's synchronous PostgreSQL error chain needs a scheduling boundary
 kaslrv Run the worst-case memory scenario on Linux
 dtlin3 Rerun HttpArena on vps.frolow.dev after the accept fix (sakmfp)?
+akj76n Measure lean-db against Go at one connection on the deployed host before deciding on spinning before parking
 
 ## Proposed
 
@@ -17,4 +18,3 @@ owgate Find where H1's parse spends 40 % of lsrv-arena's CPU (about 4-6 µs per 
 yvladm Decide whether per-loop PostgreSQL pools should share connections across loops
 3pund6 Decide what follows from the classification of Linux pending-connection accept errnos (xihdtw)
 2ltibq Run a clean D2 acceptance of the Lean HTTP server with the load generator on cores of its own
-akj76n Measure lean-db against Go at one connection on the deployed host before deciding on spinning before parking
