@@ -1,6 +1,5 @@
 ## Next, in order
 
-kaslrv Run the worst-case memory scenario on Linux
 dtlin3 Rerun HttpArena on vps.frolow.dev after the accept fix (sakmfp)?
 akj76n Measure lean-db against Go at one connection on the deployed host before deciding on spinning before parking
 3pund6 Decide what follows from the classification of Linux pending-connection accept errnos (xihdtw)
@@ -12,6 +11,7 @@ q2g4am Act on leanprover/lean4's answers to the Std.Http questions 16522 and 165
 5f54l4 Should H1Adapter decode chunked request bodies, so HttpArena's baseline and limited-conn run with their whole request mix?
 paarzq Write a connection's pipelined responses with one send, as go-fasthttp does, instead of one send and one loop turn per response
 owgate Find where H1's parse spends 40 % of lsrv-arena's CPU (about 4-6 µs per request), or accept that cost
+bfvj2q Run the memory scenarios that wait on socket queues on Linux
 
 ## Needs a decision
 
