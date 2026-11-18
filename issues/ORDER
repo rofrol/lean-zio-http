@@ -1,10 +1,10 @@
 ## Next, in order
 
 c5ca75 Test the shutdown's cancel against a performed send queued in the ready list
+7wvkwz Find why lean-db reaches only 0.64 of Go at one connection in the Linux container
 
 ## Proposed
 
-7wvkwz Find why lean-db reaches only 0.64 of Go at one connection in the Linux container
 q2g4am Act on leanprover/lean4's answers to the Std.Http questions 16522 and 16523
 5f54l4 Should H1Adapter decode chunked request bodies, so HttpArena's baseline and limited-conn run with their whole request mix?
 paarzq Write a connection's pipelined responses with one send, as go-fasthttp does, instead of one send and one loop turn per response
