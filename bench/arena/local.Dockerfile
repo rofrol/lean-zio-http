@@ -1,7 +1,11 @@
 # The runtime image of bench/arena/local.sh (item 6p6tu6): HttpArena's load
 # generator gcannon with liburing at the commits bench/arena/build.sh pins,
 # and the tracing tools (bpftrace, perf), on this machine's architecture.
-FROM debian:trixie
+#
+# The base image is linux/Dockerfile's debian:trixie index digest as of
+# 2026-11-18 (item ugay7c); linux/Dockerfile is its source of truth: move
+# this copy with it. Debian's apt packages still float with the archive.
+FROM debian:trixie@sha256:9c6e381421d0f48d1b8133e573f33c185ee16cbf505eda9c4a8a4791b25ea8a6
 RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends \
       gcc libc6-dev libssl-dev make git ca-certificates curl procps libpq5 util-linux bpftrace linux-perf >/dev/null
 RUN git clone -q https://github.com/axboe/liburing.git /liburing && cd /liburing \

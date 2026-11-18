@@ -1002,7 +1002,9 @@ libpq's or the server's major is not 17 or Zig is not on
 and a patch at least the minimum's), so a rebuild that drifted fails instead of testing other
 versions silently. To move the base image, take the index digest that
 `docker buildx imagetools inspect debian:trixie` prints and note the date
-beside it in `linux/Dockerfile`. It needs network access and
+beside it in `linux/Dockerfile`, and move the digest and date
+of its copy in `bench/arena/local.Dockerfile` (the local HttpArena image)
+with them. It needs network access and
 docker; `./check.sh` does not depend on it. Run it at each update of zio and
 record its result in the commit. It is development evidence on the host's
 architecture and the container runtime's kernel, not production
