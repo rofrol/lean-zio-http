@@ -1,6 +1,5 @@
 ## Next, in order
 
-bfvj2q Run the memory scenarios that wait on socket queues on Linux
 vyzkxi Decide whether the gate should guard against ephemeral-port exhaustion left by the boundary suite's TIME_WAIT sockets on macOS
 4bngph Move the toolchain to the first nightly with lean4 PR 16562 and set maxPathSegments and maxQueryParams in the H1 adapter
 
