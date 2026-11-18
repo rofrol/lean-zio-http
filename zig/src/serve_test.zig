@@ -2847,6 +2847,51 @@ test "explicit order: a queued performed send within the response before its exp
     try expectLog(&s, &.{ .{ .kind = .open }, .{ .kind = .sent }, .{ .kind = .expired, .n = 0, .byte = write_code }, .{ .kind = .free } });
 }
 
+test "explicit order: a performed send queued in the ready list when the shutdown runs is reported once, and the connection closes once" {
+    var s: Single = undefined;
+    try s.init(64);
+    defer s.deinit();
+    defer releaseHolds(&s);
+    respond_on_open = 16;
+    report_sent = true;
+    const w = hold(&s.lp.wake.c, true);
+    const cl = try s.listener.connect();
+    defer _ = c.close(cl);
+    awaitReadable(s.listener.fd);
+    try s.stepUntil(.open, 1);
+    const conn = s.lp.head.?;
+    try std.testing.expect(conn.cur.?.kind == .wrote);
+    // The turn that would report the send is due, and held.
+    try stepUntilHeld(&s, &.{w});
+    try std.testing.expect(s.lp.ready_head == conn);
+    s.lp.stop.notify();
+    var step: usize = 0;
+    while (stops == 0) : (step += 1) {
+        if (step == max_steps) return error.StopNeverRan;
+        try s.lp.loop.poll(.zero);
+    }
+    // The shutdown leaves the performed send queued: the connection is not
+    // closing, and the drain runs. No deadline and not the drain can end
+    // here (`Single.init` sets their budgets to `never`), so the wake's
+    // turn is the next thing that reaches the connection.
+    try std.testing.expect(conn.cur.?.kind == .wrote);
+    try std.testing.expect(s.lp.ready_head == conn);
+    try std.testing.expect(!conn.closing);
+    try std.testing.expect(s.lp.drain_armed);
+    try std.testing.expect(!s.lp.drained);
+    s.collect();
+    try expectLog(&s, &.{.{ .kind = .open }});
+    // Its turn reports it: the whole response went, Lean asks for the next
+    // receive, which the shutdown declines, and the connection closes.
+    try forward(&s, w);
+    try std.testing.expect(s.lp.ready_head == null);
+    try s.stepUntil(.free, 1);
+    try std.testing.expectEqual(@as(u32, 16), s.log[1].n);
+    try s.finish();
+    s.collect();
+    try expectLog(&s, &.{ .{ .kind = .open }, .{ .kind = .sent }, .{ .kind = .written }, .{ .kind = .refused }, .{ .kind = .free } });
+}
+
 /// The fake's ids of the connections in the loop's ready list, in its order.
 fn readyIds(s: *const Single, out: []u32) []u32 {
     var k: usize = 0;

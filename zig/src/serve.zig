@@ -941,6 +941,11 @@ pub const LoopCtx = struct {
     /// receive in flight is canceled (its callback reports `refused`, or the
     /// result it had). Sends run to completion; Lean still answers requests
     /// already buffered, and every receive it asks for afterwards is declined.
+    /// A send the loop performed itself (`.wrote`) whose result waits in the
+    /// ready list is left there: its turn (`readyCb`) reports that result to
+    /// Lean, once, as for any send. The stop itself never drops it; it goes
+    /// unreported only when the connection closes first, on its own expiry
+    /// (`expire`) or at the drain's end (`Conn.cut`).
     /// While connections are open the drain runs (`drainCb`), so the shutdown
     /// ends by `drain_ms` at the latest, plus a connect in flight that no
     /// query waits for (its own `--pg-connect-ms`). `loop.run` returns once

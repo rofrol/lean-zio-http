@@ -382,7 +382,11 @@ only `Server.Query` values.
   generation it ends is reported and that expiry is stale, released
   unreported; one within the period leaves the expiry current, and it
   closes. A receive completed before the shutdown's cancel is reported once;
-  one the cancel reached is refused. An expiry before a queued performed
+  one the cancel reached is refused. A performed send (`.wrote`) queued in
+  the ready list when the shutdown runs is not canceled: its turn, before
+  any expiry or the drain's end, reports it once; in the test the send ends
+  the response, the receive Lean then asks for is refused, and the
+  connection closes once (item c5ca75). An expiry before a queued performed
   send (`.wrote`) closes, the send unreported; that send before the expiry
   is reported, and the expiry is stale when the send ended the response and
   current when it did not. Connections in the ready list that perform their
