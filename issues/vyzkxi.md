@@ -8,3 +8,5 @@ Seen in item laxhsb (2026-11-18, the M1): the boundary suite run as `check.sh` r
 
 Question: should the gate do anything about it?
 Options: have check.sh report the PCB count and the port range at the start and in a boundary dial failure, so such a failure names its cause | have the boundary suite reuse fewer ports (e.g. fewer connections per scenario where the bound allows) | document it in the README's "Running" and leave the gate as is | leave it
+
+Decided 2026-11-18 by the coordinating session with sol, argon and hydrogen (calls b09b0b42, dfc4a7ad, 44f96d50; all pick option 1, sol and hydrogen as work now, argon would keep it proposed) under the user's delegation of 2026-11-18: approved, diagnostics only. On macOS, where sysctl exposes them, check.sh prints net.inet.tcp.pcbcount and net.inet.ip.portrange.first..last before the boundary suite and again when it fails; a dial failure with EADDRNOTAVAIL names port exhaustion as a possible cause (the PCB count is system-wide, not a count of ephemeral ports in use). The failure stays a failure; no lower connection counts, no wait, no retry.
