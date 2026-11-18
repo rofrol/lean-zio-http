@@ -61,7 +61,9 @@ pg_start() {
   pgdata="$tmp/pgdata"
   pgopts="-c listen_addresses= -c unix_socket_directories=$tmp -p 5499 -c max_prepared_transactions=4 -c max_connections=200"
   pg="host=$tmp port=5499 user=postgres dbname=postgres"
-  initdb -D "$pgdata" -U postgres --auth=trust -E UTF8 --no-locale >"$tmp/initdb.log" 2>&1 || { cat "$tmp/initdb.log"; exit 1; }
+  # --no-sync: the cluster is disposable, and on the VPS (bench/arena/run.sh
+  # db) initdb's fsyncs would hit the production host's disk.
+  initdb -D "$pgdata" -U postgres --auth=trust -E UTF8 --no-locale --no-sync >"$tmp/initdb.log" 2>&1 || { cat "$tmp/initdb.log"; exit 1; }
   pg_ctl -D "$pgdata" -w -l "$tmp/pg.log" -o "$pgopts" start >/dev/null
   # The rows of world: randomnumber = (id * 7919) mod 10000 + 1 (42 -> 2599).
   psql "$pg" -q -v ON_ERROR_STOP=1 -c "CREATE TABLE world (id int PRIMARY KEY, randomnumber int NOT NULL);

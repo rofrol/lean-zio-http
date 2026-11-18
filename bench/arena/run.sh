@@ -1,11 +1,13 @@
 #!/bin/sh
-# run.sh tests|bench: the VPS side of the HttpArena runs (item 53rwgc;
-# README, "HttpArena on the VPS"). Run as root from the directory
-# bench/arena/build.sh filled and copied to the host; it writes only under
-# that directory (out/) and starts only processes of its own.
+# run.sh tests|bench|db: the VPS side of the HttpArena runs (items 53rwgc,
+# dtlin3; README, "HttpArena on the VPS") and of bench/dbpairs.sh there
+# (item akj76n). Run as root from the directory bench/arena/build.sh filled
+# and copied to the host; it writes only under that directory (out/, and
+# db/tmp for the db phase's private PostgreSQL cluster) and starts only
+# processes of its own.
 #
 # Everything runs in one transient systemd scope of its own
-# (lsrv-arena-53rwgc.scope: at most 900 MB of memory, no swap, 4096 tasks,
+# (lsrv-arena.scope: at most 900 MB of memory, no swap, 4096 tasks,
 # so the run cannot push the host's services out of memory) and in fresh
 # network and PID namespaces (unshare): the servers listen only on that
 # namespace's loopback, unreachable from the network, and the socket limits
@@ -18,12 +20,12 @@
 # kills the scope and ends the run with status 3; the owner decides whether
 # it resumes. Every probe goes to out/health-PHASE.log.
 set -eu
-[ $# -eq 1 ] && case $1 in tests|bench) ;; *) false ;; esac || { echo "usage: $0 tests|bench"; exit 2; }
+[ $# -eq 1 ] && case $1 in tests|bench|db) ;; *) false ;; esac || { echo "usage: $0 tests|bench|db"; exit 2; }
 phase=$1
 d=$(cd "$(dirname "$0")" && pwd)
 mkdir -p "$d/out"
 health=http://127.0.0.1:8083/
-scope=lsrv-arena-53rwgc
+scope=lsrv-arena
 log=$d/out/health-$phase.log
 rm -f "$d/stop" "$d/done"
 probe() { curl -s -o /dev/null -m 5 -w '%{http_code} %{time_total}' "$health" || echo "000 5"; } # delay: external deadline: a probe of the site gives up after 5 s

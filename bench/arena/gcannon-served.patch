@@ -1,0 +1,75 @@
+gcannon-served.patch: applied by gcannon.Dockerfile to gcannon at build.sh's
+pinned commit (item dtlin3; README, "HttpArena on the VPS"). It adds one
+line to gcannon's report, "Connections served: N": the connection slots
+that received at least one response after the warmup reset, that is in the
+measured window (a slot keeps its mark across reconnects, so with -r it
+counts slots, not sockets). Accounting only: nothing gcannon sends changes.
+
+diff --git a/include/stats.h b/include/stats.h
+index b9c89a0..1532d05 100644
+--- a/include/stats.h
++++ b/include/stats.h
+@@ -58,6 +58,7 @@ typedef struct worker_stats {
+     uint64_t paced_late;           /* ...more than 1 ms after it */
+     uint64_t paced_lag_max_us;     /* the largest schedule-to-send gap */
+     uint64_t conns_active;         /* connections open when the worker stopped */
++    uint64_t conns_served;         /* connection slots answered at least once in the window */
+ } worker_stats_t;
+ 
+ void stats_record_latency(worker_stats_t *s, uint64_t latency_us);
+diff --git a/include/worker.h b/include/worker.h
+index 0bd20e0..5a081bf 100644
+--- a/include/worker.h
++++ b/include/worker.h
+@@ -55,6 +55,7 @@ typedef struct gc_conn {
+     const char      *send_buf;       /* buffer currently in flight (for partial-send resubmit) */
+     int              requests_sent;  /* total requests sent on this connection */
+     int              responses_recv; /* total responses received on this connection */
++    int              served;         /* answered at least once since the warmup reset */
+     char            *scratch_buf;    /* per-conn buffer for placeholder substitution */
+     int              scratch_len;    /* allocated size of scratch_buf */
+     uint64_t         rng_state;      /* xorshift64 state for RAND placeholders */
+diff --git a/src/stats.c b/src/stats.c
+index f3730d6..996193b 100644
+--- a/src/stats.c
++++ b/src/stats.c
+@@ -84,6 +84,7 @@ void stats_merge(worker_stats_t *dst, const worker_stats_t *src)
+     dst->paced_sends    += src->paced_sends;
+     dst->paced_late     += src->paced_late;
+     dst->conns_active   += src->conns_active;
++    dst->conns_served   += src->conns_served;
+     if (src->paced_lag_max_us > dst->paced_lag_max_us)
+         dst->paced_lag_max_us = src->paced_lag_max_us;
+ 
+@@ -209,6 +210,7 @@ void stats_print(const worker_stats_t *s, double elapsed_sec, int num_templates,
+            s->responses ? 100.0 * s->latency_count / s->responses : 0.0);
+     if (s->overflow)
+         printf("  Latency overflow (>5s): %u\n", s->overflow);
++    printf("  Connections served: %lu\n", s->conns_served);
+     if (s->reconnects)
+         printf("  Reconnects: %lu\n", s->reconnects);
+     if (s->connect_errors || s->read_errors || s->timeouts) {
+diff --git a/src/worker.c b/src/worker.c
+index 021146a..956c219 100644
+--- a/src/worker.c
++++ b/src/worker.c
+@@ -832,6 +832,8 @@ void worker_loop(worker_t *w)
+             }
+             w->stats.ws_upgrades = saved_ws;
+             w->stats.ws_upgrade_failures = saved_ws_fail;
++            for (int i = 0; i < w->num_conns; i++)
++                w->conns[i].served = 0;
+             w->reset_request = 0;
+         }
+ 
+@@ -1100,6 +1102,10 @@ void worker_loop(worker_t *w)
+                     else
+                         w->stats.read_errors++;
+                     c->responses_recv++;
++                    if (!c->served) {
++                        c->served = 1;
++                        w->stats.conns_served++;
++                    }
+ 
+                     if (w->ws_mode) {
+                         w->stats.status_2xx++;

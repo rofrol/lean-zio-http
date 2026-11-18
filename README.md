@@ -115,10 +115,10 @@ only `Server.Query` values.
   poll starts beside it (section "Deadlines"), only after the kernel said
   EAGAIN, whatever the backend. zio's io_uring backend would otherwise queue
   every send untried, and each would look parked. The deployed server runs
-  on epoll: item 53rwgc's measurements on its host resolved no difference
-  between the two backends (section "HttpArena on the VPS"), but those
-  figures are invalid for lsrv-arena (item sakmfp), so the comparison
-  between the backends is open again.
+  on epoll: item dtlin3's measurements on its host after the accept fix
+  (section "HttpArena on the VPS") resolve no difference in throughput or
+  CPU between the two backends; io_uring's p99 there is lower in two
+  profiles of four.
   Each loop
   also owns a PostgreSQL pool (`src/pg.zig`, section "PostgreSQL"). The
   library needs libpq's headers (`-Dpq-include`) and the servers link
@@ -731,6 +731,26 @@ lean-db should spin before parking, which would trade idle CPU for
 latency, is a separate decision that needs a measurement on the deployed
 host's kernel first.
 
+That measurement (item akj76n, run by item dtlin3 in the same window as
+"HttpArena on the VPS": vps.frolow.dev, 2026-11-18, `bench/arena/run.sh db`,
+the same scope and namespaces, as `nobody`, at 2ae7e98 with dtlin3's bench/
+changes only) shows no such gap on the deployed host. `bench/dbpairs.sh`
+(ten pairs of 100,000 requests at c=1): lean-db/go-db 1.08 to 1.32 (median
+1.21); lean-db 3,247 to 3,661 requests per second, p50 254 to 282 µs, p99
+511 to 654 µs, 121 to 134 µs of CPU per request, 1.76 to 1.86 voluntary and
+0.34 to 0.51 involuntary switches per request; go-db 2,681 to 3,028, p50 311
+to 344 µs, p99 615 to 776 µs, 216 to 245 µs of CPU, 8.53 to 8.80 and 1.79
+to 1.88 switches; the private cluster's CPU 68 to 76 µs per request for
+lean-db, 74 to 83 for go-db. With `-g 1`: 1.00 to 1.22 (median 1.09); lean-db
+2,904 to 3,624 requests per second (p50 256 to 319 µs, 122 to 148 µs of
+CPU), go-db 2,838 to 3,254 (p50 288 to 327 µs, 169 to 195 µs of CPU, 5.28
+to 5.54 and 0.90 to 1.06 switches). A request on the VPS takes several times as
+long as in the container, so these figures do not compare with the M1's. On
+the deployed host lean-db is faster with Go's default GOMAXPROCS (ranges
+apart) and spends less CPU per request in both runs; with `-g 1` their
+throughput and p50 ranges overlap. Neither run shows a c=1 gap there for a
+spin before parking to close.
+
 Collecting rows in chunks (item 4lmjda) against single-row mode, measured
 by `bench/rows.sh` (M1, 2026-11-17, load average 11 to 17 from other work,
 two rounds of 8 s, a fresh `lsrv-db` per case, 8 loops with 4 connections
@@ -1171,50 +1191,46 @@ includes those warm-up requests, `bench.sh` samples it around the whole run,
 at most 256 requests against hundreds of thousands. HttpArena's profiles on
 Linux are in "HttpArena on the VPS".
 
-## HttpArena on the VPS (item 53rwgc)
-
-**lsrv-arena's figures below and every comparison drawn from them are
-invalid** (decided 2026-11-17, item sakmfp). They were taken with a
-transport that accepted one connection per loop turn: in a local
-reproduction of the baseline and pipelined profiles about half of the
-4,096 connections were not accepted during the load, and gcannon counts
-only answered requests, so its throughput, latency and CPU per response
-for lsrv-arena covered only the connections accepted ("The over-5 s tail:
-connections accepted late", below). That cause is verified locally; its
-size on the VPS was not measured, as the VPS harness traces no accepts.
-The fix (item sakmfp) has not been measured on the VPS; the Go entries'
-figures are unaffected. The rest of this section is kept as the record of
-that run.
+## HttpArena on the VPS (items 53rwgc, dtlin3)
 
 **These figures are a diagnostic, not a clean acceptance of ekklesiai.org's
 speed requirement D2.** The load generator ran on the same 2 vCPUs as the
-server, as the owner approved for this run (2026-11-17): throughput is a
-lower bound, and latency and CPU per response are observations contaminated
-by the generator. A clean D2 acceptance needs the generator on cores of its
+server, as the owner approved for these runs (2026-11-17, and under the
+owner's delegation of 2026-11-18 for this rerun): throughput is a lower
+bound, and latency and CPU per response are observations contaminated by
+the generator. A clean D2 acceptance needs the generator on cores of its
 own.
+
+The figures below are item dtlin3's rerun (2026-11-18), after the accept
+fix (item sakmfp). They replace item 53rwgc's (2026-11-17), which were
+invalid for lsrv-arena: its transport then accepted one connection per loop
+turn, so about half of the 4,096 connections were not served during a
+sample and gcannon's figures covered only the others ("The over-5 s tail:
+connections accepted late", below). git history keeps that run's tables.
 
 What ran: HttpArena (https://github.com/MDA2AV/HttpArena, da3ded60952b) at
 its HTTP/1.1 profiles this server owns, on vps.frolow.dev, the production
 host (2026-11-17: x86_64, 2 vCPU Intel Xeon Gold 6152, 2.4 GB of memory,
 kernel 6.12.74+deb13+1-amd64, Debian 13.4), with lsrv-arena (`MainArena.lean`,
 `App/Arena.lean`: HttpArena's `/baseline11` and `/pipeline` as its go-stdlib
-entry answers them; the measured build differed from the committed one only
-in values HttpArena does not send: `+` in a query, a field with two `=`,
-values beyond 64 bits) on epoll and on io_uring, against HttpArena's go-stdlib
-(the floor) and go-fasthttp (the target) entries. Five rounds after one
-warm-up round, the contenders' order rotating each round, a fresh server per
-sample. Versions: Lean nightly-2026-11-17, Zig 0.17.1, zio 53ed3c377317,
-gcannon fb63bf61387314 (liburing 2.9), zrk 2.3.0, Go 1.27.3 for the Go
-entries. lsrv-arena runs 2 loops with `--max-conns 16384`.
+entry answers them) on epoll and on io_uring, built from main at 2ae7e98
+(the accept fix is caeba5f; item dtlin3 changed only `bench/`), against
+HttpArena's go-stdlib (the floor) and go-fasthttp (the target) entries. Five
+rounds after one warm-up round, the contenders' order rotating each round,
+a fresh server per sample. Versions: Lean nightly-2026-11-17, Zig 0.17.1,
+zio 53ed3c377317, gcannon fb63bf61387314 (liburing 2.9) with
+`bench/arena/gcannon-served.patch`, zrk 2.3.0, Go 1.27.3 for the Go entries.
+lsrv-arena runs 2 loops with `--max-conns 16384`.
 
 How (`bench/arena/`): `build.sh` cross-builds everything for x86_64 Linux on
-the M1 (the host's disk is shared and nearly full: nothing is built there),
-and `run.sh tests|bench`, run as root on the host from the copied directory,
-runs it in a transient systemd scope of its own (900 MB of memory, no swap)
-and fresh network and PID namespaces (`inner.sh`), watching the site's
-health URL once a second and ending the run at the first answer other than
-200 or slower than 1 s. `summarize.py` prints the tables below from the
-copied `out/` directory.
+the M1 (nothing is built on the host, whose disk is shared and nearly
+full), and `run.sh tests|bench|db`, run as root on the host from the copied
+directory (`/var/tmp/lsrv-arena-dtlin3`), runs it in a transient systemd
+scope of its own (900 MB of memory, no swap) and fresh network and PID
+namespaces (`inner.sh`), watching the site's health URL once a second and
+ending the run at the first answer other than 200 or slower than 1 s.
+`summarize.py` prints the tables below from the copied `out/` directory.
+`run.sh db` runs `bench/dbpairs.sh` there (section "PostgreSQL").
 
 Deviations from HttpArena's own run, all applied to every contender alike:
 - Native processes in namespaces instead of HttpArena's docker containers,
@@ -1226,6 +1242,11 @@ Deviations from HttpArena's own run, all applied to every contender alike:
   /baseline11 chunked" fails for lsrv-arena. Every other check passes for
   every contender: the sums, a random sum, Content-Type, `/pipeline`, and
   16 requests pipelined on one connection.
+- gcannon carries `gcannon-served.patch`, which only counts: its report
+  gains "Connections served", the connection slots answered at least once
+  in the measured window (after the warm-up). It is how this run counts the
+  connections served, against the 4,096 configured; the host has no
+  tracing tools, and the local diagnostic below traced accepts instead.
 - Left out: async (each request answered after 10 ms: the handler has no
   timer, `Request → Await Response` waits only for queries, and adding one
   changes the architectural core), so memory under async is not measured;
@@ -1235,7 +1256,7 @@ Deviations from HttpArena's own run, all applied to every contender alike:
 
 The test suite on the host itself, before the runs: `zig build test`'s
 binaries for x86_64 (from `build.sh`) passed on epoll and on io_uring each:
-serve_test's 25 tests, pg_test's 31, and pg_glue_test.
+serve_test's 42 tests, pg_test's 38, and pg_glue_test.
 
 Results, rounds 1-5: median (min-max) per sample; req/s counts 2xx responses
 over the generator's window; CPU per response is the server's user and
@@ -1245,75 +1266,93 @@ difference is resolved only where the ranges do not overlap. Every response
 of every sample was 2xx (gcannon's status counts equal its responses), and
 zrk reported no error. "over 5 s" counts responses slower than 5 s
 (gcannon's latency overflow, outside its histogram, so its percentiles
-leave them out: under 0.1 % of a sample's responses); limited-conn's reconnects are the profile's own (`-r 10`).
+leave them out); "served" is the patch's count of connections answered
+in the window, of 4,096 (in limited-conn, connection slots, each reopened
+after 10 requests, `-r 10`).
 
 baseline (gcannon, 4096 connections, 5 s, GET and POST alternating):
 
-| server | runs | req/s | p99 ms | CPU µs/resp | peak MB | non-2xx | over 5 s |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| lsrv-epoll | 5 | 31,516 (27,928-33,934) | 66.3 (59.4-76.4) | 48 (44-55) | 38 (36-41) | 0 | 50 |
-| lsrv-io_uring | 5 | 33,841 (32,421-34,065) | 64.3 (60.1-67.7) | 45 (44-46) | 41 (38-44) | 0 | 62 |
-| go-stdlib | 5 | 28,400 (27,932-29,597) | 709.5 (389.2-880.2) | 47 (47-49) | 141 (141-143) | 0 | 0 |
-| go-fasthttp | 5 | 45,046 (41,808-45,407) | 267.2 (228.4-313.5) | 25 (25-27) | 82 (81-83) | 0 | 0 |
+| server | runs | req/s | p99 ms | p99.9 ms | CPU µs/resp | peak MB | non-2xx | over 5 s | served |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| lsrv-epoll | 5 | 23,467 (22,246-25,189) | 847.9 (785.4-937.3) | 1480 (1410-1640) | 61 (57-63) | 84 (84-85) | 0 | 0 | 4,096 in each |
+| lsrv-io_uring | 5 | 23,531 (21,626-25,709) | 588.9 (513.3-651.5) | 856 (753-909) | 61 (55-65) | 86 (84-86) | 0 | 0 | 4,096 in each |
+| go-stdlib | 5 | 24,807 (24,209-29,147) | 1170.0 (596.1-1580.0) | 1510 (1290-2540) | 56 (47-57) | 141 (136-142) | 0 | 0 | 4,096 in each |
+| go-fasthttp | 5 | 40,841 (38,047-43,383) | 299.6 (258.8-392.1) | 512 (457-710) | 27 (26-30) | 82 (82-83) | 0 | 0 | 4,096 in each |
 
 pipelined (gcannon, 4096 connections, 16 requests in flight on each, 5 s):
 
-| server | runs | req/s | p99 ms | CPU µs/resp | peak MB | non-2xx | over 5 s |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| lsrv-epoll | 5 | 43,955 (36,228-45,909) | 3720.0 (3450.0-3790.0) | 32 (31-39) | 34 (32-35) | 0 | 603 |
-| lsrv-io_uring | 5 | 43,753 (41,272-47,408) | 3570.0 (3420.0-3830.0) | 33 (30-34) | 35 (33-35) | 0 | 591 |
-| go-stdlib | 5 | 44,526 (40,898-46,198) | 3980.0 (3850.0-4580.0) | 32 (31-35) | 74 (68-76) | 0 | 65 |
-| go-fasthttp | 5 | 431,859 (393,507-473,046) | 610.5 (381.3-692.4) | 3 (3-3) | 81 (80-81) | 0 | 0 |
+| server | runs | req/s | p99 ms | p99.9 ms | CPU µs/resp | peak MB | non-2xx | over 5 s | served |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| lsrv-epoll | 5 | 34,799 (32,016-35,920) | 3220 (2980-3580) | 3720 (3360-4120) | 37 (37-41) | 87 (86-89) | 0 | 0 | 4,096 in each |
+| lsrv-io_uring | 5 | 35,492 (28,831-37,913) | 3070 (2830-3860) | 3570 (3250-4360) | 37 (34-46) | 87 (87-89) | 0 | 0 | 4,096 in each |
+| go-stdlib | 5 | 42,108 (34,962-45,379) | 4460 (4020-4770) | 4710 (4390-4910) | 35 (31-40) | 73 (63-82) | 0 | 169 | 1,788 (1,463-2,118) |
+| go-fasthttp | 5 | 421,898 (306,909-441,098) | 601.5 (373.6-911.2) | 976 (669-1490) | 3 (3-4) | 80 (79-83) | 0 | 0 | 4,096 in each |
 
 limited-conn (baseline with a new connection after every 10 requests):
 
-| server | runs | req/s | p99 ms | CPU µs/resp | peak MB | non-2xx | over 5 s |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| lsrv-epoll | 5 | 26,136 (24,719-28,956) | 1620.0 (1370.0-1700.0) | 55 (49-57) | 28 (24-30) | 0 | 0 |
-| lsrv-io_uring | 5 | 27,833 (26,442-28,190) | 1500.0 (1460.0-1640.0) | 50 (48-52) | 26 (25-27) | 0 | 0 |
-| go-stdlib | 5 | 23,970 (20,490-25,154) | 752.9 (480.4-906.7) | 56 (55-67) | 155 (150-159) | 0 | 0 |
-| go-fasthttp | 5 | 33,423 (31,318-34,460) | 337.6 (290.3-428.0) | 34 (33-37) | 110 (107-112) | 0 | 0 |
+| server | runs | req/s | p99 ms | p99.9 ms | CPU µs/resp | peak MB | non-2xx | over 5 s | served |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| lsrv-epoll | 5 | 23,113 (21,794-24,786) | 920.2 (836.5-970.2) | 1320 (1220-1440) | 60 (56-64) | 72 (68-74) | 0 | 0 | 4,096 in each |
+| lsrv-io_uring | 5 | 22,142 (21,043-23,672) | 623.7 (542.6-717.8) | 828 (783-956) | 63 (58-66) | 107 (105-111) | 0 | 0 | 4,096 in each |
+| go-stdlib | 5 | 22,298 (19,701-22,897) | 808.4 (766.7-952.8) | 1100 (882-1280) | 60 (59-69) | 150 (149-152) | 0 | 0 | 4,096 in each |
+| go-fasthttp | 5 | 33,657 (31,682-34,835) | 327.0 (313.4-358.2) | 503 (479-542) | 34 (32-36) | 108 (102-113) | 0 | 0 | 4,096 in each |
 
 latency-10k (zrk at a fixed 10,000 requests/s, 1024 connections, 20 s;
-each run reached 99.2-99.5 % of the rate; no errors):
+each run reached 99.2-99.5 % of the rate; no errors; zrk reports no p99.9
+and no count of connections served):
 
 | server | runs | req/s | p99 ms | CPU µs/resp | peak MB | non-2xx |
 |---|---:|---:|---:|---:|---:|---:|
-| lsrv-epoll | 5 | 9,941 (9,939-9,949) | 14.0 (8.5-94.0) | 70 (65-82) | 34 (34-34) | 0 |
-| lsrv-io_uring | 5 | 9,943 (9,931-9,945) | 8.6 (7.1-14.7) | 67 (65-70) | 33 (33-33) | 0 |
-| go-stdlib | 5 | 9,939 (9,925-9,944) | 18.8 (12.3-66.8) | 75 (73-78) | 45 (44-47) | 0 |
-| go-fasthttp | 5 | 9,946 (9,934-9,951) | 5.3 (4.5-9.5) | 50 (48-52) | 31 (31-33) | 0 |
+| lsrv-epoll | 5 | 9,937 (9,930-9,944) | 16.1 (14.1-28.8) | 80 (77-81) | 34 (33-34) | 0 |
+| lsrv-io_uring | 5 | 9,941 (9,934-9,944) | 20.5 (13.3-47.7) | 77 (73-81) | 34 (33-34) | 0 |
+| go-stdlib | 5 | 9,945 (9,924-9,951) | 15.2 (13.4-19.3) | 79 (77-81) | 44 (43-45) | 0 |
+| go-fasthttp | 5 | 9,947 (9,935-9,954) | 5.4 (4.6-6.3) | 56 (53-58) | 32 (32-33) | 0 |
 
-Read with the caveat above, and void for lsrv-arena (the notice at the
-top of this section):
-- Against the floor: lsrv-arena on io_uring answers more baseline and
-  limited-conn requests per second than go-stdlib (ranges apart); on epoll
-  the ranges overlap go-stdlib's. In pipelined the three are level. Its
-  baseline p99 is about a tenth of go-stdlib's, and its peak memory is lower
-  in every profile (a third or less in baseline and limited-conn, half in
-  pipelined).
-- Against the target: go-fasthttp is ahead in throughput in every
-  throughput profile (ranges apart), by about 1.2 to 1.3 times in baseline and
-  limited-conn and 10 times in pipelined, where it answers 16 pipelined
-  requests for about 3 µs of CPU each and this server, like go-stdlib, for
-  about 32; and in CPU per response everywhere.
-- In pipelined and baseline, lsrv-arena's tail is long: responses over 5 s
-  in every pipelined sample (about 120 per sample of some 220,000) and in
-  every baseline sample (7 to 14), which neither Go entry has in baseline.
-  Its cause was that the loops accepted one connection per turn (fixed in
-  item sakmfp, not re-measured here), so in a local reproduction about
-  half of the 4,096 connections were never accepted during the load and
-  gcannon's figures for lsrv-arena covered only the others ("The over-5 s tail: connections accepted late", below).
-- epoll against io_uring: the throughput, p99 and CPU ranges overlap in
-  every profile, so no difference in them is resolved; only latency-10k's
-  peak memory is (34 MB on epoll, 33 on io_uring).
+Read with the caveat above:
+- The accept fix on the host: in every sample of every gcannon profile, on
+  both backends, all 4,096 connection slots received a response in the
+  window, and no recorded response took over 5 s (53rwgc: 50 and 62 in
+  baseline, 603 and 591 in pipelined, over five samples). Its pipelined
+  p99.9 is still 3.3 to 4.4 s; gcannon allows up to 65,536 requests in
+  flight there (4,096 connections, 16 each) on 2 vCPUs, but how many were
+  in flight was not measured.
+- 53rwgc counted no connections served on the host; the local reproduction
+  of its run (below) found about half of them answered. Its figures are
+  therefore not compared with these: baseline throughput is lower than
+  53rwgc's (about 23,500 per second against 31,500 to 33,800), p99 higher
+  (0.5 to 0.9 s against about 65 ms), and peak memory higher (84 to 86 MB
+  against about 40).
+- go-stdlib in pipelined answered only 1,463 to 2,118 of the 4,096
+  connections in a sample, and 169 of its responses took over 5 s; its
+  pipelined figures cover only those connections. Its slow accepts under
+  that profile were also seen locally (below); they are go-stdlib's own and
+  were not traced further.
+- Against the floor (go-stdlib): in baseline and limited-conn the
+  throughput ranges overlap go-stdlib's, and so do the p99 ranges except
+  lsrv-arena's on io_uring in limited-conn (543 to 718 ms against 767 to
+  953); lsrv-arena's peak memory is lower in both (84 to 86 MB
+  against 136 to 142 in baseline; 68 to 111 against 149 to 152 in
+  limited-conn). In pipelined go-stdlib's figures do not cover all its
+  connections, so they are not compared. latency-10k: the ranges overlap
+  except peak memory (33 to 34 MB against 43 to 45).
+- Against the target (go-fasthttp): ahead in throughput in every throughput
+  profile, ranges apart: about 1.7 times in baseline, 1.5 in limited-conn
+  and 12 in pipelined, with lower p99 and less CPU per response
+  everywhere.
+- epoll against io_uring: throughput and CPU per response overlap in every
+  profile. io_uring's p99 and p99.9 are lower in baseline (p99 513 to 652
+  ms against 785 to 937) and limited-conn (543 to 718 against 837 to 970),
+  ranges apart; in pipelined both overlap, and so does p99 in latency-10k
+  (zrk reports no p99.9). In limited-conn
+  io_uring's peak memory is higher (105 to 111 MB against 68 to 74).
 
-The site's health during the runs: 884 probes while the tests and the load
-ran, every answer 200, the slowest 0.013 s, and 50 before and after them, at
-most 0.004 s; the stop condition never fired. No Sejm import
-ran during the runs (20:51-21:06 UTC). Disk on the host: 4.2 GB free before
-the run's 391 MB were copied, 3.8 GB during, 4.2 GB after its directory was
-removed.
+The site's health during the runs: 2,275 probes while the tests, the load
+and `bench/dbpairs.sh` ran (18:41-19:24 UTC, `run.sh` tests 18:41, db
+18:41-19:05, bench 19:09-19:24), every answer 200, the slowest 0.018 s,
+and 75 before and after them, at most 0.003 s; the stop condition never
+fired. No Sejm import was scheduled in that window (its timer runs at
+05:30 UTC). Disk on the host: 3.7 GB free before the run's 446 MB were
+copied, 3.3 GB during, 3.7 GB after its directory was removed.
 
 ### The over-5 s tail: connections accepted late (item 6p6tu6)
 
@@ -1344,9 +1383,9 @@ lsrv-arena samples after that change gave the same shape (accepted during
 the load 2,311 and 2,343 of 4,096 in baseline, 1,978 and 1,998 in
 pipelined; 14-20 and 208-218 over 5 s), and go-fasthttp's two 4,096.
 
-The tail reproduces at the VPS's scale (VPS: 7-14 per baseline sample, about
-120 per pipelined one) and is not a lost wakeup or a fairness bug among
-served connections: it is the accept path.
+The tail reproduces at the scale of item 53rwgc's VPS run (7-14 per
+baseline sample, about 120 per pipelined one) and is not a lost wakeup or a
+fairness bug among served connections: it is the accept path.
 - **One accept per loop turn.** `acceptCb` (`zig/src/serve.zig`) handles the
   one connection its accept returned and adds the next accept. zio tries
   that accept at once, but queues its completion, and the callback runs only
@@ -1363,10 +1402,10 @@ served connections: it is the accept path.
   answered requests, from their send. So about half the connections were
   never accepted during the load, invisible in its counts; those accepted
   near its end were answered after more than 5 s (in pipelined, 16 requests
-  each: 142-181 over 5 s, 14-15 connections accepted after 5 s). The VPS
-  figures above have the same shape, so lsrv-arena's throughput, latency
-  and CPU per response there very likely also cover only the connections it
-  accepted; that is not measured on the VPS.
+  each: 142-181 over 5 s, 14-15 connections accepted after 5 s). Item
+  53rwgc's VPS figures had the same shape; item dtlin3's rerun after the
+  fix counted the connections served there (above): all 4,096, with no
+  response over 5 s.
 - **The check of the cause** (a diagnostic build, not committed): with
   `acceptCb` taking up to 64 more pending connections with `accept(2)`
   before it adds the next accept, every connection was accepted during the
@@ -1377,7 +1416,7 @@ served connections: it is the accept path.
   CPUs. Item sakmfp made that change (`LoopCtx.acceptMore`; "Production
   contract", "Admission"); its own run is below.
 - io_uring was not traced locally; its completions take the same deferred
-  path in zio's loop, and the VPS counts for it are the same.
+  path in zio's loop, and 53rwgc's VPS counts for it were the same.
 - go-stdlib's pipelined samples also accepted slowly (up to 3 s) and
   showed a tail (0 here, 0 to 2,986 over 5 s in six other local samples,
   65 over five on the VPS); that is go-stdlib's own, not traced
@@ -1427,7 +1466,7 @@ lsrv-arena's responses now cover every connection, so they are not
 comparable with the first table of this section, taken before the fix,
 when about half the connections were accepted during the load; the median
 rose as in the diagnostic build, since twice the connections share the two
-CPUs. The VPS figures are not re-measured.
+CPUs. Item dtlin3 re-measured the VPS after the fix (above).
 
 ## `Std.Http.Protocol.H1` compared with the hand-written parser (item 7bccgi)
 

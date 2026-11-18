@@ -1,5 +1,5 @@
 #!/bin/sh
-# inner.sh tests|bench DIR: run.sh runs this in the run's own network and PID
+# inner.sh tests|bench|db DIR: run.sh runs this in the run's own network and PID
 # namespaces (item 53rwgc; README, "HttpArena on the VPS"). Results go to
 # DIR/out.
 #
@@ -11,6 +11,7 @@
 #   HTTP/1.1 profiles the server owns, with the generator on the same two
 #   CPUs. Each sample starts a fresh server, so its peak memory (VmHWM) is that
 #   sample's. The contenders' order rotates each round.
+# db: bench/dbpairs.sh, below.
 set -eu
 phase=$1 d=$2
 out=$d/out
@@ -38,6 +39,30 @@ if [ "$phase" = tests ]; then
     [ $s -eq 0 ] || status=1
   done
   exit $status
+fi
+
+if [ "$phase" = db ]; then
+  # bench/dbpairs.sh twice, with Go's default GOMAXPROCS and with -g 1 (item
+  # akj76n), from db/, which build.sh lays out as the repository. initdb
+  # refuses root, so it runs as nobody, writing only under db/tmp: its
+  # private cluster takes only a Unix socket there (bench/lib.sh, pg_start),
+  # never the host's PostgreSQL.
+  # Only what build.sh laid out: not db/tmp, where a cluster left by an
+  # interrupted run must keep its own modes.
+  chmod go+rx "$d" "$d/db"
+  chmod -R go+rX "$d/db/.lake" "$d/db/bench" "$d/lib"
+  mkdir -p "$d/db/tmp"
+  chown nobody:nogroup "$d/db/tmp"
+  dbpairs() { # NAME [ARG...]
+    name=$1; shift
+    stopped
+    (cd "$d/db" && setpriv --reuid=nobody --regid=nogroup --clear-groups \
+      env TMPDIR="$d/db/tmp" HOME="$d/db/tmp" sh bench/dbpairs.sh "$@") >"$out/$name.txt" 2>&1 ||
+      { echo "$name failed: $(tail -n 3 "$out/$name.txt")"; exit 1; }
+  }
+  dbpairs dbpairs
+  dbpairs dbpairs-g1 -g 1
+  exit 0
 fi
 
 port=8080

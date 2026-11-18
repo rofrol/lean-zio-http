@@ -10,9 +10,13 @@
 #   once per Linux backend (epoll, io_uring), in linux/Dockerfile's image for
 #   linux/amd64 (Zig cross-compiling from aarch64, below). The test binaries
 #   run only on the VPS (bench/arena/run.sh tests).
+# - For bench/dbpairs.sh on the VPS (run.sh db; item akj76n): lsrv-db (epoll),
+#   bench/load and bench/pgserver, laid out under OUT/db as the repository
+#   lays them out.
 # - gcannon (HttpArena's load generator, io_uring) at a pinned commit, with
 #   liburing 2.9 as docker/gcannon.Dockerfile builds it; at that commit it
-#   also needs OpenSSL's headers (src/ktls.c), which that Dockerfile lacks.
+#   also needs OpenSSL's headers (src/ktls.c), which that Dockerfile lacks;
+#   with gcannon-served.patch (its "Connections served" line).
 # - zrk 2.3.0 (the fixed-rate generator of the latency profiles), checked
 #   against the SHA-256 that docker/zrk.Dockerfile pins.
 # - HttpArena's go-stdlib and go-fasthttp entries, cross-compiled with this
@@ -33,6 +37,8 @@ out=$(cd "$out" && pwd) arena=$(cd "$arena" && pwd)
 [ "$(git -C "$arena" rev-parse HEAD)" = "$arena_commit" ] || { echo "$arena is not at $arena_commit"; exit 1; }
 cd "$(dirname "$0")/../.."
 mkdir "$out/lib" "$out/requests"
+# db/ mirrors the repository paths bench/dbpairs.sh runs from (run.sh db).
+mkdir -p "$out/db/.lake/build/bin" "$out/db/bench/load" "$out/db/bench/pgserver"
 
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT INT TERM
@@ -67,6 +73,11 @@ docker run --rm --platform linux/amd64 --security-opt seccomp=unconfined \
   for backend in epoll io_uring; do
     LSRV_LINUX_BACKEND=$backend lake build lsrv-arena
     cp .lake/build/bin/lsrv-arena /out/lsrv-arena-$backend
+    # lsrv-db for bench/dbpairs.sh (run.sh db), on the build'"'"'s default backend.
+    if [ $backend = epoll ]; then
+      LSRV_LINUX_BACKEND=$backend lake build lsrv-db
+      cp .lake/build/bin/lsrv-db /out/db/.lake/build/bin/lsrv-db
+    fi
     touch /tmp/mark
     # Built for the VPS'"'"'s glibc (Debian 13: 2.41). Zig also runs them here,
     # under Rosetta, where io_uring_setup and other calls fail with ENOSYS
@@ -94,6 +105,16 @@ for b in epoll io_uring; do
   done
 done
 [ -x "$out/pg_glue_test" ] || { echo "missing pg_glue_test"; exit 1; }
+[ -x "$out/db/.lake/build/bin/lsrv-db" ] || { echo "missing lsrv-db"; exit 1; }
+
+# bench/dbpairs.sh's load generator and Go server, as its header says to
+# build them, for x86_64 Linux.
+for p in load pgserver; do
+  case $p in load) bin=load ;; pgserver) bin=server ;; esac
+  (cd bench/$p && GOTOOLCHAIN=local CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o "$out/db/bench/$p/$bin" .)
+done
+cp bench/dbpairs.sh "$out/db/bench/"
+cp bench/lib.sh "$out/db/bench/"
 
 # gcannon.Dockerfile builds from linux/Dockerfile's debian:trixie digest.
 docker build -q --platform linux/amd64 --build-arg LIBURING_COMMIT="$liburing_commit" \

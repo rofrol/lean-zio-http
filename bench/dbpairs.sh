@@ -111,7 +111,8 @@ while [ "$round" -le "$rounds" ]; do
     printf 'round=%s ' "$round"; sample go-db "$go_pid" "$go_addr"; go_rps=$rps
     printf 'round=%s ' "$round"; sample lean-db "$lean_pid" "$lean_addr"; lean_rps=$rps
   fi
-  ratio=$(echo "scale=2; $lean_rps / $go_rps" | bc)
+  # awk, not bc: the VPS (bench/arena/run.sh db) has no bc.
+  ratio=$(awk -v l="$lean_rps" -v g="$go_rps" 'BEGIN { printf "%.2f", l / g }')
   echo "round=$round lean-db/go-db $ratio"
   round=$((round + 1))
 done

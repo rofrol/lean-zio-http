@@ -14,6 +14,10 @@ its reconnects in limited-conn are the profile's own (-r 10: a new connection
 after every 10 requests), as HttpArena's gcannon.sh counts them, apart from
 errors. CPU per response is approximate: the server's CPU is read around the
 whole generator run, connection set-up and drain included (CLK_TCK 100).
+"served" is gcannon's "Connections served" (gcannon-served.patch, item
+dtlin3): the connection slots answered at least once in the measured window,
+against the 4,096 configured, "-" for zrk and for a run with an unpatched
+gcannon. p99.9 is gcannon's own, "-" for zrk, which reports none.
 Prints Markdown. A difference is called resolved only where the two ranges do
 not overlap.
 """
@@ -32,15 +36,19 @@ def gcannon(text):
     codes = dict(re.findall(r"(\dxx)=(\d+)", text))
     lat = re.search(r"Latency\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)", text)
     over = re.search(r"Latency overflow \(>5s\): (\d+)", text)
+    served = re.search(r"Connections served: (\d+)", text)
     ok = int(codes.get("2xx", 0))
     bad = sum(int(codes.get(k, 0)) for k in ("3xx", "4xx", "5xx"))
     return {
         "rps": ok / float(m.group(2)),
         "responses": int(m.group(3)),
         "p99_ms": ms(lat.group(4)),
+        "p999_ms": ms(lat.group(5)),
         "bad": bad,
         "slow": int(over.group(1)) if over else 0,
         "errors": 0,
+        # gcannon-served.patch's line; absent from an unpatched gcannon's output.
+        "served": int(served.group(1)) if served else None,
     }
 
 
@@ -51,10 +59,12 @@ def zrk(text):
         "rps": j["status_codes"]["2xx"] / j["duration_s"],
         "responses": j["requests"],
         "p99_ms": j["latency_us"]["p99"] / 1000,
+        "p999_ms": None,
         "bad": j["errors"]["non_2xx_3xx"],
         "slow": 0,
         "errors": errors,
         "rate_ratio": j["rate_ratio"],
+        "served": None,
     }
 
 
@@ -65,6 +75,11 @@ def ms(s):
 
 def rng(xs, fmt):
     return f"{fmt(statistics.median(xs))} ({fmt(min(xs))}-{fmt(max(xs))})"
+
+
+def opt(xs, fmt):
+    """rng, or "-" where the generator does not report the value."""
+    return "-" if None in xs else rng(xs, fmt)
 
 
 def main():
@@ -81,15 +96,17 @@ def main():
         rows.setdefault(prof, {}).setdefault(srv, []).append(r)
     for prof, servers in rows.items():
         print(f"\n{prof}\n")
-        print("| server | runs | req/s | p99 ms | CPU µs/resp | peak MB | non-2xx | over 5 s | zrk errors |")
-        print("|---|---:|---:|---:|---:|---:|---:|---:|---:|")
+        print("| server | runs | req/s | p99 ms | p99.9 ms | CPU µs/resp | peak MB | non-2xx | over 5 s | zrk errors | served |")
+        print("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
         for srv, rs in sorted(servers.items(), key=lambda kv: ORDER.index(kv[0])):
             col = lambda k: [r[k] for r in rs]
             print(f"| {srv} | {len(rs)} | {rng(col('rps'), lambda v: f'{v:,.0f}')} "
                   f"| {rng(col('p99_ms'), lambda v: f'{v:.1f}')} "
+                  f"| {opt(col('p999_ms'), lambda v: f'{v:.1f}')} "
                   f"| {rng(col('cpu_us'), lambda v: f'{v:.0f}')} "
                   f"| {rng(col('hwm_mb'), lambda v: f'{v:.0f}')} "
-                  f"| {sum(col('bad'))} | {sum(col('slow'))} | {sum(col('errors'))} |")
+                  f"| {sum(col('bad'))} | {sum(col('slow'))} | {sum(col('errors'))} "
+                  f"| {opt(col('served'), lambda v: f'{v:,.0f}')} |")
             if prof.startswith("latency"):
                 print(f"<!-- {srv} rate_ratio {min(col('rate_ratio')):.4f}-{max(col('rate_ratio')):.4f} -->")
 

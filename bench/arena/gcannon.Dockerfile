@@ -2,7 +2,7 @@
 # which builds it with `docker build --platform linux/amd64 --output` and
 # passes the commits it pins as LIBURING_COMMIT and GCANNON_COMMIT. The last
 # stage holds only the outputs: gcannon and lib/liburing.so.2.9 with its link
-# lib/liburing.so.2.
+# lib/liburing.so.2. Its build context is bench/arena (gcannon-served.patch).
 #
 # The base image is linux/Dockerfile's debian:trixie index digest as of
 # 2026-11-18 (item ugay7c); linux/Dockerfile is its source of truth: move
@@ -19,8 +19,10 @@ RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends \
 RUN git clone -q https://github.com/axboe/liburing.git /liburing && cd /liburing \
     && git checkout -q "$LIBURING_COMMIT" \
     && ./configure --prefix=/usr >/dev/null && make -s -j"$(nproc)" -C src && make -s install -C src >/dev/null
+# gcannon-served.patch adds the "Connections served" line (its header says why).
+COPY gcannon-served.patch /gcannon-served.patch
 RUN git clone -q https://github.com/MDA2AV/gcannon /gcannon && cd /gcannon \
-    && git checkout -q "$GCANNON_COMMIT" \
+    && git checkout -q "$GCANNON_COMMIT" && git apply /gcannon-served.patch \
     && make -s clean && make -s -j"$(nproc)"
 RUN mkdir -p /dist/lib && cp /gcannon/gcannon /dist/ && cp /usr/lib/liburing.so.2.9 /dist/lib/ \
     && ln -s liburing.so.2.9 /dist/lib/liburing.so.2
