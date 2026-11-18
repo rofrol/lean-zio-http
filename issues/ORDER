@@ -10,6 +10,7 @@ q2g4am Act on leanprover/lean4's answers to the Std.Http questions 16522 and 165
 paarzq Write a connection's pipelined responses with one send, as go-fasthttp does, instead of one send and one loop turn per response
 owgate Find where H1's parse spends 40 % of lsrv-arena's CPU (about 4-6 µs per request), or accept that cost
 7wvkwz Find why lean-db reaches only 0.64 of Go at one connection in the Linux container
+c5ca75 Test the shutdown's cancel against a performed send queued in the ready list
 
 ## Needs a decision
 
