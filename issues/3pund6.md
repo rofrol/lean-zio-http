@@ -1,4 +1,5 @@
 Decide what follows from the classification of Linux pending-connection accept errnos (xihdtw)
+Done by: the coordinating session
 
 Needs a decision (item xihdtw's outcome, commit "boundary: classify Linux pending-connection accept errnos under the pinned zio"; README "Production contract", "Accept errors").
 
@@ -19,3 +20,5 @@ Question: What follows from the classification?
 Options: keep exiting and keep the item open as a bounded finding | ask zio upstream (b) | close it (a)
 
 Checked 2026-11-17 with sol (consult round 20261117-011832-74e7) under the user's delegation: deferred: keep today's exit and the bounded kernel finding; asking zio upstream needs the user's go. No local workaround.
+
+Decided 2026-11-18 by the coordinating session with sol, argon and hydrogen (consult round 20261118-181941-5f8f; calls 4a23f520, e4c9a8ea, 272fc555), under the user's delegation of 2026-11-18 to decide the remaining open questions with the models: approved (all three agree): keep today's exit on these errnos and the bounded kernel finding in README; no local workaround. Ask zio upstream with one issue on https://github.com/lalinsky/zio from the user's gh account: the mappings (src/os/base.zig unexpectedError for ENETUNREACH, EHOSTUNREACH, EHOSTDOWN, ENONET, ENOPROTOOPT; src/os/net.zig errnoToAcceptError EOPNOTSUPP -> OperationNotSupported) at the pinned commit and HEAD; accept(2)'s retry note; the Linux sources read (v5.4, v6.1, mainline aebb727: inet_accept returns only inet_csk_accept's EINVAL, EAGAIN or wait errors, also through io_uring); that there is no reproducer and other kernels and security-module hooks were not read; the question whether these should get named accept errors or stay Unexpected as documented behavior. No man-pages report. Tell ekklesiai.org's session the finding and the issue link for its decision record 0001. Track the answer in this item; a confirmed bug follows Rule 6 (fork and PR).
