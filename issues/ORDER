@@ -1,5 +1,6 @@
 ## Next, in order
 
+r4q3yu Build owgate's H1 parse micro-benchmark and local profiling harness, without conclusions
 4bngph Move the toolchain to the first nightly with lean4 PR 16562 and set maxPathSegments and maxQueryParams in the H1 adapter
 owgate Find where H1's parse spends 40 % of lsrv-arena's CPU (about 4-6 µs per request), or accept that cost
 paarzq Write a connection's pipelined responses with one send, as go-fasthttp does, instead of one send and one loop turn per response
