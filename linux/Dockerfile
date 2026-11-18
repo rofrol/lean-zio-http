@@ -15,8 +15,9 @@
 # debian:trixie as of 2026-11-18 (the multi-architecture index; its
 # manifests' annotations say created 2026-11-04; Debian 13.7): to update,
 # take the index digest that `docker buildx imagetools inspect debian:trixie`
-# prints and the date, and move the digest and date of its copy in
-# ../bench/arena/local.Dockerfile with them (item ugay7c).
+# prints and the date, and move the digest and date of its copies in
+# ../bench/arena/local.Dockerfile and ../bench/arena/gcannon.Dockerfile with
+# them (item ugay7c).
 FROM debian:trixie@sha256:9c6e381421d0f48d1b8133e573f33c185ee16cbf505eda9c4a8a4791b25ea8a6
 
 RUN apt-get update && apt-get install -y --no-install-recommends \

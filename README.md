@@ -1003,7 +1003,8 @@ and a patch at least the minimum's), so a rebuild that drifted fails instead of 
 versions silently. To move the base image, take the index digest that
 `docker buildx imagetools inspect debian:trixie` prints and note the date
 beside it in `linux/Dockerfile`, and move the digest and date
-of its copy in `bench/arena/local.Dockerfile` (the local HttpArena image)
+of its copies in `bench/arena/local.Dockerfile` (the local HttpArena image)
+and `bench/arena/gcannon.Dockerfile` (`bench/arena/build.sh`'s gcannon)
 with them. It needs network access and
 docker; `./check.sh` does not depend on it. Run it at each update of zio and
 record its result in the commit. It is development evidence on the host's

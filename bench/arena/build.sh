@@ -95,14 +95,12 @@ for b in epoll io_uring; do
 done
 [ -x "$out/pg_glue_test" ] || { echo "missing pg_glue_test"; exit 1; }
 
-docker run --rm --platform linux/amd64 -v "$out:/out" debian:trixie sh -c "
-  set -eu
-  apt-get update -qq && apt-get install -y -qq --no-install-recommends gcc libc6-dev libssl-dev make git ca-certificates >/dev/null
-  git clone -q https://github.com/axboe/liburing.git /liburing && cd /liburing && git checkout -q $liburing_commit
-  ./configure --prefix=/usr >/dev/null && make -s -j\$(nproc) -C src && make -s install -C src >/dev/null
-  git clone -q https://github.com/MDA2AV/gcannon /gcannon && cd /gcannon && git checkout -q $gcannon_commit
-  make -s clean && make -s -j\$(nproc)
-  cp gcannon /out/gcannon && cp /usr/lib/liburing.so.2.9 /out/lib/ && ln -s liburing.so.2.9 /out/lib/liburing.so.2"
+# gcannon.Dockerfile builds from linux/Dockerfile's debian:trixie digest.
+docker build -q --platform linux/amd64 --build-arg LIBURING_COMMIT="$liburing_commit" \
+  --build-arg GCANNON_COMMIT="$gcannon_commit" --output "type=local,dest=$tmp/gcannon" \
+  -f bench/arena/gcannon.Dockerfile bench/arena >/dev/null
+cp "$tmp/gcannon/gcannon" "$out/gcannon"
+cp -P "$tmp"/gcannon/lib/liburing.so.2.9 "$tmp"/gcannon/lib/liburing.so.2 "$out/lib/"
 
 curl -fsSLo "$tmp/zrk.tar.gz" "https://github.com/zoxy-io/zrk/releases/download/v$zrk_version/zrk-$zrk_version-x86_64-linux.tar.gz"
 echo "$zrk_sha256  $tmp/zrk.tar.gz" | shasum -a 256 -c - >/dev/null
