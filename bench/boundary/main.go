@@ -948,17 +948,23 @@ func procAddr(s string) (string, error) {
 
 // checkQueues checks tcpQueues against connections of this process, over
 // loopback, whose queues are known, before a scenario relies on it: each of
-// three servers has not read k bytes its client wrote (1,000, 2,000 and
-// 3,000; awaitBytes shows they arrived) and has written nothing, so its
+// n servers (n >= 1) has not read k bytes its client wrote (1,000, 2,000 and
+// 3,000 for the first three, and each further one a size no other has:
+// checkSize; awaitBytes shows they arrived) and has written nothing, so its
 // socket must show exactly k unread and nothing unacknowledged, and its
-// client's nothing unread. A fourth server, with a send buffer far larger
+// client's nothing unread. memoryFull checks 3 such connections; a scenario
+// of held that waits on the client-to-server queues checks as many as it
+// opens. A further server, with a send buffer far larger
 // than its client's receive buffer, writes until its send would block to a
 // client that writes nothing and never reads: of the w bytes it wrote, its
 // socket's unacknowledged and the client's unread (from a second, later
 // reading, as in memoryFull) must each be more than none and at most w, and
 // together at least w (a byte received and not yet acknowledged counts
 // twice), and the client must have nothing unacknowledged.
-func checkQueues() error {
+func checkQueues(n int) error {
+	if n < 1 || n > 3000 {
+		panic(fmt.Sprintf("checkQueues(%d): checkSize gives distinct sizes for 1 to 3,000 connections", n))
+	}
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return err
@@ -979,7 +985,7 @@ func checkQueues() error {
 		})
 		return errors.Join(err, serr)
 	}}
-	for range 4 {
+	for range n + 1 {
 		c, err := d.Dial("tcp", ln.Addr().String())
 		if err != nil {
 			return err
@@ -991,8 +997,8 @@ func checkQueues() error {
 		}
 		ss = append(ss, s.(*net.TCPConn))
 	}
-	sizes := []int{1000, 2000, 3000}
-	for i, k := range sizes {
+	for i := range n {
+		k := checkSize(i)
 		if _, err := cs[i].Write(bytes.Repeat([]byte{'a'}, k)); err != nil {
 			return err
 		}
@@ -1000,10 +1006,10 @@ func checkQueues() error {
 			return err
 		}
 	}
-	if err := ss[3].SetWriteBuffer(1 << 20); err != nil {
+	if err := ss[n].SetWriteBuffer(1 << 20); err != nil {
 		return err
 	}
-	w, err := fillSend(ss[3])
+	w, err := fillSend(ss[n])
 	if err != nil {
 		return err
 	}
@@ -1022,7 +1028,8 @@ func checkQueues() error {
 		}
 		return
 	}
-	for i, k := range sizes {
+	for i := range n {
+		k := checkSize(i)
 		c, s, err := pair(i, first)
 		if err != nil {
 			return err
@@ -1031,11 +1038,11 @@ func checkQueues() error {
 			return fmt.Errorf("control connection %d: the server's queues read %d unread and %d unacknowledged, the client's %d unread; want %d, 0 and 0", i, s[0], s[1], c[0], k)
 		}
 	}
-	_, s, err := pair(3, first)
+	_, s, err := pair(n, first)
 	if err != nil {
 		return err
 	}
-	c, _, err := pair(3, later)
+	c, _, err := pair(n, later)
 	if err != nil {
 		return err
 	}
@@ -1043,9 +1050,17 @@ func checkQueues() error {
 		// The kernel may cap or grow either buffer (Linux: net.core.wmem_max;
 		// macOS grows the receive buffer): a receiver that took every byte
 		// leaves nothing unacknowledged, so the sizes it took are reported.
-		return fmt.Errorf("control connection 3: %d bytes written; the server's queue reads %d unacknowledged, the client's %d unread and %d unacknowledged (send buffer %s, receive buffer %s)", w, s[1], c[0], c[1], sockBuffer(ss[3], syscall.SO_SNDBUF), sockBuffer(cs[3], syscall.SO_RCVBUF))
+		return fmt.Errorf("control connection %d: %d bytes written; the server's queue reads %d unacknowledged, the client's %d unread and %d unacknowledged (send buffer %s, receive buffer %s)", n, w, s[1], c[0], c[1], sockBuffer(ss[n], syscall.SO_SNDBUF), sockBuffer(cs[n], syscall.SO_RCVBUF))
 	}
 	return nil
+}
+
+// checkSize is the number of bytes checkQueues' control connection i writes
+// and leaves unread: 1,000, 2,000 or 3,000 by i mod 3, plus i/3, so no two
+// of up to 3,000 connections write the same number and a reading that
+// attributes one connection's queue to another fails.
+func checkSize(i int) int {
+	return 1000*(i%3+1) + i/3
 }
 
 // sockBuffer describes c's socket option opt (SO_SNDBUF or SO_RCVBUF) as
@@ -1191,7 +1206,7 @@ func memoryFull(path string) (string, error) {
 	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
 		return "skipped: the socket queues are read on macOS and Linux only", nil
 	}
-	if err := checkQueues(); err != nil {
+	if err := checkQueues(3); err != nil {
 		return "", fmt.Errorf("the socket queues read wrong: %w", err)
 	}
 	s, err := start(path, "1", "--max-conns", "1100")
@@ -1357,14 +1372,20 @@ func readInterim(r io.Reader) error {
 	return nil
 }
 
-// awaitRead waits until lsof shows, for every connection of conns, nothing
-// of the client's unacknowledged and nothing unread by the server: the
-// server has taken every byte the clients wrote from its sockets. The
-// producer is the server's loop receiving; after `tries` readings without
-// it, it reports what was still queued. That a byte left the socket does not show that Lean has been
-// handed it: a receive the loop has completed but not yet passed to
-// `Conn.step` at the measurement is not excluded (as in memoryFull).
+// awaitRead waits until the socket queues (tcpQueues: lsof on macOS, /proc
+// on Linux) show, for every connection of conns, nothing of the client's
+// unacknowledged and nothing unread by the server: the server has taken
+// every byte the clients wrote from its sockets. The producer is the
+// server's loop receiving; after `tries` readings without it, it fails with
+// what was still queued. A drained queue does not prove that `Conn.step`
+// processed the bytes: a receive the loop has completed but not yet passed
+// to `Conn.step` at the measurement is not excluded (as in memoryFull).
 func awaitRead(pid int, conns []*net.TCPConn) error {
+	// External polling, bounded: the queues are the kernel's socket state,
+	// read with lsof or from /proc, and neither sends a notification when the
+	// server's receive drains them. Exhausting the readings is a failure;
+	// the count is not measured, so add no sleep, delay or larger count
+	// without measured evidence.
 	const tries = 200
 	queued := ""
 	for range tries {
@@ -1388,18 +1409,25 @@ func awaitRead(pid int, conns []*net.TCPConn) error {
 			return nil
 		}
 	}
-	return fmt.Errorf("after %d lsof readings, %s", tries, queued)
+	return fmt.Errorf("after %d socket-queue readings, %s", tries, queued)
 }
 
 // held measures what n connections retain in a state each reaches through
 // hold (which sees its connection and ends at an event showing the server
-// holds that state, or, when lsofSettle, after which awaitRead must show the
-// server has read every byte). Two measurements, after n/2 and after n
+// holds that state, or, when queueSettle, after which awaitRead must show
+// the server has read every byte). Two measurements, after n/2 and after n
 // connections, as in memoryFull: their difference per added connection,
-// without the fixed component. args go to the server.
-func held(path string, args []string, n int, lsofSettle bool, hold func(c *net.TCPConn) error) (string, error) {
-	if lsofSettle && runtime.GOOS != "darwin" {
-		return "skipped: the socket queues it waits on are read with lsof, on macOS only (Linux's are qualified for the scenario with 100 connections sending responses only)", nil
+// without the fixed component. args go to the server. When queueSettle, the
+// socket queues are first checked against n connections whose
+// client-to-server queues are known (checkQueues), on macOS and Linux only.
+func held(path string, args []string, n int, queueSettle bool, hold func(c *net.TCPConn) error) (string, error) {
+	if queueSettle {
+		if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
+			return "skipped: the socket queues it waits on are read on macOS and Linux only", nil
+		}
+		if err := checkQueues(n); err != nil {
+			return "", fmt.Errorf("the socket queues read wrong: %w", err)
+		}
 	}
 	s, err := start(path, append(args, "--max-conns", strconv.Itoa(n+100))...)
 	if err != nil {
@@ -1426,7 +1454,7 @@ func held(path string, args []string, n int, lsofSettle bool, hold func(c *net.T
 		if err != nil {
 			return 0, err
 		}
-		if lsofSettle {
+		if queueSettle {
 			if err := awaitRead(s.cmd.Process.Pid, conns[:hi]); err != nil {
 				return 0, err
 			}
@@ -1452,9 +1480,9 @@ func held(path string, args []string, n int, lsofSettle bool, hold func(c *net.T
 // reports is checked against no bound, since the adapter's is on live blocks,
 // checked in lsrv-test, not on the resident set (README, "Memory": these
 // measurements falsified the earlier 98 KiB).
-func adapterScenario(args []string, n int, lsofSettle bool, hold func(c *net.TCPConn) error) func(path string) (string, error) {
+func adapterScenario(args []string, n int, queueSettle bool, hold func(c *net.TCPConn) error) func(path string) (string, error) {
 	return func(path string) (string, error) {
-		summary, err := held(path, args, n, lsofSettle, hold)
+		summary, err := held(path, args, n, queueSettle, hold)
 		if err != nil || strings.HasPrefix(summary, "skipped: ") {
 			return summary, err
 		}
@@ -1492,9 +1520,10 @@ func holdHead(h string) func(c *net.TCPConn) error {
 }
 
 // holdLine sends a complete request and reads its response, the event that
-// shows the server accepted the connection (lsof sees no connection still in
-// the listen queue), then the start of a request, l, and nothing more; that
-// the server read l is lsof's to show (lsofSettle).
+// shows the server accepted the connection (one still in the listen queue
+// is no descriptor of the server's, so tcpQueues would not list it), then the start of a request, l, and
+// nothing more; that the server read l is the socket queues' to show
+// (queueSettle).
 func holdLine(l string) func(c *net.TCPConn) error {
 	return func(c *net.TCPConn) error {
 		if _, err := io.WriteString(c, "POST /echo HTTP/1.1\r\nHost: a\r\nContent-Length: 0\r\n\r\n"); err != nil {
