@@ -48,3 +48,5 @@ Draft body:
     Question: are these six meant to stay `Unexpected` / `OperationNotSupported`? If so, could the docs say so? Or should they get a named, retryable accept error, like `NetworkDown` and `ProtocolFailure`? We'd like to rely on what zio documents rather than on our reading of the kernel.
     
     Context: our server ([lean-zio-http](https://github.com/rofrol/lean-zio-http), README "Accept errors") currently exits on these errors and documents why.
+
+Decided by the user 2026-11-19: yes, the session posts the drafted zio issue above from the user's gh account.
