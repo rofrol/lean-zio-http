@@ -1243,6 +1243,172 @@ test "f: an expiry that comes after the completion changes nothing" {
     try fx.deinit();
 }
 
+// The deadline timer's own lifecycle (`Pool.rearm`, `Pool.arm`): the tests
+// below force each fire with hooks instead of waiting for the clock. A fire
+// is forced by moving the registered timer's deadline into the past through
+// the loop; a callback is held "on its way" by giving the timer a null
+// callback, so the loop hands the fired completion out through
+// `nextDispatched` instead of calling it (zio's `Completion.callback`), and
+// the test calls the pool's callback on it later, as the loop would.
+
+/// Makes the pool's registered timer fire at the loop's next poll.
+fn fireTimer(fx: *Fixture) void {
+    fx.loop.setTimer(&fx.pool.timer, .{ .deadline = .zero });
+}
+
+/// The pool's timer is registered with the loop and has not fired.
+fn timerRegistered(fx: *Fixture) bool {
+    return fx.pool.timer.c.loadState().phase == .running and !fx.pool.timer.c.has_result;
+}
+
+/// The pool's timer is registered for `timer_due` and points back at the
+/// pool's callback `cb`.
+fn expectArmedFor(fx: *Fixture, cb: *const ev.Completion.CallbackFn, due_at: zio.Timestamp) !void {
+    try std.testing.expect(timerRegistered(fx));
+    try std.testing.expect(fx.pool.timer_due != null and fx.pool.timer_due.?.value == due_at.value);
+    try std.testing.expect(fx.pool.timer.timeout == .deadline and fx.pool.timer.timeout.deadline.value == due_at.value);
+    try std.testing.expect(fx.pool.timer.c.callback == cb);
+    try std.testing.expect(fx.pool.timer.c.userdata == @as(*anyopaque, &fx.pool));
+}
+
+/// Fires the timer and holds its callback: returns the pool's callback,
+/// with the fired (dead) completion out of the loop and not yet called.
+fn holdTimer(fx: *Fixture) !*const ev.Completion.CallbackFn {
+    const cb = fx.pool.timer.c.callback.?;
+    fx.pool.timer.c.callback = null;
+    fireTimer(fx);
+    var steps: usize = 0;
+    while (true) : (steps += 1) {
+        if (steps == max_steps) return error.NoProgress;
+        try fx.loop.poll(.zero);
+        if (fx.loop.nextDispatched()) |got| {
+            try std.testing.expect(got == &fx.pool.timer.c);
+            try std.testing.expect(fx.loop.nextDispatched() == null);
+            return cb;
+        }
+    }
+}
+
+fn earliestOf(ws: []TestWaiter, also: zio.Timestamp) zio.Timestamp {
+    var e = also;
+    for (ws) |*w| if (w.w.deadline.value < e.value) {
+        e = w.w.deadline;
+    };
+    return e;
+}
+
+test "f: the deadline timer is re-added from its own callback, fire after fire" {
+    var fx: Fixture = .{};
+    try fx.initBudgets(1, .{ .query_ms = far, .query_max_ms = far, .connect_ms = far });
+    _ = try fx.pair();
+    fake.start.push(&.{1});
+    fake.connect_poll.push(&.{1}); // waits to read; the server never answers
+    var ws: [3]TestWaiter = .{ .{ .pool = &fx.pool }, .{ .pool = &fx.pool }, .{ .pool = &fx.pool } };
+    for (&ws) |*w| w.submit();
+    const s = slot0(&fx);
+    try std.testing.expectEqual(.connecting, s.state);
+    const cb = fx.pool.timer.c.callback.?;
+    try expectArmedFor(&fx, cb, earliestOf(&ws, s.connect_deadline));
+
+    // A fire with nothing due re-adds the timer for the same deadline.
+    const due_at = fx.pool.timer_due.?;
+    fireTimer(&fx);
+    try fx.until(&fx, struct {
+        fn f(x: *Fixture) bool {
+            return timerRegistered(x) and x.pool.timer.timeout.deadline.value != 0;
+        }
+    }.f);
+    try expectArmedFor(&fx, cb, due_at);
+    for (&ws) |*w| try std.testing.expectEqual(@as(usize, 0), w.n);
+
+    // Each fire expires one waiter made due, and the callback re-adds the
+    // timer for what still runs: the later waiters and the connect.
+    for (&ws, 0..) |*w, i| {
+        w.w.deadline = .zero;
+        fireTimer(&fx);
+        try fx.until(w, delivered);
+        try std.testing.expectEqual(.err, w.got[0].kind);
+        try std.testing.expectEqualSlices(u8, "57014", &w.got[0].sqlstate);
+        for (ws[i + 1 ..]) |*o| try std.testing.expectEqual(@as(usize, 0), o.n);
+        try expectArmedFor(&fx, cb, earliestOf(ws[i + 1 ..], s.connect_deadline));
+    }
+
+    // The connect's deadline is the last: once it expires nothing runs, and
+    // the callback adds no timer.
+    s.connect_deadline = .zero;
+    fireTimer(&fx);
+    try fx.until(&fx, Fixture.allDisconnected);
+    try std.testing.expect(fx.pool.timer_due == null);
+    try std.testing.expectEqual(.dead, fx.pool.timer.c.loadState().phase);
+    try std.testing.expectEqual(@as(usize, 1), fake.count.get(.finish));
+    try fx.deinit();
+}
+
+test "f: a shutdown while the timer's callback is on its way never re-arms the timer" {
+    var fx: Fixture = .{};
+    try fx.initBudgets(1, .{ .query_ms = far, .query_max_ms = far, .connect_ms = far });
+    var a: TestWaiter = .{ .pool = &fx.pool };
+    _ = try sentAndBusy(&fx, &a, query());
+    const cb = try holdTimer(&fx);
+    // The pool cannot take the timer back from the loop now.
+    try std.testing.expect(!fx.loop.clearTimer(&fx.pool.timer));
+    fx.pool.stop();
+    fx.pool.abort();
+    try std.testing.expectEqual(@as(usize, 1), a.n);
+    try std.testing.expectEqual(.abandoned, a.got[0].kind);
+    try std.testing.expectEqualSlices(u8, "57014", &a.got[0].sqlstate);
+    // Left to the callback, which finds nothing running and adds no timer.
+    try std.testing.expect(fx.pool.timer_due != null);
+    const mark = fake.calls;
+    cb(&fx.loop, &fx.pool.timer.c);
+    try expectKinds(mark, &[_]Kind{});
+    try std.testing.expect(fx.pool.timer_due == null);
+    try std.testing.expectEqual(.dead, fx.pool.timer.c.loadState().phase);
+    try std.testing.expectEqual(@as(usize, 1), a.n);
+    try fx.until(&fx, Fixture.allDisconnected);
+    try fx.deinit();
+}
+
+test "f: an update while the timer's callback is on its way is left to that callback, which re-adds the timer" {
+    var fx: Fixture = .{};
+    try fx.initBudgets(1, .{ .query_ms = far, .query_max_ms = far, .connect_ms = far });
+    _ = try fx.pair();
+    fake.start.push(&.{1});
+    fake.connect_poll.push(&.{1}); // waits to read; the server never answers
+    var ws: [2]TestWaiter = .{ .{ .pool = &fx.pool }, .{ .pool = &fx.pool } };
+    ws[0].submit();
+    const cb = try holdTimer(&fx);
+    const held = fx.pool.timer_due.?;
+    // A query with an earlier deadline: the pool cannot take the timer back,
+    // so the timer stays with its callback.
+    in_submit = true;
+    fx.pool.submit(&ws[1].w, queryMs(far / 2));
+    in_submit = false;
+    try std.testing.expect(ws[1].w.deadline.value < held.value);
+    try std.testing.expect(fx.pool.timer_due.?.value == held.value);
+    try std.testing.expect(!timerRegistered(&fx));
+    // The callback finds nothing due and re-adds the timer for the earliest
+    // deadline, the new query's.
+    cb(&fx.loop, &fx.pool.timer.c);
+    try std.testing.expectEqual(@as(usize, 0), ws[0].n + ws[1].n);
+    try expectArmedFor(&fx, cb, ws[1].w.deadline);
+    try std.testing.expectEqual(ws[1].w.deadline.value, earliestOf(&ws, slot0(&fx).connect_deadline).value);
+
+    // A shutdown then takes the re-added timer back: it never fires.
+    fx.pool.stop();
+    fx.pool.abort();
+    for (&ws) |*w| {
+        try std.testing.expectEqual(@as(usize, 1), w.n);
+        try std.testing.expectEqualSlices(u8, "57014", &w.got[0].sqlstate);
+    }
+    try std.testing.expect(fx.pool.timer_due == null);
+    try std.testing.expectEqual(.new, fx.pool.timer.c.loadState().phase);
+    try fx.until(&fx, Fixture.allDisconnected);
+    try fx.idle();
+    try std.testing.expectEqual(.new, fx.pool.timer.c.loadState().phase);
+    try fx.deinit();
+}
+
 test "f: a budget of 0 or above the ceiling is refused with 22023, unsent" {
     var fx: Fixture = .{};
     try fx.initBudgets(1, .{ .query_ms = 100, .query_max_ms = 200, .connect_ms = far });

@@ -514,8 +514,10 @@ pub const Pool = struct {
     /// `dispatch` in order.
     ready_head: ?*Waiter = null,
     ready_tail: ?*Waiter = null,
-    /// The deadline timer, armed for `timer_due` while that is set; its
-    /// callback clears it.
+    /// The deadline timer, armed for `timer_due`. While that is set the
+    /// timer is the loop's (registered, or fired with its callback still to
+    /// run) and the pool does not overwrite it (`rearm`); its callback
+    /// unsets it first.
     timer: ev.Timer = undefined,
     timer_due: ?zio.Timestamp = null,
     /// The slot whose connect is in flight: at most one per pool. It stays
@@ -543,9 +545,6 @@ pub const Pool = struct {
 
     pub fn init(self: *Pool, loop: *ev.Loop, conninfo: [*:0]const u8, options: [*:0]const u8, budgets: Budgets, slots: []Slot, trace: bool) void {
         self.* = .{ .loop = loop, .conninfo = conninfo, .options = options, .budgets = budgets, .slots = slots, .trace = trace };
-        self.timer = ev.Timer.init(.none);
-        self.timer.c.callback = timerCb;
-        self.timer.c.userdata = self;
         for (slots) |*s| s.* = .{ .pool = self };
     }
 
@@ -646,16 +645,19 @@ pub const Pool = struct {
     }
 
     /// Arms the deadline timer for the earliest deadline still running: a
-    /// queued query's, a busy slot's query's, the connect's. A timer whose
-    /// callback is already on its way is left to it: that callback re-arms.
-    /// From `timerCb` this sets the timer whose callback is running: zio's
-    /// `Completion.callback` (pinned 53ed3c377317, src/ev/completion.zig:294-305)
-    /// says the loop does not touch a completion without `rearm` or an owner
-    /// after its callback returns, and `Loop.setTimer` is documented to "Set
-    /// or reset a timer with a new timeout" (src/ev/loop.zig:673). That
-    /// `setTimer` accepts a timer from inside its own callback is said only by
-    /// a comment in its body ("rearm from the callback (or after it)",
-    /// src/ev/loop.zig:681-684), not by its documentation.
+    /// queued query's, a busy slot's query's, the connect's.
+    ///
+    /// While `timer_due` is set the timer belongs to the loop: registered,
+    /// or fired with its callback still to run. Only `arm` re-initializes
+    /// it, and only with `timer_due` unset, so a timer the loop holds is
+    /// never re-initialized. The pool takes it back only through
+    /// `Loop.clearTimer`; when that returns false the timer's callback is on
+    /// its way and the timer is left to it: the callback unsets `timer_due`
+    /// first (zio no longer touches the completion then) and re-arms
+    /// through here. The pool never cancels the timer. That is
+    /// also why a shutdown never re-arms it: once `abort` has answered
+    /// everything no deadline is running, so neither this nor a callback
+    /// still on its way arms it again.
     fn rearm(self: *Pool) void {
         var next_due: ?zio.Timestamp = null;
         var it = self.head;
@@ -670,10 +672,29 @@ pub const Pool = struct {
             if (!self.loop.clearTimer(&self.timer)) return;
             self.timer_due = null;
         }
-        if (next_due) |n| {
-            self.timer_due = n;
-            self.loop.setTimer(&self.timer, .{ .deadline = n });
-        }
+        if (next_due) |n| self.arm(n);
+    }
+
+    /// Arms the unregistered timer for `at` by initializing it afresh and
+    /// adding it, which zio documents for a timer that is not registered
+    /// (pinned 53ed3c377317): from `timerCb`, the completion whose callback
+    /// is running, `Completion.callback` (src/ev/completion.zig:294-305,
+    /// https://github.com/lalinsky/zio/pull/929): "for a completion with
+    /// neither `rearm` nor a group or queue owner the loop does not touch it
+    /// after the callback returns. The callback may therefore free it, or
+    /// reuse its memory for the next operation, of the same or another type,
+    /// and `add` it again"; after `Loop.clearTimer` returned true
+    /// (src/ev/loop.zig:724-726): "the timer is the caller's again: it was
+    /// disarmed here (or was never armed), and its callback will not run".
+    /// The pool does not use `Loop.setTimer`, whose documentation does not
+    /// say whether it may be called from the timer's own callback.
+    fn arm(self: *Pool, at: zio.Timestamp) void {
+        std.debug.assert(self.timer_due == null);
+        self.timer = ev.Timer.init(.{ .deadline = at });
+        self.timer.c.callback = timerCb;
+        self.timer.c.userdata = self;
+        self.timer_due = at;
+        self.loop.add(&self.timer.c);
     }
 
     fn earliest(a: ?zio.Timestamp, b: zio.Timestamp) zio.Timestamp {
@@ -688,7 +709,8 @@ pub const Pool = struct {
     /// connect in flight ends (`Slot.connectExpire`).
     /// Deliveries run from `dispatch`, after the state is repaired; one a
     /// connect's end makes at once (`failWaiting`) may submit, and that
-    /// query waits for the `dispatch` below.
+    /// query waits for the `dispatch` below, which re-arms the timer for
+    /// what still runs (`rearm`, `arm`).
     fn timerCb(lp: *ev.Loop, c: *ev.Completion) void {
         const self: *Pool = @ptrCast(@alignCast(c.userdata.?));
         ownLoop(lp, self.loop);
