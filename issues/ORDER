@@ -1,6 +1,5 @@
 ## Next, in order
 
-rqc3ql Install bc in the Linux validation image, so bench.sh reports CPU per request there
 qgrnr3 Backend-independent tests of the transport's completion, cancel and expiry orderings
 faahn4 Decide how to settle zio's undocumented setTimer from a timer's own callback
 ugay7c Pin the HttpArena containers' debian:trixie base image by digest
