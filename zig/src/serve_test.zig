@@ -2892,6 +2892,58 @@ test "explicit order: a performed send queued in the ready list when the shutdow
     try expectLog(&s, &.{ .{ .kind = .open }, .{ .kind = .sent }, .{ .kind = .written }, .{ .kind = .refused }, .{ .kind = .free } });
 }
 
+test "explicit order: the drain's end before a queued performed send's turn closes, and the send is not reported" {
+    var s: Single = undefined;
+    try s.init(64);
+    defer s.deinit();
+    defer releaseHolds(&s);
+    respond_on_open = 16;
+    report_sent = true;
+    const w = hold(&s.lp.wake.c, true);
+    const cl = try s.listener.connect();
+    defer _ = c.close(cl);
+    awaitReadable(s.listener.fd);
+    try s.stepUntil(.open, 1);
+    const conn = s.lp.head.?;
+    try std.testing.expect(conn.cur.?.kind == .wrote);
+    // The turn that would report the send is due, and held.
+    try stepUntilHeld(&s, &.{w});
+    try std.testing.expect(s.lp.ready_head == conn);
+    s.lp.stop.notify();
+    var step: usize = 0;
+    while (stops == 0) : (step += 1) {
+        if (step == max_steps) return error.StopNeverRan;
+        try s.lp.loop.poll(.zero);
+    }
+    // The shutdown leaves the performed send queued, and the drain runs.
+    try std.testing.expect(s.lp.drain_armed);
+    try std.testing.expect(!conn.closing);
+    // The drain is made due and its expiry held: the loop has completed
+    // both the wake and the drain's timer, with the send still queued.
+    const d = hold(&s.lp.drain.c, false);
+    s.lp.loop.setTimer(&s.lp.drain, .{ .duration = .zero });
+    try stepUntilHeld(&s, &.{ w, d });
+    try std.testing.expect(conn.cur.?.kind == .wrote);
+    try std.testing.expect(s.lp.ready_head == conn);
+    s.collect();
+    try expectLog(&s, &.{.{ .kind = .open }});
+    // The drain's end comes first: `Conn.cut` closes the connection
+    // (`expire`); the send has completed, so nothing is canceled, and it
+    // stays in the ready list, whose turn delivers it to the close.
+    try forward(&s, d);
+    try std.testing.expect(s.lp.drained);
+    try std.testing.expect(!s.lp.drain_armed);
+    try std.testing.expect(conn.closing);
+    try std.testing.expect(conn.cur.?.kind == .wrote);
+    try std.testing.expect(s.lp.ready_head == conn);
+    try forward(&s, w);
+    try std.testing.expect(s.lp.ready_head == null);
+    try s.stepUntil(.free, 1);
+    try s.finish();
+    s.collect();
+    try expectLog(&s, &.{ .{ .kind = .open }, .{ .kind = .free } });
+}
+
 /// The fake's ids of the connections in the loop's ready list, in its order.
 fn readyIds(s: *const Single, out: []u32) []u32 {
     var k: usize = 0;
