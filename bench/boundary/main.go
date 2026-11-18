@@ -728,19 +728,89 @@ func memory(path string) (string, error) {
 // QS); macOS's `netstat -an -p tcp` lists no TCP sockets (seen on Darwin
 // 27.2). On Linux from /proc (procQueues). checkQueues checks either against
 // connections whose queues are known.
-func tcpQueues(pids ...int) (map[string][2]int, error) {
+func tcpQueues(pids ...int) (queueReading, error) {
+	r := queueReading{pids: pids}
+	var err error
 	if runtime.GOOS == "linux" {
-		return procQueues(pids)
+		r.qs, r.raw, err = procQueues(pids)
+		return r, err
 	}
+	// -F: one field per line, a file's name ("n") before its TCP info ("T").
+	// lsof also exits 1 when it lists nothing; its stderr says why.
+	var stderr strings.Builder
+	cmd := exec.Command("lsof", "-nP", "-a", "-p", pidList(pids), "-iTCP", "-sTCP:ESTABLISHED", "-Tqs", "-F", "nT")
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	r.raw = string(out)
+	if err != nil {
+		return r, fmt.Errorf("lsof: %v, stderr %q, output:\n%s\n--- every TCP socket of processes %s, read after it:\n%s", err, stderr.String(), r.raw, pidList(pids), tcpSnapshot(pids))
+	}
+	r.qs, err = lsofQueues(r.raw)
+	if err != nil {
+		return r, fmt.Errorf("%w, in:\n%s", err, r.raw)
+	}
+	return r, nil
+}
+
+// queueReading is one reading of tcpQueues: the queues by "local->foreign"
+// and the text they were parsed from, kept to describe a connection missing
+// from them.
+type queueReading struct {
+	qs   map[string][2]int
+	pids []int
+	raw  string
+}
+
+// pair returns the queues of both sockets of the connection between a and
+// b: the one from a to b and the one from b to a. When the reading lacks
+// either, the error names those it lacks and carries the text the reading
+// parsed, which shows whether lsof listed the socket and with which fields,
+// and a snapshot, taken after it, of the processes' TCP sockets in every
+// state (tcpSnapshot), which shows their state and owner at that later
+// point only (item laxhsb: one such failure on macOS, not reproduced).
+func (r queueReading) pair(a, b string) (ab, ba [2]int, err error) {
+	var missing []string
+	for i, name := range []string{a + "->" + b, b + "->" + a} {
+		q, ok := r.qs[name]
+		if !ok {
+			missing = append(missing, name)
+		}
+		if i == 0 {
+			ab = q
+		} else {
+			ba = q
+		}
+	}
+	if missing != nil {
+		err = fmt.Errorf("%s: not among the established connections read\n--- the reading parsed:\n%s\n--- every TCP socket of processes %s, read after it:\n%s", strings.Join(missing, " and "), r.raw, pidList(r.pids), tcpSnapshot(r.pids))
+	}
+	return
+}
+
+// tcpSnapshot lists the TCP sockets of processes pids in every state, with
+// their queues and state, or why it could not. On Linux the reading itself
+// is already unfiltered (procQueues).
+func tcpSnapshot(pids []int) string {
+	if runtime.GOOS == "linux" {
+		return "(on Linux the reading parsed holds every state)"
+	}
+	out, err := exec.Command("lsof", "-nP", "-a", "-p", pidList(pids), "-iTCP", "-Tqs", "-F", "pfnT").CombinedOutput()
+	if err != nil {
+		return fmt.Sprintf("%s(lsof: %v)", out, err)
+	}
+	return string(out)
+}
+
+func pidList(pids []int) string {
 	ps := make([]string, len(pids))
 	for i, p := range pids {
 		ps[i] = strconv.Itoa(p)
 	}
-	// -F: one field per line, a file's name ("n") before its TCP info ("T").
-	out, err := exec.Command("lsof", "-nP", "-a", "-p", strings.Join(ps, ","), "-iTCP", "-sTCP:ESTABLISHED", "-Tqs", "-F", "nT").Output()
-	if err != nil {
-		return nil, err
-	}
+	return strings.Join(ps, ",")
+}
+
+// lsofQueues parses tcpQueues' lsof output.
+func lsofQueues(out string) (map[string][2]int, error) {
 	qs := map[string][2]int{}
 	seen := map[string]int{} // per name: bit 1 QR read, bit 2 QS read
 	name := ""
@@ -782,14 +852,17 @@ func tcpQueues(pids ...int) (map[string][2]int, error) {
 // snd_una (get_tcp4_sock in Linux's net/ipv4/tcp_ipv4.c, and
 // get_tcp6_sock): bytes received and not read, and bytes written and not
 // acknowledged, as lsof's QR and QS. An IPv4-mapped IPv6 address is
-// written as IPv4, as Go writes it.
-func procQueues(pids []int) (map[string][2]int, error) {
+// written as IPv4, as Go writes it. It also returns the text it parsed:
+// each process's socket inodes and its tables, in every state.
+func procQueues(pids []int) (map[string][2]int, string, error) {
 	qs := map[string][2]int{}
+	var raw strings.Builder
+	written := map[string]string{} // a table's text: the first file read with it
 	for _, pid := range pids {
 		dir := fmt.Sprintf("/proc/%d/fd", pid)
 		fds, err := os.ReadDir(dir)
 		if err != nil {
-			return nil, err
+			return nil, "", err
 		}
 		inodes := map[string]bool{}
 		for _, fd := range fds {
@@ -798,10 +871,12 @@ func procQueues(pids []int) (map[string][2]int, error) {
 				continue // closed since the listing
 			}
 			if err != nil {
-				return nil, err
+				return nil, "", err
 			}
 			if in, ok := strings.CutPrefix(l, "socket:["); ok {
-				inodes[strings.TrimSuffix(in, "]")] = true
+				in = strings.TrimSuffix(in, "]")
+				inodes[in] = true
+				fmt.Fprintf(&raw, "%d socket inode %s\n", pid, in)
 			}
 		}
 		for _, table := range []string{"tcp", "tcp6"} {
@@ -811,7 +886,15 @@ func procQueues(pids []int) (map[string][2]int, error) {
 				continue // a kernel without IPv6
 			}
 			if err != nil {
-				return nil, err
+				return nil, "", err
+			}
+			// The namespace's table, the same for each of its processes when
+			// nothing changed between the reads: written once.
+			if first, ok := written[string(data)]; ok {
+				fmt.Fprintf(&raw, "%s: the same as %s\n", name, first)
+			} else {
+				written[string(data)] = name
+				fmt.Fprintf(&raw, "%s:\n%s", name, data)
 			}
 			lines := strings.Split(string(data), "\n")
 			for _, line := range lines[1:] { // after the heading
@@ -822,7 +905,7 @@ func procQueues(pids []int) (map[string][2]int, error) {
 					continue
 				}
 				if len(f) < 10 {
-					return nil, fmt.Errorf("%s line %q", name, line)
+					return nil, "", fmt.Errorf("%s line %q", name, line)
 				}
 				if f[3] != "01" || !inodes[f[9]] {
 					continue
@@ -833,13 +916,13 @@ func procQueues(pids []int) (map[string][2]int, error) {
 				t, err3 := strconv.ParseUint(tx, 16, 32)
 				r, err4 := strconv.ParseUint(rx, 16, 32)
 				if err := errors.Join(err1, err2, err3, err4); err != nil || !ok {
-					return nil, fmt.Errorf("%s line %q: %v", name, line, err)
+					return nil, "", fmt.Errorf("%s line %q: %v", name, line, err)
 				}
 				qs[local+"->"+remote] = [2]int{int(r), int(t)}
 			}
 		}
 	}
-	return qs, nil
+	return qs, raw.String(), nil
 }
 
 // procAddr reads an address of /proc/net/tcp or tcp6, "ADDR:PORT" in hex:
@@ -932,12 +1015,10 @@ func checkQueues() error {
 	if err != nil {
 		return err
 	}
-	pair := func(i int, qs map[string][2]int) (c, s [2]int, err error) {
+	pair := func(i int, r queueReading) (c, s [2]int, err error) {
 		cl, sv := cs[i].LocalAddr().String(), cs[i].RemoteAddr().String()
-		c, ok1 := qs[cl+"->"+sv]
-		s, ok2 := qs[sv+"->"+cl]
-		if !ok1 || !ok2 {
-			err = fmt.Errorf("control connection %d (%s): not among the established connections read", i, cl)
+		if c, s, err = r.pair(cl, sv); err != nil {
+			err = fmt.Errorf("control connection %d: %w", i, err)
 		}
 		return
 	}
@@ -1184,16 +1265,15 @@ func memoryFull(path string) (string, error) {
 			return 0, err
 		}
 		for _, side := range []int{0, 1} {
-			qs, err := tcpQueues(s.cmd.Process.Pid, os.Getpid())
+			r, err := tcpQueues(s.cmd.Process.Pid, os.Getpid())
 			if err != nil {
 				return 0, fmt.Errorf("socket queues: %w", err)
 			}
 			for i, c := range conns[:hi] {
 				cl, sv := c.LocalAddr().String(), c.RemoteAddr().String()
-				cq, ok1 := qs[cl+"->"+sv]
-				sq, ok2 := qs[sv+"->"+cl]
-				if !ok1 || !ok2 {
-					return 0, fmt.Errorf("connection %d (%s): not among the established connections read", i, cl)
+				cq, sq, err := r.pair(cl, sv)
+				if err != nil {
+					return 0, fmt.Errorf("connection %d, reading %d of %d connections before the measurement: %w", i, side+1, hi, err)
 				}
 				if side == 0 && cq[1] != 0 {
 					return 0, fmt.Errorf("connection %d: %d bytes of the client's unacknowledged", i, cq[1])
@@ -1237,10 +1317,13 @@ func memoryFull(path string) (string, error) {
 	least := write // the fewest bytes any connection held buffered
 	for i, c := range conns {
 		cl, sv := c.LocalAddr().String(), c.RemoteAddr().String()
-		cq, ok1 := later[cl+"->"+sv]
-		sq, ok2 := after[sv+"->"+cl]
-		if !ok1 || !ok2 {
-			return "", fmt.Errorf("connection %d (%s): not among the established connections read", i, cl)
+		_, sq, err := after.pair(cl, sv)
+		if err != nil {
+			return "", fmt.Errorf("connection %d, the first reading after the measurement: %w", i, err)
+		}
+		cq, _, err := later.pair(cl, sv)
+		if err != nil {
+			return "", fmt.Errorf("connection %d, the second reading after the measurement: %w", i, err)
 		}
 		sent := cq[0] + sq[1]
 		if sent >= (gets-1)*respSize {
@@ -1285,17 +1368,16 @@ func awaitRead(pid int, conns []*net.TCPConn) error {
 	const tries = 200
 	queued := ""
 	for range tries {
-		qs, err := tcpQueues(pid, os.Getpid())
+		r, err := tcpQueues(pid, os.Getpid())
 		if err != nil {
-			return fmt.Errorf("lsof: %w", err)
+			return fmt.Errorf("socket queues: %w", err)
 		}
 		queued = ""
 		for i, c := range conns {
 			cl, sv := c.LocalAddr().String(), c.RemoteAddr().String()
-			cq, ok1 := qs[cl+"->"+sv]
-			sq, ok2 := qs[sv+"->"+cl]
-			if !ok1 || !ok2 {
-				return fmt.Errorf("connection %d (%s): not among lsof's established connections", i, cl)
+			cq, sq, err := r.pair(cl, sv)
+			if err != nil {
+				return fmt.Errorf("connection %d: %w", i, err)
 			}
 			if cq[1] != 0 || sq[0] != 0 {
 				queued = fmt.Sprintf("connection %d: %d bytes of the client's unacknowledged, %d unread by the server", i, cq[1], sq[0])
