@@ -369,6 +369,26 @@ only `Server.Query` values.
   closed. The pool's tests check its end (`Pool.abort`): the running query
   abandoned, the queued one unsent, both sessions closed, a later query
   answered at once.
+  (7) Orderings delivered explicitly (item qgrnr3): which order a poll
+  delivers a completion, its cancel and an expiry in depends on the backend,
+  so these tests hold the real completions back from `serve.zig`'s callbacks
+  until the loop has completed them, then hand them over in the order the
+  test names (zio's `Completion.callback`: for a completion with neither
+  `rearm` nor a group or queue owner, as all of the transport's are, the
+  loop does not touch it after its callback returns). They control when
+  `serve.zig`'s callbacks run, not the kernel's order. An expiry before its receive's
+  completion closes, unreported, whether the cancel came too late (the
+  bytes) or reached it (canceled); a receive before the expiry of the
+  generation it ends is reported and that expiry is stale, released
+  unreported; one within the period leaves the expiry current, and it
+  closes. A receive completed before the shutdown's cancel is reported once;
+  one the cancel reached is refused. An expiry before a queued performed
+  send (`.wrote`) closes, the send unreported; that send before the expiry
+  is reported, and the expiry is stale when the send ended the response and
+  current when it did not. Connections in the ready list that perform their
+  next send during its turn are reported once in it and taken by the next
+  turn, in order, also when one of them closed on an expiry before the
+  turn. They do not assert which order a backend takes.
 - **Not yet:** chunked
   request bodies, percent-decoding and query parsing, Go's larger limits.
 

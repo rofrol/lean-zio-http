@@ -29,14 +29,15 @@
 //!
 //! These tests and pg_test.zig's run on macOS (kqueue, `./check.sh`) and on
 //! Linux (epoll and io_uring, `./linux-check.sh`, README "Running"; rerun it
-//! at each zio update and update this record). Last Linux run, 2026-11-17
-//! (item sakmfp, after its five accept tests were added): OrbStack on the
-//! M1, aarch64, kernel 7.2.12-orbstack-00394-gbecdd6130068, Debian 13.7,
-//! Zig 0.17.1, Lean nightly-2026-11-17, libpq 17.12, zio 53ed3c377317.
-//! `./linux-check.sh` exit 0, on epoll and on io_uring each: `zig build
-//! test` passed (serve_test's 30 tests, pg_test's 31), pg_glue_test passed, and the rest
-//! of `./check.sh`, bench/dbcheck on the container's private cluster
-//! included. On the production host, 2026-11-17 (item 53rwgc, README
+//! at each zio update and update this record). Last Linux run, 2026-11-18
+//! (item qgrnr3, after its ten tests of explicitly delivered orderings were
+//! added): OrbStack on the M1, aarch64, kernel
+//! 7.2.12-orbstack-00394-gbecdd6130068, Debian 13.7, Zig 0.17.1, Lean
+//! nightly-2026-11-17, libpq 17.12, zio 53ed3c377317. `./linux-check.sh`
+//! exit 0, on epoll and on io_uring each: `zig build test` passed (it prints
+//! no count; serve_test.zig then held 40 tests, all 40 passing on macOS),
+//! pg_glue_test passed, and the rest of `./check.sh`, bench/dbcheck on the
+//! container's private cluster included. On the production host, 2026-11-17 (item 53rwgc, README
 //! "HttpArena on the VPS"): x86_64, 2 vCPU, kernel 6.12.74+deb13+1-amd64,
 //! Debian 13.4, the same versions, binaries cross-built by
 //! bench/arena/build.sh: serve_test's 25 tests and pg_test's 31 passed on
@@ -2442,4 +2443,542 @@ test "the loop does not take its stop while the stop's notifier is still waking 
     try s.stepUntil(.free, 1);
     try s.finish();
     try std.testing.expectEqual(ev.Async.Pending{ .disarmed = true }, s.lp.stop.pending.load(.acquire));
+}
+
+// ---- orderings of a completion, its cancel and an expiry, delivered explicitly ----
+//
+// The tests above let the loop choose the order in which a poll delivers
+// completions and timers, and that order depends on the backend (two of them
+// state io_uring's separately). The tests below fix it themselves (item
+// qgrnr3): the loop still performs every operation and completes it, but the
+// completion's callback is replaced (`hold`) by one that only notes it, and
+// the test then hands each held completion to serve.zig's own callback
+// (`forward`) in the order the test names. zio allows this: "The completion
+// is already dead when it runs, and for a completion with neither `rearm`
+// nor a group or queue owner the loop does not touch it after the callback
+// returns" (53ed3c377317, src/ev/completion.zig, `Completion.callback`, as
+// cited at serve.zig's `Op`), and no completion held here has either. So
+// serve.zig sees the same calls, with the results the kernel gave, as when a
+// backend completes them in that order. The tests assert what serve.zig
+// reports to Lean in each order (each event at most once, a stale
+// generation's expiry not at all, a current one's always) and that work
+// still runnable is kept; they do not assert which order a backend takes.
+
+/// One completion held back from serve.zig: `callback` is serve.zig's own,
+/// and `completed` says the loop has completed it and called `heldCb`
+/// instead. `keep`: the completion is added again under the same callback
+/// field (the loop's `wake`), so it stays held after each `forward`.
+const Hold = struct {
+    comp: *ev.Completion = undefined,
+    callback: *const ev.Completion.CallbackFn = undefined,
+    installed: bool = false,
+    completed: bool = false,
+    keep: bool = false,
+};
+var holds: [4]Hold = @splat(.{});
+
+fn heldCb(_: *ev.Loop, comp: *ev.Completion) void {
+    for (&holds) |*h| {
+        if (!h.installed or h.comp != comp) continue;
+        if (h.completed) @panic("a held completion completed twice before it was forwarded");
+        h.completed = true;
+        return;
+    }
+    @panic("heldCb called for a completion no hold holds");
+}
+
+/// Holds back the completion `comp`, in flight or to be added, from its callback.
+fn hold(comp: *ev.Completion, keep: bool) *Hold {
+    for (&holds) |*h| {
+        if (h.installed) continue;
+        h.* = .{ .comp = comp, .callback = comp.callback.?, .installed = true, .keep = keep };
+        comp.callback = heldCb;
+        return h;
+    }
+    @panic("no free hold");
+}
+
+/// Hands the held, completed `h` to serve.zig's callback, as the loop would
+/// have. A hold without `keep` ends, with its completion's callback field
+/// back as the loop leaves it, before the callback runs: serve.zig may free
+/// or reuse that memory, so the hold does not touch it afterwards.
+fn forward(s: *Single, h: *Hold) !void {
+    if (!h.installed or !h.completed) return error.NotCompleted;
+    h.completed = false;
+    if (!h.keep) {
+        h.installed = false;
+        h.comp.callback = h.callback;
+    }
+    h.callback(&s.lp.loop, h.comp);
+}
+
+/// Ends every hold the test left, before `Single.deinit`: each completion
+/// still in flight gets serve.zig's callback back, and each completed one is
+/// forwarded, so a test that returned early leaves nothing undelivered.
+fn releaseHolds(s: *Single) void {
+    for (&holds) |*h| {
+        if (h.installed) h.comp.callback = h.callback;
+    }
+    for (&holds) |*h| {
+        if (h.installed and h.completed) forward(s, h) catch unreachable;
+        h.* = .{};
+    }
+}
+
+/// Polls the loop until the loop has completed every hold in `hs`, at most
+/// `max_steps` polls, taking the events into the log.
+fn stepUntilHeld(s: *Single, hs: []const *Hold) !void {
+    var step: usize = 0;
+    while (true) : (step += 1) {
+        s.collect();
+        for (hs) |h| {
+            if (!h.completed) break;
+        } else return;
+        if (step == max_steps) {
+            s.dump();
+            return error.NeverCompleted;
+        }
+        try s.lp.loop.poll(.zero);
+    }
+}
+
+/// The result of the held receive `h`.
+fn heldRecv(h: *const Hold) ev.NetRecv.Error!usize {
+    const r: *ev.NetRecv = @fieldParentPtr("c", h.comp);
+    return r.getResult();
+}
+
+/// Holds the receive in flight and the current deadline's timer of the one
+/// connection, after its client sent `bytes` (none: "") and that deadline
+/// was made due; returns once the loop has completed the timer, and the
+/// receive too when `bytes` is not empty.
+fn holdRecvAndExpiry(s: *Single, cl: c.fd_t, bytes: []const u8) !struct { recv: *Hold, timer: *Hold } {
+    const conn = s.lp.head.?;
+    const op = conn.cur orelse return error.NoOperation;
+    if (op.kind != .recv) return error.NotReceiving;
+    const r = hold(&op.comp.recv.c, false);
+    const t = hold(&conn.arm.?.timer.c, false);
+    if (bytes.len > 0) {
+        try send(cl, bytes);
+        awaitReadable(conn.fd);
+    }
+    dueNow(s);
+    if (bytes.len > 0) try stepUntilHeld(s, &.{ r, t }) else try stepUntilHeld(s, &.{t});
+    return .{ .recv = r, .timer = t };
+}
+
+test "explicit order: an expiry before its receive's completion closes, and the bytes received are not reported" {
+    var s: Single = undefined;
+    try s.init(64);
+    defer s.deinit();
+    defer releaseHolds(&s);
+    open_dl = head_code;
+    const cl = try s.listener.connect();
+    defer _ = c.close(cl);
+    awaitReadable(s.listener.fd);
+    try s.stepUntil(.open, 1);
+    const h = try holdRecvAndExpiry(&s, cl, "a");
+    try std.testing.expectEqual(@as(usize, 1), try heldRecv(h.recv));
+    // The expiry closes and cancels the receive, which has completed
+    // already: the cancel changes nothing, and the completion, with its
+    // byte, only leads to the close.
+    try forward(&s, h.timer);
+    try std.testing.expect(s.lp.head.?.closing);
+    try forward(&s, h.recv);
+    try s.stepUntil(.free, 1);
+    s.lp.stop.notify();
+    try s.finish();
+    s.collect();
+    try expectLog(&s, &.{ .{ .kind = .open }, .{ .kind = .expired, .n = 0, .byte = head_code }, .{ .kind = .free } });
+}
+
+test "explicit order: an expiry that cancels its receive in flight closes, and the canceled completion is not reported" {
+    var s: Single = undefined;
+    try s.init(64);
+    defer s.deinit();
+    defer releaseHolds(&s);
+    open_dl = head_code;
+    const cl = try s.listener.connect();
+    defer _ = c.close(cl);
+    awaitReadable(s.listener.fd);
+    try s.stepUntil(.open, 1);
+    const h = try holdRecvAndExpiry(&s, cl, "");
+    try std.testing.expect(!h.recv.completed);
+    // The expiry runs while the receive waits in the kernel: its cancel
+    // reaches it, and its completion comes after, canceled.
+    try forward(&s, h.timer);
+    try stepUntilHeld(&s, &.{h.recv});
+    try std.testing.expectError(error.Canceled, heldRecv(h.recv));
+    try forward(&s, h.recv);
+    try s.stepUntil(.free, 1);
+    s.lp.stop.notify();
+    try s.finish();
+    s.collect();
+    try expectLog(&s, &.{ .{ .kind = .open }, .{ .kind = .expired, .n = 0, .byte = head_code }, .{ .kind = .free } });
+}
+
+test "explicit order: a receive before the expiry of the generation it ends is reported, and that expiry is stale" {
+    var s: Single = undefined;
+    try s.init(64);
+    defer s.deinit();
+    defer releaseHolds(&s);
+    open_dl = head_code;
+    recv_dl = idle_code;
+    const cl = try s.listener.connect();
+    defer _ = c.close(cl);
+    awaitReadable(s.listener.fd);
+    try s.stepUntil(.open, 1);
+    const conn = s.lp.head.?;
+    const old = conn.arm.?;
+    const h = try holdRecvAndExpiry(&s, cl, "a");
+    // The receive starts generation 1 under the idle deadline. Generation
+    // 0's timer has fired, so it cannot be taken off: it is retired.
+    try forward(&s, h.recv);
+    try s.stepUntil(.recv, 1);
+    try std.testing.expect(conn.arm.? != old);
+    try std.testing.expect(old.retired);
+    try std.testing.expectEqual(@as(u32, 1), conn.retired_arms);
+    // Its callback only releases it (`old` is freed): nothing is reported,
+    // and the connection goes on receiving.
+    try forward(&s, h.timer);
+    try std.testing.expectEqual(@as(u32, 0), conn.retired_arms);
+    s.collect();
+    try expectLog(&s, &.{ .{ .kind = .open }, .{ .kind = .recv, .n = 1, .byte = 'a' } });
+    try std.testing.expect(conn.cur.?.kind == .recv);
+    // The current generation's expiry is reported and closes.
+    dueNow(&s);
+    try s.stepUntil(.free, 1);
+    s.lp.stop.notify();
+    try s.finish();
+    s.collect();
+    try expectLog(&s, &.{
+        .{ .kind = .open },
+        .{ .kind = .recv, .n = 1, .byte = 'a' },
+        .{ .kind = .expired, .n = 1, .byte = idle_code },
+        .{ .kind = .free },
+    });
+}
+
+test "explicit order: a receive within the period before that period's expiry is reported, and the expiry is current and closes" {
+    var s: Single = undefined;
+    try s.init(64);
+    defer s.deinit();
+    defer releaseHolds(&s);
+    open_dl = head_code;
+    recv_keeps = true;
+    const cl = try s.listener.connect();
+    defer _ = c.close(cl);
+    awaitReadable(s.listener.fd);
+    try s.stepUntil(.open, 1);
+    const conn = s.lp.head.?;
+    const arm = conn.arm.?;
+    const h = try holdRecvAndExpiry(&s, cl, "a");
+    // The receive keeps the period: the arm whose timer fired stays the
+    // current one, and its expiry, delivered after, is that period's.
+    try forward(&s, h.recv);
+    try s.stepUntil(.recv, 1);
+    try std.testing.expect(conn.arm.? == arm);
+    try std.testing.expect(!arm.retired);
+    try forward(&s, h.timer);
+    try s.stepUntil(.free, 1);
+    s.lp.stop.notify();
+    try s.finish();
+    s.collect();
+    try expectLog(&s, &.{
+        .{ .kind = .open },
+        .{ .kind = .recv, .n = 1, .byte = 'a' },
+        .{ .kind = .expired, .n = 0, .byte = head_code },
+        .{ .kind = .free },
+    });
+}
+
+test "explicit order: a receive completed before the shutdown's cancel is reported once, with its bytes, and the next is refused" {
+    var s: Single = undefined;
+    try s.init(64);
+    defer s.deinit();
+    defer releaseHolds(&s);
+    const cl = try s.listener.connect();
+    defer _ = c.close(cl);
+    awaitReadable(s.listener.fd);
+    try s.stepUntil(.open, 1);
+    const conn = s.lp.head.?;
+    const r = hold(&conn.cur.?.comp.recv.c, false);
+    try send(cl, "a");
+    awaitReadable(conn.fd);
+    try stepUntilHeld(&s, &.{r});
+    // The stop finds the receive completed: its cancel changes nothing.
+    s.lp.stop.notify();
+    var step: usize = 0;
+    while (stops == 0) : (step += 1) {
+        if (step == max_steps) return error.StopNeverRan;
+        try s.lp.loop.poll(.zero);
+    }
+    try std.testing.expectEqual(@as(usize, 1), stop_nphases);
+    try std.testing.expect(stop_phases[0] != .running);
+    try forward(&s, r);
+    try s.stepUntil(.free, 1);
+    try s.finish();
+    s.collect();
+    try expectLog(&s, &.{ .{ .kind = .open }, .{ .kind = .recv, .n = 1, .byte = 'a' }, .{ .kind = .refused }, .{ .kind = .free } });
+}
+
+test "explicit order: a receive the shutdown's cancel reaches completes canceled and is refused" {
+    var s: Single = undefined;
+    try s.init(64);
+    defer s.deinit();
+    defer releaseHolds(&s);
+    const cl = try s.listener.connect();
+    defer _ = c.close(cl);
+    awaitReadable(s.listener.fd);
+    try s.stepUntil(.open, 1);
+    const r = hold(&s.lp.head.?.cur.?.comp.recv.c, false);
+    s.lp.stop.notify();
+    try stepUntilHeld(&s, &.{r});
+    try std.testing.expectEqual(@as(u32, 1), stops);
+    try std.testing.expectEqual(ev.Completion.State.Phase.running, stop_phases[0]);
+    try std.testing.expectError(error.Canceled, heldRecv(r));
+    try forward(&s, r);
+    try s.stepUntil(.free, 1);
+    try s.finish();
+    s.collect();
+    try expectLog(&s, &.{ .{ .kind = .open }, .{ .kind = .refused }, .{ .kind = .free } });
+}
+
+/// Opens one connection that starts a response of `len` bytes, sent
+/// `testing.chunk` bytes at a time, and holds the loop's `wake` (the turn
+/// that reports a send the loop performed) and the write deadline's timer;
+/// returns once the loop has completed both, the deadline made due, with
+/// the first send's result waiting in the ready list.
+fn holdWroteAndExpiry(s: *Single, len: usize) !struct { cl: c.fd_t, wake: *Hold, timer: *Hold } {
+    respond_on_open = len;
+    report_sent = true;
+    const w = hold(&s.lp.wake.c, true);
+    const cl = try s.listener.connect();
+    errdefer _ = c.close(cl);
+    awaitReadable(s.listener.fd);
+    try s.stepUntil(.open, 1);
+    const conn = s.lp.head.?;
+    try std.testing.expect(conn.cur.?.kind == .wrote);
+    try std.testing.expect(s.lp.ready_head == conn);
+    const t = hold(&conn.arm.?.timer.c, false);
+    dueNow(s);
+    try stepUntilHeld(s, &.{ w, t });
+    try std.testing.expect(s.lp.ready_head == conn);
+    return .{ .cl = cl, .wake = w, .timer = t };
+}
+
+test "explicit order: an expiry before its queued performed send closes, and the send is not reported" {
+    var s: Single = undefined;
+    try s.init(64);
+    defer s.deinit();
+    defer releaseHolds(&s);
+    const h = try holdWroteAndExpiry(&s, 16);
+    defer _ = c.close(h.cl);
+    const conn = s.lp.head.?;
+    try forward(&s, h.timer);
+    try std.testing.expect(conn.closing);
+    // The send has completed: nothing to cancel, and it stays in the ready
+    // list, whose turn delivers it to the close.
+    try std.testing.expect(s.lp.ready_head == conn);
+    try forward(&s, h.wake);
+    try std.testing.expect(s.lp.ready_head == null);
+    try s.stepUntil(.free, 1);
+    s.lp.stop.notify();
+    try s.finish();
+    s.collect();
+    try expectLog(&s, &.{ .{ .kind = .open }, .{ .kind = .expired, .n = 0, .byte = write_code }, .{ .kind = .free } });
+}
+
+test "explicit order: a queued performed send that ends the response before its expiry is reported, and that expiry is stale" {
+    var s: Single = undefined;
+    try s.init(64);
+    defer s.deinit();
+    defer releaseHolds(&s);
+    const h = try holdWroteAndExpiry(&s, 16);
+    defer _ = c.close(h.cl);
+    const conn = s.lp.head.?;
+    const arm = conn.arm.?;
+    // The whole response went in one send: the connection receives under no
+    // deadline, and the write deadline's fired timer is retired.
+    try forward(&s, h.wake);
+    s.collect();
+    try std.testing.expect(conn.cur.?.kind == .recv);
+    try std.testing.expect(conn.arm == null);
+    try std.testing.expect(arm.retired);
+    try std.testing.expectEqual(@as(u32, 1), conn.retired_arms);
+    try forward(&s, h.timer);
+    try std.testing.expectEqual(@as(u32, 0), conn.retired_arms);
+    s.lp.stop.notify();
+    try s.stepUntil(.free, 1);
+    try std.testing.expectEqual(@as(u32, 16), s.log[1].n);
+    try s.finish();
+    s.collect();
+    try expectLog(&s, &.{ .{ .kind = .open }, .{ .kind = .sent }, .{ .kind = .written }, .{ .kind = .refused }, .{ .kind = .free } });
+}
+
+test "explicit order: a queued performed send within the response before its expiry is reported, and the expiry is current and closes" {
+    var s: Single = undefined;
+    try s.init(64);
+    defer s.deinit();
+    defer releaseHolds(&s);
+    serve.testing.chunk = 8;
+    const h = try holdWroteAndExpiry(&s, 16);
+    defer _ = c.close(h.cl);
+    const conn = s.lp.head.?;
+    const arm = conn.arm.?;
+    // Half the response went: the next send runs under the same write
+    // deadline (the arm whose timer fired stays current) and is performed
+    // at once, its result queued for the next turn.
+    try forward(&s, h.wake);
+    try std.testing.expect(conn.arm.? == arm);
+    try std.testing.expect(!arm.retired);
+    try std.testing.expect(conn.cur.?.kind == .wrote);
+    try std.testing.expect(s.lp.ready_head == conn);
+    try forward(&s, h.timer);
+    try std.testing.expect(conn.closing);
+    try stepUntilHeld(&s, &.{h.wake});
+    try forward(&s, h.wake);
+    try s.stepUntil(.free, 1);
+    try std.testing.expectEqual(@as(u32, 8), s.log[1].n);
+    try std.testing.expectEqual(@as(u32, 8), s.log[1].left);
+    s.lp.stop.notify();
+    try s.finish();
+    s.collect();
+    try expectLog(&s, &.{ .{ .kind = .open }, .{ .kind = .sent }, .{ .kind = .expired, .n = 0, .byte = write_code }, .{ .kind = .free } });
+}
+
+/// The fake's ids of the connections in the loop's ready list, in its order.
+fn readyIds(s: *const Single, out: []u32) []u32 {
+    var k: usize = 0;
+    var it = s.lp.ready_head;
+    while (it) |conn| : (it = conn.ready_next) {
+        out[k] = connOf(conn.state).id;
+        k += 1;
+    }
+    return out[0..k];
+}
+
+/// The `sent` events from log index `from` on, as the fake's connection ids.
+fn sentIds(s: *const Single, from: usize, out: []u32) []u32 {
+    var k: usize = 0;
+    for (s.log[from..s.n]) |e| {
+        if (e.kind != .sent) continue;
+        out[k] = e.conn;
+        k += 1;
+    }
+    return out[0..k];
+}
+
+test "explicit order: connections that perform their next send during a ready turn are reported once in it and kept for the next" {
+    var s: Single = undefined;
+    try s.init(64);
+    defer s.deinit();
+    defer releaseHolds(&s);
+    // Three connections each send a response of three 8-byte sends.
+    serve.testing.chunk = 8;
+    respond_on_open = 24;
+    report_sent = true;
+    const w = hold(&s.lp.wake.c, true);
+    var cls: [3]c.fd_t = undefined;
+    for (&cls, 0..) |*cl, i| {
+        cl.* = s.listener.connect() catch |err| {
+            for (cls[0..i]) |o| _ = c.close(o);
+            return err;
+        };
+    }
+    defer for (cls) |cl| {
+        _ = c.close(cl);
+    };
+    awaitReadable(s.listener.fd);
+    try s.stepUntil(.open, 3);
+    try stepUntilHeld(&s, &.{w});
+    var ids: [3]u32 = undefined;
+    var buf: [4]u32 = undefined;
+    const first = readyIds(&s, &buf);
+    try std.testing.expectEqual(@as(usize, 3), first.len);
+    @memcpy(&ids, first);
+    // The list holds each opened connection once.
+    for (s.log[0..3]) |e| {
+        try std.testing.expectEqual(Kind.open, e.kind);
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u32, &ids, &.{e.conn}));
+    }
+
+    // Turn 1: each connection's first send is reported once, in the list's
+    // order; each performs its second at once, which joins a new list for
+    // the next turn instead of being taken in this one, and the wake is
+    // added again.
+    var from = s.n;
+    try forward(&s, w);
+    s.collect();
+    try std.testing.expectEqualSlices(u32, &ids, sentIds(&s, from, &buf));
+    try std.testing.expectEqualSlices(u32, &ids, readyIds(&s, &buf));
+    try std.testing.expect(s.lp.wake_armed);
+
+    // Before turn 2, the middle connection's write deadline ends: it closes,
+    // and its send, queued already, stays in the list for the turn, which
+    // delivers it to the close, unreported. The others are reported and
+    // kept for turn 3.
+    const mid: *serve.Conn = s.lp.ready_head.?.ready_next.?;
+    const t = hold(&mid.arm.?.timer.c, false);
+    s.lp.loop.setTimer(&mid.arm.?.timer, .{ .duration = .zero });
+    try stepUntilHeld(&s, &.{ w, t });
+    try forward(&s, t);
+    try std.testing.expect(mid.closing);
+    try std.testing.expectEqualSlices(u32, &ids, readyIds(&s, &buf));
+    from = s.n;
+    try forward(&s, w);
+    s.collect();
+    const kept = [2]u32{ ids[0], ids[2] };
+    try std.testing.expectEqualSlices(u32, &kept, sentIds(&s, from, &buf));
+    try std.testing.expectEqualSlices(u32, &kept, readyIds(&s, &buf));
+
+    // Turn 3: the last sends end both responses.
+    try stepUntilHeld(&s, &.{w});
+    from = s.n;
+    try forward(&s, w);
+    s.collect();
+    try std.testing.expectEqualSlices(u32, &kept, sentIds(&s, from, &buf));
+    try std.testing.expect(s.lp.ready_head == null);
+    try std.testing.expect(!s.lp.wake_armed);
+    s.lp.stop.notify();
+    try s.stepUntil(.free, 3);
+    try s.finish();
+    s.collect();
+
+    // Exactly once: each connection opened, was freed, and had each of its
+    // sends reported once (the middle one only its first), the middle one's
+    // expiry reported once, each response ended once.
+    for (ids, 0..) |id, i| {
+        var opens: usize = 0;
+        var sents: usize = 0;
+        var expiries: usize = 0;
+        var writtens: usize = 0;
+        var frees: usize = 0;
+        var left: u32 = 24;
+        for (s.log[0..s.n]) |e| {
+            if (e.conn != id) continue;
+            switch (e.kind) {
+                .open => opens += 1,
+                .sent => {
+                    sents += 1;
+                    try std.testing.expectEqual(@as(u32, 8), e.n);
+                    left -= 8;
+                    try std.testing.expectEqual(left, e.left);
+                },
+                .expired => {
+                    expiries += 1;
+                    try std.testing.expectEqual(@as(u32, 0), e.n);
+                    try std.testing.expectEqual(write_code, e.byte);
+                },
+                .written => writtens += 1,
+                .free => frees += 1,
+                else => {},
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 1), opens);
+        try std.testing.expectEqual(@as(usize, 1), frees);
+        try std.testing.expectEqual(@as(usize, if (i == 1) 1 else 3), sents);
+        try std.testing.expectEqual(@as(usize, if (i == 1) 1 else 0), expiries);
+        try std.testing.expectEqual(@as(usize, if (i == 1) 0 else 1), writtens);
+    }
 }
