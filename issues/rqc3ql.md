@@ -13,3 +13,5 @@ in bench.sh, and say in README "Running" whether bench.sh is meant to run in
 the container.
 
 Decided 2026-11-17 by the coordinating session with sol (consult call 0925fa8f) under the user's delegation: approved with changes. Add bc to linux/Dockerfile, together with zg4hrz's pins; do not rewrite bench.sh's arithmetic. Make bench.sh fail clearly when bc is missing, rather than print empty figures. Say in README "Running" that bench.sh runs in the container. Acceptance: in the container, CPU per request and lean's share come out filled in.
+
+A first run (2026-11-18) made the change in commit d7d7056, kept on branch attempt/rqc3ql-1, and ended BLOCKED only because the Mac's disk was full (docker build: no space left on device); argon reviewed that diff and found no defect. Space is free again (71 GiB). Start from that commit (cherry-pick it), then do the verification it could not: build the image, run ./bench.sh in the container and check that CPU per request and lean's share are filled in, and run the ./bench.sh gate on macOS.
