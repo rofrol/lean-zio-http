@@ -1084,6 +1084,19 @@ integrating a change (item cxhvkb). Both scripts share their helpers and the
 private cluster's setup through `bench/lib.sh`; `bench.sh` measures on a
 fresh cluster after `check.sh`'s has been removed.
 
+The boundary tests open thousands of loopback connections, and each closed
+one stays in TIME_WAIT for 2*MSL (30 s on macOS) on the side that closed it
+first. On the M1 (item laxhsb) the suite's two runs in one `check.sh` raised
+the kernel's TCP PCB count (every TCP socket of the system) from about 800
+to about 7,500; the ephemeral port range holds 16,384 ports. A third pair of
+runs started at once after two others failed a dial with EADDRNOTAVAIL. So a `check.sh` or
+`bench.sh` started within about 30 s of another connection-heavy run on the
+same machine can fail for a reason that is not the change under test. Such a
+failure stays a failure: the suite names EADDRNOTAVAIL as possible port
+exhaustion, and `check.sh` prints the PCB count (system-wide, every TCP
+socket) and the ephemeral port range before each run of the suite and after
+a failing one, where `sysctl` has them (item vyzkxi).
+
 `check.sh` runs `zig build test` against the one libpq `pg_config` names.
 `./libpq-lines.sh PGSRC` runs it against every libpq line the pool supports
 ("Modules", `zig/`: 17 or later): the lowest supported release

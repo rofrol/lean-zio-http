@@ -1737,6 +1737,16 @@ func main() {
 		}
 		ran++
 		if err := runScenario(*fixture, sc); err != nil {
+			// A dial that fails with EADDRNOTAVAIL may have found the
+			// ephemeral ports exhausted, for example by the TIME_WAIT
+			// sockets of another connection-heavy run that ended less than
+			// 2*MSL ago (item vyzkxi). Every dial error reaches here
+			// wrapped with %w. The failure stays a failure; the note
+			// names the possible cause, and check.sh prints the kernel's
+			// counts where sysctl has them.
+			if errors.Is(err, syscall.EADDRNOTAVAIL) {
+				err = fmt.Errorf("%w (EADDRNOTAVAIL: no local address and port to assign; the ephemeral ports may be exhausted, e.g. by TIME_WAIT sockets of a connection-heavy run that ended less than 2*MSL ago)", err)
+			}
 			fmt.Printf("FAIL %s: %v\n", sc.name, err)
 			failed++
 		}

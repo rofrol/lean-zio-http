@@ -103,8 +103,28 @@ fi
 .lake/build/bin/lsrv-compare >"$tmp/compare.txt" || { cat "$tmp/compare.txt"; exit 1; }
 sed -n '1,/^## Malformed/p' "$tmp/compare.txt"
 grep -E '^[0-9]+ requests: [0-9]+ verdicts' "$tmp/compare.txt"
-bench/boundary/boundary
-bench/boundary/boundary -no-continue -fixture .lake/build/bin/lsrv-fixture-hand
+# The boundary suite opens thousands of loopback connections, and each closed
+# one stays in TIME_WAIT for 2*MSL (30 s on macOS) on the side that closed it
+# first, both sides being on this machine. A run
+# started soon after another connection-heavy one can find the ephemeral
+# ports exhausted and fail a dial with EADDRNOTAVAIL, which the suite then
+# names (item vyzkxi). Where sysctl has them (macOS), the kernel's TCP PCB
+# count, which counts every TCP socket of the system and not only the
+# ephemeral ports in use, and the ephemeral port range are printed before the
+# suite's two runs and again when one fails. Only diagnostics: no wait, no
+# retry. tcp_ports WHEN prints them, labeled WHEN.
+tcp_ports() {
+  v=$(sysctl -n net.inet.tcp.pcbcount net.inet.ip.portrange.first net.inet.ip.portrange.last 2>/dev/null) || return 0
+  when=$1
+  set -- $v
+  [ $# -eq 3 ] || return 0
+  echo "$when: TCP PCBs in the kernel (every socket, system-wide): $1; ephemeral ports $2-$3"
+}
+tcp_ports "before the boundary suite (lsrv-fixture)"
+bench/boundary/boundary || { tcp_ports "after the boundary suite failed (lsrv-fixture)"; exit 1; }
+tcp_ports "before the boundary suite (lsrv-fixture-hand)"
+bench/boundary/boundary -no-continue -fixture .lake/build/bin/lsrv-fixture-hand ||
+  { tcp_ports "after the boundary suite failed (lsrv-fixture-hand)"; exit 1; }
 # A port another process holds (here a running lsrv's): a server asked for it
 # must say why, with the errno, and exit 1 before "ready"; a server on a port
 # the kernel picks starts beside it and passes the end-to-end checks.
