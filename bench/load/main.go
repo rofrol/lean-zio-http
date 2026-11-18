@@ -1,5 +1,8 @@
 // Closed-loop HTTP/1.1 keep-alive load generator: C connections send GET
-// requests back to back until the measurement endpoint (start + D). Only
+// requests back to back until the measurement endpoint (start + D), or, with
+// -n N, until N requests have completed across all connections (each
+// connection takes one of the N before sending, so exactly N are sent and
+// counted; item 7wvkwz, to end paired samples at the same count). Only
 // responses with the expected status and body count; any other outcome makes
 // the run fail (exit status 1). Throughput is divided by the time actually
 // elapsed until the last connection finished its outstanding request. A
@@ -26,6 +29,7 @@ import (
 	"os"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -38,6 +42,7 @@ func main() {
 	c := flag.Int("c", 64, "connections")
 	d := flag.Duration("d", 10*time.Second, "duration until the measurement endpoint")
 	want := flag.String("body", "Hello, World!", "expected response body")
+	total := flag.Int64("n", 0, "requests to complete across all connections; when above 0, ends the run instead of -d")
 	flag.Parse()
 	expected := []byte(*want)
 
@@ -67,6 +72,15 @@ func main() {
 	var opened, done sync.WaitGroup
 	measuring := make(chan struct{})
 	var end time.Time // written before measuring is closed
+	var left atomic.Int64
+	left.Store(*total)
+	// more reports whether this connection sends another request.
+	more := func() bool {
+		if *total > 0 {
+			return left.Add(-1) >= 0
+		}
+		return time.Now().Before(end)
+	}
 	for i := 0; i < *c; i++ {
 		opened.Add(1)
 		done.Add(1)
@@ -89,7 +103,7 @@ func main() {
 			opened.Done()
 			<-measuring
 			var l []time.Duration
-			for fail == "" && time.Now().Before(end) {
+			for fail == "" && more() {
 				t := time.Now()
 				if fail = get(cl); fail == "" {
 					l = append(l, time.Since(t))
