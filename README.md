@@ -651,6 +651,77 @@ c=64 before and 40 to 44 after; PostgreSQL's backends 12 to 13 µs at c=1
 and 18 to 20 µs at c=64 for both, so the `statement_timeout` the deadlines
 put in every session's startup options shows no cost there either.
 
+In the Linux container (`linux/Dockerfile` on OrbStack's arm64 VM, 10
+vCPUs, kernel 7.2.12-orbstack, epoll), lean-db reaches only about half of
+Go at one connection (item 7wvkwz, 2026-11-18, macOS host load average 4
+to 26). The runs used the image and archive of "Running", with this in
+place of `./bench.sh` in the container:
+
+```sh
+LIBRARY_PATH=$(pg_config --libdir) lake build lsrv-db &&
+  (cd bench/load && go build -o load .) &&
+  (cd bench/pgserver && go build -o server .) && bench/dbpairs.sh
+```
+
+`bench/dbpairs.sh` runs both servers side by side and alternates which goes
+first in each pair, every sample ending after the same 100,000 requests
+(`bench/load -n`; the per-request costs include the load's one warm-up
+request). Ten pairs:
+
+| c=1, 10 pairs | lowest to highest |
+|---|---|
+| lean-db / go-db requests per second | 0.49 to 0.56 (median 0.52) |
+| p50 latency, lean-db; go-db | 90 to 102 µs; 40 to 41 µs |
+| server CPU µs per request, lean-db; go-db | 34 to 37; 23 to 25 |
+| voluntary context switches per request, lean-db; go-db | 1.81 to 1.90; 2.30 to 2.40 |
+| involuntary ones, lean-db; go-db | 0.13 to 0.23; 1.06 to 1.09 |
+| private cluster's CPU µs per request, lean-db; go-db | 19 to 21; 10 to 11 |
+
+lean-db's own database path is not where the time goes; what the reply's
+wait holds, PostgreSQL's work or the wake-up, these measurements do not
+split. Over 20,000 requests under
+`strace -f -c`, lean-db makes 9 system calls per request (4 `recvfrom`, one
+of them the peek's re-armed receive failing with `EAGAIN`; 2 `sendto`;
+3 `epoll_pwait2`; 5 `epoll_ctl` in all, so no registration per request) and
+go-db 16 (3 `futex`, 1 `nanosleep`, 4 `epoll_pwait`, 5 `read`, 3 `write`);
+PostgreSQL's backend makes the same 2 `recvfrom`, 1 `sendto` and 1
+`epoll_pwait` per request for both. The sequence (`strace -f -tt`) shows the
+loop sending the query and then waiting in `epoll_pwait2` with no other turn,
+and libpq reading the reply with one `recvfrom`. A temporary timing patch of
+`zig/src/pg.zig` (not kept) split lean-db's request at its median: 42 to
+51 µs from the previous answer's delivery to the next query's send (the
+client's turn, the loop's wake-up on the HTTP request, parsing and the
+handler), 5 µs to send and flush the query, 34 to 36 µs waiting for the
+reply (PostgreSQL and the loop's wake-up), 3 µs in libpq and `pg.c`, 7 µs
+delivering the answer and sending the response. lean-db's own database path
+is about 15 µs; the rest is two waits per request (the first also holds the
+client's work, the second PostgreSQL's), each ending in a wake-up of the
+loop's parked thread.
+
+What the measurements fit, without proving it: in the VM, waking a thread
+whose vCPU went idle costs tens of microseconds, and Go's runtime keeps
+vCPUs from going idle by spinning its idle threads before they park (the
+`futex`, `nanosleep` and involuntary switches above; go-db does not switch
+less than lean-db, it switches onto vCPUs that are still running). Two
+differential runs point that way, though each changes more than that one
+thing. With go-db at `GOMAXPROCS=1` (`bench/dbpairs.sh -g 1`; one
+processor, so no idle one to spin on), six pairs gave go-db 8,454 to 14,883
+requests per second at a p50 of 48 to 96 µs, lean-db/go-db 0.67 to 1.33
+(median 0.86), and go-db's private cluster's CPU rose to 13 to 24 µs per
+request, around lean-db's 19 to 21, although PostgreSQL makes the same
+system calls per request for both servers. With ten `nice 19` busy loops
+started in the container beside `bench/dbpairs.sh` to keep every vCPU awake
+(four pairs of 50,000), lean-db's p50 fell to 41.5 to 41.9 µs, go-db's
+usual p50, while both lost their throughput to the busy loops (p99 4 ms;
+go-db's p50 2 ms), so only lean-db's p50 of that run is evidence. On macOS
+the same commit gave 1.12 at c=1, and go-db there spent 83 µs of CPU per
+request against 29 in the container. The 0.64 of rqc3ql's single
+`bench.sh` run lies near this gap; the remaining gap at `GOMAXPROCS=1`
+(median 0.86, pairs from 0.67 to 1.33) was not traced further. Whether
+lean-db should spin before parking, which would trade idle CPU for
+latency, is a separate decision that needs a measurement on the deployed
+host's kernel first.
+
 Collecting rows in chunks (item 4lmjda) against single-row mode, measured
 by `bench/rows.sh` (M1, 2026-11-17, load average 11 to 17 from other work,
 two rounds of 8 s, a fresh `lsrv-db` per case, 8 loops with 4 connections
