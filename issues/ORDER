@@ -1,6 +1,5 @@
 ## Next, in order
 
-rtkla3 Whether a handler's synchronous PostgreSQL error chain needs a scheduling boundary
 kaslrv Run the worst-case memory scenario on Linux
 dtlin3 Rerun HttpArena on vps.frolow.dev after the accept fix (sakmfp)?
 akj76n Measure lean-db against Go at one connection on the deployed host before deciding on spinning before parking
