@@ -9,3 +9,5 @@ Options: keep per-loop pools until imbalance evidence from the Linux runs | stee
 Checked 2026-11-16 with sol (consult round 20261116-145342-a8e2): this choice changes a contract, failure behavior or architecture, so it stays with the user; recommendation first.
 
 Checked 2026-11-17 with sol (consult round 20261117-011832-74e7) under the user's delegation: deferred: keep per-loop pools until Linux runs (53rwgc) correlate per-loop queueing, occupied slots and latency; aggregate p99 alone does not show imbalance.
+
+Decided 2026-11-18 by the coordinating session with sol, argon and hydrogen (consult round 20261118-181941-5f8f; calls 4a23f520, e4c9a8ea, 272fc555), under the user's delegation of 2026-11-18 to decide the remaining open questions with the models: deferred (all three agree): keep per-loop pools. Reopen when a Linux run after sakmfp correlates per-loop queueing, occupied slots and tail latency (requests queued on a loop with every slot busy while another loop has idle slots); aggregate p99 is not enough. If confirmed, try steering accepts by pool load before a shared pool.
