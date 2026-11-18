@@ -15,3 +15,5 @@ Options:
 3. Accept the gap as a property of the development VM and leave the loop as it is.
 
 Smaller observation from the same trace, informational: each request makes one `recvfrom` with MSG_PEEK that fails with EAGAIN, zio's try of the re-armed peek before it parks (zig/src/pg.zig `arm`, `.recv`); it is one of nine system calls per request and was not measured on its own.
+
+Decided 2026-11-18 by the coordinating session with sol, argon and hydrogen (consult round 20261118-181941-5f8f; calls 4a23f520, e4c9a8ea, 272fc555), under the user's delegation of 2026-11-18 to decide the remaining open questions with the models: approved (argon and hydrogen; sol deferred for consent, which the delegation now gives): measure on vps.frolow.dev with bench/dbpairs.sh (default and -g 1), in the same VPS window as dtlin3 and under its conditions; no loop change in this item. If the VPS shows no repeatable c=1 gap, record that and change nothing; a bounded spin before parking stays a separate decision for the owner (it changes idle CPU use on the shared production host).
