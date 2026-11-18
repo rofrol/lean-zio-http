@@ -1,6 +1,5 @@
 ## Next, in order
 
-qgrnr3 Backend-independent tests of the transport's completion, cancel and expiry orderings
 faahn4 Decide how to settle zio's undocumented setTimer from a timer's own callback
 ugay7c Pin the HttpArena containers' debian:trixie base image by digest
 
