@@ -1,5 +1,7 @@
 Decide what follows from the classification of Linux pending-connection accept errnos (xihdtw)
-Done by: the coordinating session
+
+Posted 2026-11-19 by the coordinating session at the user's go: https://github.com/lalinsky/zio/issues/931 (the draft below, unchanged). Today's exit on these errnos and README "Accept errors" stay as they are. This item now waits for a maintainer's answer and is not approved work until one arrives: a statement that they stay Unexpected/OperationNotSupported is quoted next to the server's accept handling as a documented limitation; a fix upstream is adopted at the next zio update (re-arm on the new named error); a confirmed bug that upstream won't fix follows Rule 6 (fork and PR) after the owner's go. Check the issue at session start and at each zio update. ekklesiai.org's session was told the link for its decision record 0001.
+
 
 Needs a decision (item xihdtw's outcome, commit "boundary: classify Linux pending-connection accept errnos under the pinned zio"; README "Production contract", "Accept errors").
 
