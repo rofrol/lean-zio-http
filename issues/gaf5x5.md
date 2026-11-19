@@ -9,3 +9,7 @@ Options:
 2. Bound a batch by 8,192: a Lean constant equal to serve.zig's out_cap, with a check (lsrv-test or the Zig build) that the two agree; each batch is then one system call when the kernel takes it whole, at the cost of one more loop turn per 8 KiB of pipelined responses and a second source of the transport's buffer size.
 
 Recommendation: 1, unless "one system call per batch" is the property wanted.
+
+Decided 2026-11-19 by the coordinating session with sol and hydrogen (consult round 20261119-131820-9a89; calls 2457b2df, db84fdb7) under the user's delegation to decide the next items with the models: needs the owner (a contract choice).
+Question: Is a pipelined batch bounded by maxResponseBytes (65,536, proved today) or by the transport's out_cap (8,192)?
+Options: keep maxResponseBytes (recommended by sol) | bound by out_cap with a cross-language check
