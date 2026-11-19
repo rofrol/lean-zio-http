@@ -1,8 +1,0 @@
-Bring the pool's libpq calls in line with libpq's documented call order, or cite the passage that allows them
-
-Found by the comment audit the user asked for on 2026-11-19:
-- zig/src/pg.zig:274-275: `connect` calls PQconnectPoll (`connectStep`) right after PQconnectStartParams. libpq's docs ("Connection Control Functions", PQconnectStartParams): "If you have yet to call PQconnectPoll, i.e., just after the call to PQconnectStart, behave as if it last returned PGRES_POLLING_WRITING", i.e. wait for writability first. No comment justifies the deviation; it matters for `hostaddr` TCP connects.
-- zig/src/pg.c:69 (with :120, :570): on a statement's first use PQsetChunkedRowsMode is called inside `collect`, after PQconsumeInput/PQgetResult ran; libpq's general rule is "immediately after PQsendQuery ..., before any other operation on the connection such as PQconsumeInput or PQgetResult". The comment paraphrases libpq's internal check instead of quoting a documented passage (the pipeline-mode section may cover it); code aborts if libpq refuses.
-Verify each against the libpq 17 docs; fix or quote the allowing passage next to the code.
-
-Decided 2026-11-19 by the coordinating session with sol and hydrogen (consult round 20261119-075953-d7f4; calls 88cb5a16, 0bf8ac07) at the user's request to decide the best order of the issues with the models: approved into Next while 4bngph waits. Verify each call against the libpq 17 documentation; fix the order where the docs do not allow it (for PQconnectPoll: arm writability first, the event the loop reports), or quote the passage that allows it next to the code.

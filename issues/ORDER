@@ -1,6 +1,5 @@
 ## Next, in order
 
-uo5qcn Bring the pool's libpq calls in line with libpq's documented call order, or cite the passage that allows them
 p7nicw Stop discarding statuses and errors that can hide a failure, and replace waits on our own processes with their events (Rule 10)
 jexowc Settle the dependency assumptions that rest on upstream code rather than upstream documentation (Rule 6)
 4bngph Move the toolchain to the first nightly with lean4 PR 16562 and set maxPathSegments and maxQueryParams in the H1 adapter
