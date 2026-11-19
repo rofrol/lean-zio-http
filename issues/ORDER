@@ -1,7 +1,5 @@
 ## Next, in order
 
-wy4wgz Report to zio that a queued connection reset by the peer is accepted successfully on Linux and macOS, against its accept documentation
-
 ## Proposed
 
 q2g4am Act on leanprover/lean4's answers to the Std.Http questions 16522 and 16523
