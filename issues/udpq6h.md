@@ -1,0 +1,8 @@
+Decide whether the head budget of a request left behind several responses or batches may restart with each of them
+
+Seen in item vxcuze: in lsrv-test's batchEdgeScenario (Test.lean, "a full buffer ending on an incomplete request"), a receive holding many complete requests and an incomplete one is answered in several batches, and the incomplete request is then read under the head deadline of generation `sends + 1`: the pair of the last batch's head budget (`Phase.ahead`, `gen + 1`), not the one that ran beside the first batch. The same happens without batching limits, e.g. A, Q (a request that waits for a query), C (incomplete) in one receive: C's head budget starts when Q's response starts, after the query answered.
+
+Server/Conn.lean's header (lines 38-45) says a pipelined request's head budget starts at its first byte, known either because "it was left over in the buffer when the response started (it arrived in the receive that completed the previous request, which is when the response starts ...)". For a request behind more than one response or batch, its bytes arrived in an earlier receive, so its budget starts later than its first byte, by up to the write time of the batches (and queries) before it. The extension is bounded by inCap (at most that many requests ahead) and each batch's write deadline, so it widens, without removing, the head deadline.
+
+Question: Is a head budget that restarts with each response or batch ahead of the request acceptable (then correct the header's wording), or must it run from the receive that brought its first byte (then Conn.State keeps that request's pair across the responses before it)?
+Options: accept and correct the documentation | keep the first pair across the responses ahead
