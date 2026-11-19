@@ -62,24 +62,13 @@ fi
 if [ "${zig_have%.*}" != "${zig_min%.*}" ] || [ "${zig_have##*.}" -lt "${zig_min##*.}" ]; then
   echo "zig/build.zig.zon's minimum_zig_version is $zig_min; the image has Zig $zig_have: move linux/Dockerfile's ZIG_VERSION and its sums, or minimum_zig_version, so both are on one line and the image is not below the minimum"; exit 1
 fi
-# The tree goes into the container as an archive built first, so a failure
-# of git or tar stops the script instead of hiding behind the container's
-# status. Its files are those of the working tree: tracked ones (a tracked
-# file deleted but not staged left out, item lmbozk, and one replaced by a
-# directory, which tar would copy whole; a symlink kept even when it
-# dangles) and untracked ones git does not ignore. The copy has no
-# .git, so the same NUL-delimited list goes in beside it as /files, which
+# The tree goes into the container as an archive built first
+# (linux/tree-snapshot.sh), so a failure of git or tar stops the script
+# instead of hiding behind the container's status. The copy has no .git, so
+# the snapshot's NUL-delimited list goes in beside it as /files, which
 # check.sh's bench/mdlinks reads through MDLINKS_FILES instead of
-# `git ls-files` (item gjbmli): the list and the archive describe one
-# snapshot. COPYFILE_DISABLE: macOS's tar would add AppleDouble `._` files,
-# which the build reads as sources.
-git ls-files -z --cached --others --exclude-standard >"$tmp/listed"
-# The names reach the filter only as operands of its fixed loop; a failed
-# write fails it.
-xargs -0 sh -c 'for f; do
-  if [ -L "$f" ] || { [ -e "$f" ] && [ ! -d "$f" ]; }; then printf "%s\0" "$f" || exit 1; fi
-done' sh <"$tmp/listed" >"$tmp/files"
-COPYFILE_DISABLE=1 tar --null -T "$tmp/files" -cf "$tmp/tree.tar"
+# `git ls-files` (item gjbmli).
+linux/tree-snapshot.sh "$tmp/files" "$tmp/tree.tar"
 for backend in epoll io_uring; do
   echo "backend: $backend (LSRV_LINUX_BACKEND, checked by serve_test.zig)"
   # The io_uring run only turns the container's seccomp filter off: docker's

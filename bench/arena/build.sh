@@ -41,8 +41,7 @@ mkdir "$out/lib" "$out/requests"
 mkdir -p "$out/db/.lake/build/bin" "$out/db/bench/load" "$out/db/bench/pgserver"
 
 . linux/run-images.sh
-git ls-files -z --cached --others --exclude-standard >"$tmp/files"
-COPYFILE_DISABLE=1 tar --null -T "$tmp/files" -cf "$tmp/tree.tar"
+linux/tree-snapshot.sh "$tmp/files" "$tmp/tree.tar"
 image=lsrv-linux-check-amd64:$run_tag
 run_image_build "$image" --platform linux/amd64 linux
 # seccomp off: docker's default profile refuses io_uring_setup (linux-check.sh).

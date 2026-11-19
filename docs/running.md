@@ -167,17 +167,17 @@ the container on this machine, comparable only with each other):
 
 ```sh
 docker build -t lsrv-linux-check linux
-git ls-files -z --cached --others --exclude-standard >/tmp/lsrv-files &&
-COPYFILE_DISABLE=1 tar --null -T /tmp/lsrv-files -cf /tmp/lsrv-tree.tar &&
+linux/tree-snapshot.sh /tmp/lsrv-files /tmp/lsrv-tree.tar &&
 docker run --rm -e MDLINKS_FILES=/files -v lsrv-linux-cache:/home/check/.cache \
   -v /tmp/lsrv-tree.tar:/tree.tar:ro -v /tmp/lsrv-files:/files:ro lsrv-linux-check sh -c \
   'mkdir src && tar --warning=no-unknown-keyword -xf /tree.tar -C src && cd src && ./bench.sh'
 ```
 
 The copy has no `.git`, so `bench/mdlinks` takes the list of its files
-from `MDLINKS_FILES` instead of `git ls-files`. Stage or restore a tracked
-file deleted from the working tree first: `tar` stops on it
-(`./linux-check.sh` leaves such files out of both the archive and the list).
+from `MDLINKS_FILES` instead of `git ls-files`. `linux/tree-snapshot.sh`
+copies the files the working tree holds (a tracked file deleted but not
+staged is left out; symlinks are kept); every container script copies the
+tree with it, and `./check.sh` checks it (`linux/tree-snapshot-test.sh`).
 
 `bench/boundary` starts the fixture server (`lsrv-fixture`, and
 `lsrv-fixture-hand` with `-no-continue`) with the test settings and checks:

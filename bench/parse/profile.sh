@@ -68,8 +68,7 @@ m1)
 linux)
   mkdir "$out/b"
   . linux/run-images.sh
-  git ls-files -z --cached --others --exclude-standard >"$tmp/files"
-  COPYFILE_DISABLE=1 tar --null -T "$tmp/files" -cf "$tmp/tree.tar"
+  linux/tree-snapshot.sh "$tmp/files" "$tmp/tree.tar"
   # bench/parse/Dockerfile builds on this run's base (BASE_IMAGE).
   base=lsrv-linux-check:$run_tag image=lsrv-parse-profile:$run_tag
   run_image_build "$base" linux

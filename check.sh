@@ -35,6 +35,9 @@ esac
 # MDLINKS_FILES (linux-check.sh).
 (cd bench/mdlinks && go test ./... && go build -o mdlinks .)
 bench/mdlinks/mdlinks
+# The working-tree snapshot the container scripts copy (linux/tree-snapshot.sh,
+# item lmbozk); it needs only git and tar.
+linux/tree-snapshot-test.sh
 # lake builds the Zig library (extern_lib zsrv in lakefile.lean, ZIG_OPTIMIZE
 # picks its optimization) and links it into the servers.
 lake build

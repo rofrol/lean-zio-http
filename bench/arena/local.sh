@@ -28,8 +28,7 @@ cd "$(dirname "$0")/../.."
 mkdir "$out/b"
 
 . linux/run-images.sh
-git ls-files -z --cached --others --exclude-standard >"$tmp/files"
-COPYFILE_DISABLE=1 tar --null -T "$tmp/files" -cf "$tmp/tree.tar"
+linux/tree-snapshot.sh "$tmp/files" "$tmp/tree.tar"
 COPYFILE_DISABLE=1 tar -C "$arena" -cf "$tmp/arena.tar" frameworks/go-stdlib frameworks/go-fasthttp requests
 base=lsrv-linux-check:$run_tag
 run_image_build "$base" linux
