@@ -32,8 +32,10 @@ def inCap : Nat := maxHeadBytes + 4 + maxBodyBytes
 Date header): its bytes and whether to close the connection after them. The
 connection applies it to the time of the event that sends the response (the
 receive that completed the request, the send that finished the response
-before it, or the answer of its last query), so only the response sees the
-clock: `Adapter.handle`, its kept state and `init` cannot depend on it. -/
+before it, or the answer of its last query; a pipelined request answered in
+the same send as the response before it, `Server.Conn.batch`, gets that
+response's event), so only the response sees the clock: `Adapter.handle`,
+its kept state and `init` cannot depend on it. -/
 abbrev Dated := Nat → ByteArray × Bool
 
 /-- What an incomplete request still lacks. The connection bounds the two

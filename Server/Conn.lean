@@ -61,6 +61,19 @@ completion of the operation in flight is discarded (the loop's assumption:
 it reports nothing after `close`). The values of the budgets are the loop's
 (`Server.Transport.Options`); this model only names them.
 
+Pipelined responses (item paarzq). A response that keeps the connection
+open is sent together with the responses to the requests already complete
+in the buffer behind it that the adapter answers at once (`batch`), in
+request order and within `maxResponseBytes`, so a receive of many pipelined
+requests is answered with one send rather than one send and one loop turn
+each. The batch stops before a request that is incomplete, asks for
+`100 Continue` or a query, closes the connection or would pass the bound;
+that request is served from the buffer once the batch is sent, as before.
+The batch is one response to this model: it runs under one write deadline,
+and, as a connection receives only while it reads, no byte is read until the
+whole batch is sent (`lsrv-test`'s `batchScenario` checks the order, partial
+sends, the bound and this backpressure).
+
 Effects precede their record: a receive or send has happened in the kernel
 before its event reaches `step`, and a close is chosen before it is performed.
 All of this state is volatile; nothing survives the process, so a crash
@@ -216,15 +229,53 @@ def startSend (p : σ) (buf out : ByteArray) (next : Next) : State σ × Action 
   if 0 < out.size ∧ out.size ≤ maxResponseBytes then ({ buf, parser := p, phase := .writing out 0 next }, .send out 0)
   else closeNow ad
 
+/-- The responses to the pipelined requests at the start of `buf` that the
+adapter answers at once (`respond`), each written at `now`, pushed onto
+`parts` in request order, with the batch's size (`size`, the bytes before
+them included) and the bytes not consumed (item paarzq). It stops before the
+first request that is incomplete, asks for `100 Continue` or a query, closes
+the connection, has an empty response, or would bring the batch over
+`maxResponseBytes`: that request is served as before once the batch is sent.
+`fuel` bounds the rounds; each consumes at least one byte, so `buf.size`
+rounds are enough. -/
+def gather (now : Nat) (parts : Array ByteArray) (size : Nat) (buf : ByteArray) :
+    Nat → Array ByteArray × Nat × ByteArray
+  | 0 => (parts, size, buf)
+  | fuel + 1 =>
+    match (ad.handle ad.init buf).2 with
+    | .respond consumed f =>
+      let r := f now
+      if 0 < consumed ∧ consumed ≤ buf.size ∧ r.2 = false ∧ 0 < r.1.size ∧ size + r.1.size ≤ maxResponseBytes then
+        gather now (parts.push r.1) (size + r.1.size) (buf.extract consumed buf.size) fuel
+      else (parts, size, buf)
+    | _ => (parts, size, buf)
+
+/-- A response `first` that keeps the connection open, followed by the
+responses `gather` answers at once from `buf` behind it, as one send, with
+the bytes left in the buffer. The batch is one array whose capacity is its
+size, as `Response.write` gives a single response (docs/memory.md); with
+nothing gathered it is `first` itself. An empty `first`, which `startSend`
+answers with a close, gathers nothing. -/
+def batch (now : Nat) (first buf : ByteArray) : ByteArray × ByteArray :=
+  if first.size = 0 then (first, buf)
+  else
+    let g := gather ad now #[] first.size buf buf.size
+    if g.1.isEmpty then (first, g.2.2)
+    else (g.1.foldl (· ++ ·) ((ByteArray.emptyWithCapacity g.2.1).append first), g.2.2)
+
 /-- Goes on with a request's answer at wall clock `now`, `buf` holding the
 bytes after it, which start the next request (so the adapter starts again
-from `init`): sends a complete answer written at `now` (then closes or reads
-on, as it says), or asks for the query it waits for. Both a `respond` and an
-answered query come through here. -/
+from `init`): sends a complete answer written at `now`, together with the
+answers to the pipelined requests in `buf` that `batch` takes (then closes or
+reads on, as it says), or asks for the query it waits for. Both a `respond`
+and an answered query come through here. -/
 def resume (now : Nat) (buf : ByteArray) : Await Dated → State σ × Action
   | .done f =>
     let r := f now
-    startSend ad ad.init buf r.1 (if r.2 then .close else .read (if 0 < buf.size then .head else .idle))
+    if r.2 then startSend ad ad.init buf r.1 .close
+    else
+      let b := batch ad now r.1 buf
+      startSend ad ad.init b.2 b.1 (.read (if 0 < b.2.size then .head else .idle))
   | .query q k => ({ buf, parser := ad.init, phase := .querying k }, .query q)
 
 /-- Answers what is buffered at wall clock `now`, given the adapter's state
@@ -362,10 +413,32 @@ theorem startSend_inv (p : σ) (buf out : ByteArray) (next : Next) (hb : buf.siz
   · rename_i h; refine ⟨hb, ?_⟩; intro o off n hp; simp at hp; obtain ⟨rfl, -, -⟩ := hp; omega
   · exact closeNow_inv ad
 
+/-- Gathering only consumes bytes: it never leaves more than it was given. -/
+theorem gather_le (parts : Array ByteArray) (size : Nat) (buf : ByteArray) (fuel : Nat) :
+    (gather ad now parts size buf fuel).2.2.size ≤ buf.size := by
+  induction fuel generalizing parts size buf with
+  | zero => simp [gather]
+  | succ n ih =>
+    unfold gather
+    split
+    · dsimp only; split
+      · exact Nat.le_trans (ih _ _ _) (by simp [ByteArray.size_extract])
+      · exact Nat.le_refl _
+    · exact Nat.le_refl _
+
+theorem batch_le (first buf : ByteArray) : (batch ad now first buf).2.size ≤ buf.size := by
+  unfold batch
+  split
+  · exact Nat.le_refl _
+  · dsimp only; split <;> exact gather_le ad now _ _ _ _
+
 theorem resume_inv (buf : ByteArray) (a : Await Dated) (hb : buf.size ≤ inCap) :
     Inv (resume ad now buf a).1 := by
   match a with
-  | .done f => exact startSend_inv ad _ _ _ _ hb
+  | .done f =>
+    simp only [resume]; split
+    · exact startSend_inv ad _ _ _ _ hb
+    · exact startSend_inv ad _ _ _ _ (Nat.le_trans (batch_le ad now _ _) hb)
   | .query q k => exact ⟨hb, by intro o off n h; simp [resume] at h⟩
 
 theorem serve_inv (c : Bool) (p : σ) (buf : ByteArray) (hb : buf.size ≤ inCap) :
@@ -431,7 +504,7 @@ theorem startSend_close (p : σ) (buf out : ByteArray) (next : Next) :
 theorem resume_close (buf : ByteArray) (a : Await Dated) :
     (resume ad now buf a).2 = .close → (resume ad now buf a).1.phase = .closed := by
   match a with
-  | .done f => exact startSend_close ad _ _ _ _
+  | .done f => simp only [resume]; split <;> exact startSend_close ad _ _ _ _
   | .query q k => simp [resume]
 
 theorem serve_close (c : Bool) (p : σ) (buf : ByteArray) :
@@ -487,7 +560,7 @@ theorem startSend_recv (p : σ) (buf out : ByteArray) (next : Next) (room : Nat)
 theorem resume_recv (buf : ByteArray) (a : Await Dated) (room : Nat) :
     (resume ad now buf a).2 ≠ .recv room := by
   match a with
-  | .done f => exact startSend_recv ad _ _ _ _ _
+  | .done f => simp only [resume]; split <;> exact startSend_recv ad _ _ _ _ _
   | .query q k => simp [resume]
 
 theorem serve_recv (c : Bool) (p : σ) (buf : ByteArray) (room : Nat) :
@@ -544,7 +617,7 @@ theorem startSend_send (p : σ) (buf out data : ByteArray) (next : Next) (off : 
 theorem resume_send (buf data : ByteArray) (a : Await Dated) (off : Nat) :
     (resume ad now buf a).2 = .send data off → off < data.size := by
   match a with
-  | .done f => exact startSend_send ad _ _ _ _ _ _
+  | .done f => simp only [resume]; split <;> exact startSend_send ad _ _ _ _ _ _
   | .query q k => simp [resume]
 
 theorem serve_send (c : Bool) (p : σ) (buf data : ByteArray) (off : Nat) :
@@ -591,7 +664,7 @@ theorem resume_query (buf : ByteArray) (a : Await Dated) (q : Query) :
     (resume ad now buf a).2 = .query q → ∃ k, (resume ad now buf a).1.phase = .querying k := by
   match a with
   | .done f =>
-    intro h; simp only [resume, startSend] at h; split at h <;> simp [closeNow] at h
+    intro h; simp only [resume] at h; split at h <;> (simp only [startSend] at h; split at h <;> simp [closeNow] at h)
   | .query q' k => intro _; exact ⟨k, rfl⟩
 
 theorem serve_query (c : Bool) (p : σ) (buf : ByteArray) (q : Query) :
@@ -650,10 +723,13 @@ theorem serve_continued (p : σ) (buf : ByteArray) (out : ByteArray) (off : Nat)
   · simp only [ite_true]; unfold wait; split <;> simp [closeNow]
   · split
     · intro h
-      simp only [resume, startSend] at h
+      simp only [resume] at h
       split at h
-      · simp at h; (repeat' split at h) <;> simp_all
-      · simp [closeNow] at h
+      · simp only [startSend] at h; split at h <;> simp [closeNow] at h
+      · simp only [startSend] at h; split at h
+        · simp only [Phase.writing.injEq, Next.read.injEq] at h
+          obtain ⟨-, -, h⟩ := h; revert h; split <;> simp
+        · simp [closeNow] at h
     · simp [closeNow]
   · split
     · simp [resume]
@@ -681,7 +757,7 @@ theorem startSend_fed (p : σ) (buf out : ByteArray) (next : Next) (h : ad.Fed p
 
 theorem resume_fed (buf : ByteArray) (a : Await Dated) : FedInv ad (resume ad now buf a).1 := by
   match a with
-  | .done f => exact startSend_fed ad _ _ _ _ (.init _)
+  | .done f => simp only [resume]; split <;> exact startSend_fed ad _ _ _ _ (.init _)
   | .query q k => exact .init _
 
 /-- What `handle` kept for `buf` while it waited is fed for `buf`. -/
@@ -1326,7 +1402,7 @@ theorem serve_writing (c : Bool) (p : σ) (buf out : ByteArray) (off : Nat) (nex
     · intro h; exact absurd h (wait_writing ad _ _ _ _ _ _)
     · exact startSend_writing ad _ _ _ _ _ _ _
   · split
-    · simp only [resume]; exact startSend_writing ad _ _ _ _ _ _ _
+    · simp only [resume]; split <;> exact startSend_writing ad _ _ _ _ _ _ _
     · simp [closeNow]
   · split
     · simp [resume]

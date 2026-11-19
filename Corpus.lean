@@ -156,9 +156,9 @@ def arenaInitial : Conn.State H1Adapter.Parser := Conn.initial arenaAdapter
 
 /-- Whether each shape is what `lsrv-parsebench` takes it for, on this
 toolchain: every parse of its receive completes a request, and lsrv-arena's
-Lean side answers the receive, twice on one connection, with one `200`
-response per request, carrying the shape's body. The first failure, or
-`none`. -/
+Lean side answers the receive, twice on one connection, in one send (the
+pipelined responses together, item paarzq) of one `200` response per
+request, each carrying the shape's body. The first failure, or `none`. -/
 def arenaShapesCheck : Option String := Id.run do
   for (name, req, body) in arenaShapes do
     let b := req.toUTF8
@@ -169,9 +169,14 @@ def arenaShapesCheck : Option String := Id.run do
     for round in [0:2] do
       let some (s', out) := arenaReceive s b
         | return some s!"{name}, receive {round}: the connection did not ask to receive again after answering"
-      if out.size != want then return some s!"{name}, receive {round}: {out.size} responses, want {want}"
-      for r in out do
-        let r := String.fromUTF8! r
+      if out.size != 1 then return some s!"{name}, receive {round}: {out.size} sends, want 1"
+      -- The responses, each starting at its status line (no body holds one).
+      let parts := (String.fromUTF8! (out.foldl (· ++ ·) ByteArray.empty)).splitOn "HTTP/1.1 "
+      if parts.head? != some "" then return some s!"{name}, receive {round}: the send does not start with a status line"
+      let rs := parts.drop 1
+      if rs.length != want then return some s!"{name}, receive {round}: {rs.length} responses, want {want}"
+      for r in rs do
+        let r := "HTTP/1.1 " ++ r
         -- The body is everything after the head's first empty line.
         let ok := match r.splitOn "\r\n\r\n" with
           | _ :: b :: rest => r.startsWith "HTTP/1.1 200 " && "\r\n\r\n".intercalate (b :: rest) == body

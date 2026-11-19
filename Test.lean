@@ -365,8 +365,10 @@ def deadlineScenario : Check Unit := do
     if p1'.phase.ahead != some .head || p1'.gen != 1 || p1'.buf != p1.buf then
       fail "deadlines: an arrival with a head under way changed the state"
   | _ => fail "deadlines: an arrival with a head under way was acted on"
-  -- Two complete requests: the second response is a new write period.
-  let (w1, wa1) := Conn.step h 0 s0 (.received (bytes "GET / HTTP/1.1\r\nHost: a\r\n\r\nGET / HTTP/1.1\r\nHost: a\r\n\r\n"))
+  -- Two complete requests whose responses are not one batch (the second
+  -- closes the connection, item paarzq): the second response is a new write
+  -- period.
+  let (w1, wa1) := Conn.step h 0 s0 (.received (bytes "GET / HTTP/1.1\r\nHost: a\r\n\r\nGET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n"))
   let some (q, _) ← expectSend "deadlines: two pipelined requests" wa1 | return
   expectDeadline "deadlines: the first of two responses" w1 (some .write) 1
   let (w2, wa2) := Conn.step h 0 w1 (.sent q.size)
@@ -374,16 +376,21 @@ def deadlineScenario : Check Unit := do
   if off != 0 then fail s!"deadlines: the second response starts at {off}"
   expectDeadline "deadlines: the second response" w2 (some .write) 2
   expectStale "deadlines: the first response's expiry after it" h w2 .write 1
-  -- A complete pipelined head whose budget ends behind a slow response: the
-  -- budget ends without a close, and the response goes on.
-  if w1.phase.ahead != some .head then fail "deadlines: no head budget beside the first of two responses"
-  match Conn.step h 0 w1 (.expired .head 2) with
-  | (w1', .none) =>
-    expectDeadline "deadlines: a complete head's budget ended" w1' (some .write) 1
-    if w1'.phase.ahead != none then fail "deadlines: a complete head's budget still runs"
-    if w1'.buf != w1.buf then fail "deadlines: a complete head's expiry changed the buffer"
-    let (_, wa3) := Conn.step h 0 w1' (.sent q.size)
-    let some _ ← expectSend "deadlines: the second response after its head's budget" wa3 | return
+  -- A complete pipelined head (its body incomplete, so not answered with the
+  -- response before it) whose budget ends behind a slow response: the
+  -- budget ends without a close, the response goes on, and the body is
+  -- read after it.
+  let (b1, ba1) := Conn.step h 0 s0 (.received (bytes "GET / HTTP/1.1\r\nHost: a\r\n\r\nPOST /echo HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n\r\nhe"))
+  let some (bq, _) ← expectSend "deadlines: a response before a complete head" ba1 | return
+  if b1.phase.ahead != some .head then fail "deadlines: no head budget beside the response before a complete head"
+  match Conn.step h 0 b1 (.expired .head 2) with
+  | (b1', .none) =>
+    expectDeadline "deadlines: a complete head's budget ended" b1' (some .write) 1
+    if b1'.phase.ahead != none then fail "deadlines: a complete head's budget still runs"
+    if b1'.buf != b1.buf then fail "deadlines: a complete head's expiry changed the buffer"
+    let (b2, ba2) := Conn.step h 0 b1' (.sent bq.size)
+    expectRecv "deadlines: the body after its head's budget" ba2 (inCap - b1.buf.size)
+    expectDeadline "deadlines: the body after its head's budget" b2 (some .body) 2
   | _ => fail "deadlines: a complete pipelined head's expiry was acted on"
   -- A next request's byte that arrives in the kernel during the write starts
   -- its head budget then (no byte in the buffer: the loop watches).
@@ -429,7 +436,7 @@ def statusLine (d : ByteArray) : String := ((String.fromUTF8! d).splitOn "\r\n")
 /-- A handler that waits for queries, through `Conn.step` with H1: `/chain`
 asks for a query, continues with its result to a second one built from it,
 then sends the response; a request pipelined behind it waits in the buffer
-(no receive while querying) and is answered right after. A lost connection
+(no receive while querying) and is answered in the same send. A lost connection
 answers 503; a failure report while querying closes. -/
 def queryScenario : Check Unit := do
   let h := H1Adapter.adapter {} App.Db.app
@@ -441,13 +448,18 @@ def queryScenario : Check Unit := do
   let (s2, a2) := Conn.step h 0 s1 (.answered (.rows #["?column?"] #[#[some "1"]]))
   expectQuery "query: the second query" a2 "SELECT $1::int + 1" #[some "1"]
   let (s3, a3) := Conn.step h 0 s2 (.answered (.rows #["?column?"] #[#[some "2"]]))
+  -- The response and the pipelined request's, answered at once, are one send
+  -- (item paarzq).
   let some (resp, _) ← expectSend "query: the response" a3 | return
-  let text := String.fromUTF8! resp
+  let some (alone, _) ← expectSend "query: the pipelined request alone"
+    (Conn.step h 0 (Conn.initial h) (.received (bytes next))).2 | return
+  let first := resp.extract 0 (resp.size - alone.size)
+  let text := String.fromUTF8! first
   if statusLine resp != "HTTP/1.1 200 OK" || !text.endsWith "\r\n\r\n2" then fail s!"query: answered {repr text}"
-  let (s4, a4) := Conn.step h 0 s3 (.sent resp.size)
-  let some (resp2, _) ← expectSend "query: the pipelined request" a4 | return
-  if statusLine resp2 != "HTTP/1.1 200 OK" then fail "query: the pipelined request was not answered"
-  if s4.buf.size != 0 then fail "query: the pipelined request was not consumed"
+  if resp.extract first.size resp.size != alone then fail "query: the pipelined request was not answered after the response"
+  if s3.buf.size != 0 then fail "query: the pipelined request was not consumed"
+  let (_, a4) := Conn.step h 0 s3 (.sent resp.size)
+  expectRecv "query: after both responses" a4 inCap
   -- A lost connection: 503, and the connection goes on.
   let (s5, _) := Conn.step h 0 (Conn.initial h) (.received (bytes "GET /db?id=42 HTTP/1.1\r\nHost: a\r\n\r\n"))
   let (_, a6) := Conn.step h 0 s5 (.answered (.error "08006" "lost"))
@@ -474,9 +486,11 @@ def sameDated (a b : Dated) : Bool := clocks.all fun t => a t == b t
 
 /-- The clock reaches a response only at the event that sends it, through one
 adapter value: a request completed by its second receive carries that
-receive's Date, not the first's; a request pipelined behind it, answered when
-the response before it is sent, carries that send's Date; a response that
-waited for a query carries the answer's Date, not the receive's. -/
+receive's Date, not the first's, and so does a request pipelined behind it
+whose response is sent with it (item paarzq); a pipelined request answered
+only once the response before it is sent (here: it closes the connection)
+carries that send's Date; a response that waited for a query carries the
+answer's Date, not the receive's. -/
 def clockScenario : Check Unit := do
   let h := H1Adapter.adapter {} App.Db.app
   let hasDate (what : String) (d : ByteArray) (t : Nat) : Check Unit := do
@@ -486,9 +500,12 @@ def clockScenario : Check Unit := do
   let req := "GET / HTTP/1.1\r\nHost: a\r\n\r\n"
   let (s1, a1) := Conn.step h 951782400 (Conn.initial h) (.received (bytes "GET / HTTP/1.1\r\nHo"))
   expectRecv "clock: the first part" a1 (inCap - 18)
-  let (s2, a2) := Conn.step h 1767225599 s1 (.received (bytes ("st: a\r\n\r\n" ++ req)))
+  let closing := "GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n"
+  let (s2, a2) := Conn.step h 1767225599 s1 (.received (bytes ("st: a\r\n\r\n" ++ req ++ closing)))
   let some (r2, _) ← expectSend "clock: the completed request" a2 | return
-  hasDate "the completing receive" r2 1767225599
+  let date := "\r\nDate: " ++ String.fromUTF8! (Response.pushDate ByteArray.empty 1767225599) ++ "\r\n"
+  if ((String.fromUTF8! r2).splitOn date).length != 3 then
+    fail s!"clock: the completed request and the one pipelined with it do not both carry the receive's Date: {repr (String.fromUTF8! r2)}"
   let (_, a3) := Conn.step h 1793580020 s2 (.sent r2.size)
   let some (r3, _) ← expectSend "clock: the pipelined request" a3 | return
   hasDate "the send before a pipelined request" r3 1793580020
@@ -865,6 +882,169 @@ def responseCapacityScenario : Check Unit := do
             if retainedBytes out != 81920 then
               fail s!"response capacity, {what}, close {close}: a {retainedBytes out}-byte block at the limit, want 81,920"
 
+/-! ## Pipelined responses in one send (item paarzq) -/
+
+/-- The response a new connection sends for `req` alone, or `none`. -/
+def aloneResponse (h : Server.Adapter σ) (req : String) : Option ByteArray :=
+  match (Conn.step h 0 (Conn.initial h) (.received (bytes req))).2 with
+  | .send d 0 => some d
+  | _ => none
+
+/-- Drives a connection from state `s` and its action `a`, reporting each send
+as written in pieces of at most `k` bytes, until it asks for anything but a
+send. Fails unless every piece after the first of a send is asked for at the
+offset where the last ended, of the same data, in the same deadline period.
+The data of each send (once), and the state and action it ends with. -/
+def drain (what : String) (h : Server.Adapter σ) (k : Nat) (s : Conn.State σ) (a : Conn.Action) :
+    Check (Array ByteArray × Conn.State σ × Conn.Action) := do
+  let mut s := s
+  let mut a := a
+  let mut sends := #[]
+  -- Each step writes at least one byte, and no scenario sends a megabyte.
+  for _ in [0:1000000] do
+    match a with
+    | .send d off =>
+      if off == 0 then sends := sends.push d
+      let n := min k (d.size - off)
+      let (s', a') := Conn.step h 0 s (.sent n)
+      if off + n < d.size then
+        match a' with
+        | .send d' off' =>
+          if d' != d || off' != off + n || s'.gen != s.gen then
+            fail s!"{what}: a partial send at {off + n} of {d.size} did not continue the same send"
+            return (sends, s', a')
+        | _ =>
+          fail s!"{what}: a partial send at {off + n} of {d.size} did not continue"
+          return (sends, s', a')
+      s := s'
+      a := a'
+    | _ => return (sends, s, a)
+  fail s!"{what}: did not stop sending"
+  return (sends, s, a)
+
+/-- The responses to the complete requests in the buffer, answered at once,
+go out as one send (`Conn.batch`; one `send` action, which the transport
+copies out in pieces of at most 8,192 bytes, its `out_cap`, so a batch of at
+most that size is one system call when the kernel takes it whole, and the
+head budget of a request behind it runs beside it as beside a single
+response): in request order, the same bytes as each
+request gets alone, across partial sends of any size, in an array whose
+capacity is its size, never over `maxResponseBytes` (a batch at exactly the
+bound is taken, one byte over is not), and without a receive until every
+complete request in the buffer is answered (backpressure: a buffer filled
+with requests is answered in sends of at most `maxResponseBytes` before the
+connection reads again). A batch stops before a request that is incomplete,
+asks for `100 Continue` or a query, or closes the connection; that one is
+served once the batch is sent, as before. -/
+def batchScenario : Check Unit := do
+  let h := H1Adapter.adapter {} App.Hello.app
+  let get := "GET / HTTP/1.1\r\nHost: a\r\n\r\n"
+  let miss := "GET /nope HTTP/1.1\r\nHost: a\r\n\r\n"
+  let some rGet := aloneResponse h get | fail "batch: GET / alone was not answered"; return
+  let some rMiss := aloneResponse h miss | fail "batch: GET /nope alone was not answered"; return
+  if rGet == rMiss then fail "batch: the two requests get the same response"
+  -- Order, in one send, across partial sends.
+  let reqs := (List.range 16).map fun i => if i % 2 == 0 then get else miss
+  let want := ((List.range 16).map fun i => if i % 2 == 0 then rGet else rMiss).foldl (· ++ ·) ByteArray.empty
+  let (s1, a1) := Conn.step h 0 (Conn.initial h) (.received (bytes (String.join reqs)))
+  expectDeadline "batch: 16 pipelined requests" s1 (some .write) 1
+  if s1.buf.size != 0 || !s1.watches then fail "batch: 16 pipelined requests were not all consumed"
+  if let .send d _ := a1 then
+    if byteArrayCapacity d != d.size then fail s!"batch: capacity {byteArrayCapacity d} for {d.size} bytes"
+  for k in [want.size, 8192, 7, 1] do
+    let (sends, s2, a2) ← drain s!"batch: 16 pipelined requests in pieces of {k}" h k s1 a1
+    if sends != #[want] then fail s!"batch: 16 pipelined requests in pieces of {k}: {sends.size} sends, not their responses in order"
+    expectRecv s!"batch: after 16 pipelined responses in pieces of {k}" a2 inCap
+    expectDeadline s!"batch: after 16 pipelined responses in pieces of {k}" s2 (some .idle) 2
+  -- An incomplete request behind the batch waits, its head budget beside it.
+  let tail := "GET / HTTP/1.1\r\nHo"
+  let (t1, ta1) := Conn.step h 0 (Conn.initial h) (.received (bytes (get ++ miss ++ tail)))
+  if t1.buf != bytes tail || t1.phase.ahead != some .head then fail "batch: an incomplete request behind the batch"
+  let (ts, t2, ta2) ← drain "batch: an incomplete request behind the batch" h 8192 t1 ta1
+  if ts != #[rGet ++ rMiss] then fail "batch: the responses before an incomplete request"
+  expectRecv "batch: an incomplete request behind the batch" ta2 (inCap - tail.length)
+  expectDeadline "batch: an incomplete request behind the batch" t2 (some .head) 2
+  -- A request that closes the connection ends the batch before it.
+  let closing := "GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n"
+  let some rClose := aloneResponse h closing | fail "batch: a closing request alone"; return
+  let (c1, ca1) := Conn.step h 0 (Conn.initial h) (.received (bytes (get ++ get ++ closing ++ get)))
+  let (cs, _, ca2) ← drain "batch: a closing request" h 8192 c1 ca1
+  if cs != #[rGet ++ rGet, rClose] then fail s!"batch: a closing request: {cs.size} sends, not two responses, then the closing one"
+  expectClose "batch: after the closing response" ca2
+  -- The head budget beside a partly sent batch (`Phase.ahead`, generation
+  -- 2): its expiry closes on an incomplete head, and on a complete one left
+  -- behind the batch ends the budget while the batch goes on from its offset.
+  let (tp, tpa) := Conn.step h 0 t1 (.sent 5)
+  let tpSending := match tpa with
+    | .send d 5 => d == rGet ++ rMiss
+    | _ => false
+  unless tpSending && tp.phase.ahead == some .head do
+    fail "batch: a batch with an incomplete head behind it, partly sent, is not still sending beside the head budget"
+  expectClose "batch: an incomplete head's budget beside a partly sent batch" (Conn.step h 0 tp (.expired .head 2)).2
+  let (cp, cpa) := Conn.step h 0 c1 (.sent 5)
+  if cp.phase.ahead != some .head then fail "batch: a partly sent batch with a complete head behind it has no head budget"
+  match Conn.step h 0 cp (.expired .head 2) with
+  | (ce, .none) =>
+    if ce.phase.ahead != none || ce.gen != 1 then fail "batch: a complete head's budget beside a partly sent batch did not end"
+    match cpa with
+    | .send d 5 =>
+      if d != rGet ++ rGet then fail "batch: the partly sent batch is another one"
+      -- The expiry kept the offset: one more byte continues at 6.
+      let (c6, ca6) := Conn.step h 0 ce (.sent 1)
+      let at6 := match ca6 with
+        | .send d' 6 => d' == d
+        | _ => false
+      unless at6 do fail "batch: after a complete head's budget ended, the batch did not continue at offset 6"
+      let (cs2, _, ca3) ← drain "batch: a complete head's budget ended beside a batch" h 8192 c6 ca6
+      if cs2 != #[rClose] then fail "batch: after a complete head's budget ended beside a batch: not the closing response"
+      expectClose "batch: after a complete head's budget ended beside a batch" ca3
+    | _ => fail "batch: a partly sent batch did not continue at offset 5"
+  | _ => fail "batch: a complete head's expiry beside a partly sent batch was acted on"
+  -- `100 Continue` ends the batch before its request.
+  let expect := "POST /echo HTTP/1.1\r\nHost: a\r\nExpect: 100-continue\r\nContent-Length: 5\r\n\r\n"
+  let (e1, ea1) := Conn.step h 0 (Conn.initial h) (.received (bytes (get ++ expect)))
+  let (es, _, ea2) ← drain "batch: 100-continue" h 8192 e1 ea1
+  if es != #[rGet, Response.continueBytes] then fail s!"batch: 100-continue: {es.size} sends, not the response, then the interim one"
+  expectRecv "batch: the body after the interim response" ea2 (inCap - expect.length)
+  -- A query ends the batch before its request.
+  let hd := H1Adapter.adapter {} App.Db.app
+  let some rDb := aloneResponse hd get | fail "batch: GET / of the database application alone"; return
+  let (q1, qa1) := Conn.step hd 0 (Conn.initial hd) (.received (bytes (get ++ get ++ "GET /db?id=1 HTTP/1.1\r\nHost: a\r\n\r\n" ++ get)))
+  let (qs, q2, qa2) ← drain "batch: a query" hd 8192 q1 qa1
+  if qs != #[rDb ++ rDb] then fail "batch: a query: not the two responses before it"
+  expectQuery "batch: the query after the batch" qa2 "SELECT id, randomnumber FROM world WHERE id = $1" #[some "1"]
+  if q2.buf != bytes get then fail "batch: the request after the query was consumed"
+  -- The bound: a batch of exactly `maxResponseBytes` is one send, held in
+  -- one 81,920-byte block (docs/memory.md); a byte more is two sends.
+  let hf := H1Adapter.adapter {} App.Fixture.app
+  let echo (n : Nat) := s!"POST /echo HTTP/1.1\r\nHost: a\r\nContent-Length: {n}\r\n\r\n" ++ big n
+  let some rBig := aloneResponse hf get | fail "batch: the fixture's GET / alone"; return
+  let room := maxResponseBytes - rBig.size
+  let some n := (List.range room).find? fun n => ((aloneResponse hf (echo n)).map (·.size)) == some room
+    | fail s!"batch: no echo response of {room} bytes"; return
+  for (m, sends) in [(n, 1), (n + 1, 2)] do
+    let some rEcho := aloneResponse hf (echo m) | fail s!"batch: an echo of {m} bytes alone"; return
+    let (b1, ba1) := Conn.step hf 0 (Conn.initial hf) (.received (bytes (get ++ echo m)))
+    let (bs, _, ba2) ← drain s!"batch: {rBig.size} + {rEcho.size} bytes" hf 8192 b1 ba1
+    if bs.size != sends || bs.foldl (· ++ ·) ByteArray.empty != rBig ++ rEcho then
+      fail s!"batch: {rBig.size} + {rEcho.size} bytes: {bs.size} sends, want {sends}, of both responses in order"
+    expectRecv s!"batch: after {rBig.size} + {rEcho.size} bytes" ba2 inCap
+    if sends == 1 then
+      if let .send d _ := ba1 then
+        if d.size != maxResponseBytes || byteArrayCapacity d != d.size || retainedBytes d != 81920 then
+          fail s!"batch at the bound: {d.size} bytes, capacity {byteArrayCapacity d}, a {retainedBytes d}-byte block"
+  -- Backpressure: a buffer filled with requests is answered in sends of at
+  -- most `maxResponseBytes`, all before the next receive.
+  let many := inCap / get.length
+  let (f1, fa1) := Conn.step h 0 (Conn.initial h) (.received (bytes (String.join (List.replicate many get))))
+  let (fs, f2, fa2) ← drain "batch: a full buffer" h 8192 f1 fa1
+  if fs.foldl (· ++ ·) ByteArray.empty != (List.replicate many rGet).foldl (· ++ ·) ByteArray.empty then
+    fail s!"batch: a full buffer of {many} requests: not their responses in order"
+  if fs.size < 2 || fs.any (·.size > maxResponseBytes) then
+    fail s!"batch: a full buffer of {many} requests: {fs.size} sends of {fs.map (·.size)} bytes"
+  expectRecv "batch: after a full buffer" fa2 inCap
+  if f2.buf.size != 0 then fail "batch: a full buffer was not consumed"
+
 /-! ## The pool's result bound
 
 `zig/src/pg.c` cannot read a Lean definition, so it states
@@ -914,6 +1094,7 @@ def main : IO UInt32 := do
     continueScenario
     refusedScenario
     queryScenario
+    batchScenario
     deadlineScenario
     clockScenario
     corpusScenario

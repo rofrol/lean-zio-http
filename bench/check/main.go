@@ -35,7 +35,24 @@ func main() {
 	maxHead += strings.Repeat("a", 8192-len(maxHead)) + "\r\n\r\n"
 	maxReq := "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 8192\r\nX: "
 	maxReq += strings.Repeat("a", 8192-len(maxReq)) + "\r\n\r\n" + strings.Repeat("a", 8192)
+	// 150 pipelined requests in one write, GET (200) and POST (404) in turn:
+	// their responses (over 10,000 bytes) must come in request order. When one
+	// receive holds them (one write of 5,400 bytes does not guarantee it), they
+	// are batched (Conn.batch) and copied out in sends of at most 8,192 bytes
+	// (serve.zig's out_cap); Test.lean's batchScenario checks the batch itself.
+	var piped strings.Builder
+	var pipedAnswers []exchange
+	for i := range 150 {
+		if i%2 == 0 {
+			piped.WriteString("GET / HTTP/1.1\r\nHost: a\r\n\r\n")
+			pipedAnswers = append(pipedAnswers, exchange{"GET", 200})
+		} else {
+			piped.WriteString("POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 0\r\n\r\n")
+			pipedAnswers = append(pipedAnswers, exchange{"POST", 404})
+		}
+	}
 	checks := []check{
+		{"150 pipelined requests, answered in order", piped.String(), pipedAnswers, false},
 		{"GET /", "GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n", []exchange{{"GET", 200}}, true},
 		{"HEAD /", "HEAD / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n", []exchange{{"HEAD", 200}}, true},
 		{"pipelined POST and GET", "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n\r\nhelloGET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n",

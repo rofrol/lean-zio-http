@@ -50,7 +50,11 @@ of nightly-2026-11-17 before the cases changed with the limits below:
   capacity is at most 65,536: a block of at most 81,920 bytes, of which only
   the pages written need be resident (`lsrv-test` checks the capacity and,
   at the limit, the block). The fixture's largest response (60,121 bytes)
-  is a 65,536-byte block.
+  is a 65,536-byte block. Responses to pipelined requests sent together
+  (`Conn.batch`) are copied into one array allocated with capacity exactly
+  their total, which is at most 65,536, so the same bound holds (`lsrv-test`
+  checks a batch of exactly 65,536 bytes: one 81,920-byte block); the
+  separate responses are dropped within the step.
 - The adapter's initial state is one object shared by every connection
   (H1's is a closed term, `lean_obj_once` in the generated C), so a
   connection whose adapter is at `init` holds none of its own; the interim

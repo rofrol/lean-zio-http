@@ -31,7 +31,12 @@
   no interim response. Other expectations are ignored.
 - **Bounded output.** A response is written whole into one buffer of at most
   `maxResponseBytes` (65,536) bytes and sent in pieces of at most 8,192 bytes
-  (the loop's send buffer). A larger response, a status outside 200-599, a
+  (the loop's send buffer). The responses to the pipelined requests already
+  complete in the connection's buffer that the handler answers at once
+  follow it in the same buffer, in request order, within the same bound,
+  and are sent with it (`Conn.batch`); a request that is incomplete, asks
+  for `100 Continue` or a query, closes the connection or would pass the
+  bound is answered once they are sent. A larger response, a status outside 200-599, a
   body with 204, 205 or 304, a field the adapter owns (Content-Length,
   Transfer-Encoding, Connection, Date, Keep-Alive, Upgrade, Trailer) or a
   field name or value that is not valid becomes `500` with
