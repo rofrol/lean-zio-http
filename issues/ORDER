@@ -1,6 +1,5 @@
 ## Next, in order
 
-c6yngw Fix stale and contradictory comments found by the comment audit
 uo5qcn Bring the pool's libpq calls in line with libpq's documented call order, or cite the passage that allows them
 p7nicw Stop discarding statuses and errors that can hide a failure, and replace waits on our own processes with their events (Rule 10)
 jexowc Settle the dependency assumptions that rest on upstream code rather than upstream documentation (Rule 6)
@@ -16,6 +15,7 @@ q2g4am Act on leanprover/lean4's answers to the Std.Http questions 16522 and 165
 3pund6 Decide what follows from the classification of Linux pending-connection accept errnos (xihdtw)
 lmbozk Make the container scripts' working-tree snapshot skip tracked files deleted from the working tree
 fbqrqb Run bench/arena/build.sh and local.sh end to end on the run-scoped image tags, and record amjip6's accepted limits
+fzddri Rerun ./linux-check.sh for the tests and pool changes added since its last recorded run
 
 ## Needs a decision
 
