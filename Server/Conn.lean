@@ -331,12 +331,17 @@ def continues : Phase → Event → Phase → Bool
   | .writing _ _ (.read (.body _)), .sent _, .reading (.body _) => true
   | _, _, _ => false
 
-/-- Sets the generation of `r`, the answer to `e` in state `s`: kept while the
-period continues, the next one otherwise; a closed connection keeps none. -/
-def stamp (s : State σ) (e : Event) (r : State σ × Action) : State σ × Action :=
+/-- Sets the generation of `r`, the answer to `e` in a state of phase `ph`
+and generation `g`: kept while the period continues, the next one otherwise;
+a closed connection keeps none. It takes the phase and the generation rather
+than the state so that `step` reads them before `advance` and holds no
+reference to the state while `advance` runs: a shared state would make
+`advance` copy the buffer it appends a receive to (item l46evh,
+docs/reports/chunked-receive-memory.md). -/
+def stamp (ph : Phase) (g : Nat) (e : Event) (r : State σ × Action) : State σ × Action :=
   match r.1.phase with
   | .closed => r
-  | p => ({ r.1 with gen := if continues s.phase e p then s.gen else s.gen + 1 }, r.2)
+  | p => ({ r.1 with gen := if continues ph e p then g else g + 1 }, r.2)
 
 /-- Whether the loop is to watch for bytes of a next request while it
 sends: a response is sent, nothing is buffered, and no byte of a next
@@ -384,7 +389,7 @@ def step (now : Nat) (s : State σ) (e : Event) : State σ × Action :=
   | .closed, _ => (s, .none)
   | _, .expired d g => expire ad s d g
   | _, .arrived => arrive s
-  | _, _ => stamp s e (advance ad now s e)
+  | ph, _ => let g := s.gen; stamp ph g e (advance ad now s e)
 
 /-! ## Guarantees
 
@@ -824,7 +829,7 @@ def Event.isLoop : Event → Bool
   | .expired .. | .arrived => true
   | _ => false
 
-theorem stamp_obs (s : State σ) (e : Event) (r : State σ × Action) : obs (stamp s e r) = obs r := by
+theorem stamp_obs (ph : Phase) (g : Nat) (e : Event) (r : State σ × Action) : obs (stamp ph g e r) = obs r := by
   unfold stamp; split <;> rfl
 
 /-- An event other than the loop's own report is answered as `advance`
@@ -836,7 +841,7 @@ theorem step_obs (s : State σ) (e : Event) (he : e.isLoop = false) :
   · rename_i h; simp [advance, h]
   · simp [Event.isLoop] at he
   · simp [Event.isLoop] at he
-  · exact stamp_obs _ _ _
+  · exact stamp_obs _ _ _ _
 
 /-- What a report of the loop may do: close, or ask for nothing while keeping
 the buffer, the adapter's state and the generation, and leaving the phase

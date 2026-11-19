@@ -160,7 +160,7 @@ metadata, which is not derived (`sendingBound`):
 | an 8,000-byte head, after `100 Continue` | 1,000 | 52.0 to 52.1 |
 | a head of 100 short fields, after `100 Continue` | 400 | 49.7 to 49.8 |
 | all but one byte of an 8,192-byte body | 400 | 73.0 to 73.2 |
-| a head of 97 fields of 72-byte values and all but one body byte, received 7 bytes at a time (`--chunk 7`) | 100 | 81.3 to 93.1 |
+| a head of 97 fields of 72-byte values and all but one body byte, received 7 bytes at a time (`--chunk 7`) | 100 | 75.8 to 77.4 |
 | an incomplete request after 50 pipelined ones | 400 | 31.4 to 32.1 |
 | a head whose request-target has 255 path segments | 400 | 51.9 |
 | a head whose request-target has 1,000 query parameters | 400 | 104.6 to 105.1 |
@@ -173,12 +173,13 @@ metadata, which is not derived (`sendingBound`):
 head of 4,000 path segments grew it by 207.8 to 208.0 KiB, one of 4,000
 query parameters by 301.8 to 301.9, and a request line of 8,176 empty query
 parameters by 500.7 to 501.0. The row of 7-byte receives: four runs,
-2026-11-19, toolchain nightly-2026-11-19; it read 76.2 to 77.4 when first
-measured, 2026-11-17, and grew because `Conn.step` keeps the connection's
-state shared while `advance` runs, so each receive copies the whole buffer
-instead of appending in place; with that copy removed the same tree measured
-75.5 to 78.1. The rows that receive whole did not move:
-[the report](reports/chunked-receive-memory.md).) For the line with the most elements the
+2026-11-19, toolchain nightly-2026-11-19, after item l46evh; it read 76.2 to
+77.4 when first measured, 2026-11-17, then 81.3 to 93.1 while `Conn.step`
+kept the connection's state shared while `advance` ran, so that each receive
+copied the whole buffer instead of appending in place (86.7 to 90.2 in runs
+alternated with the four above). `lsrv-test` checks that a receive appends
+in place (`receiveInPlaceScenario`). The rows that receive whole did not
+move: [the report](reports/chunked-receive-memory.md).) For the line with the most elements the
 limits allow, the adapter's state holds 126,168 bytes (123.2 KiB) of live
 blocks (`lsrv-test`), besides the connection's 20 KiB and its buffer; with
 the hand-written parser, which keeps no state, the same connections grew the

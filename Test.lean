@@ -881,6 +881,48 @@ def responseCapacityScenario : Check Unit := do
             if retainedBytes out != 81920 then
               fail s!"response capacity, {what}, close {close}: a {retainedBytes out}-byte block at the limit, want 81,920"
 
+/-! ## A receive appends in place (item l46evh) -/
+
+/-- The address of `a`'s bytes, as an integer: `test/retained.c`. -/
+@[extern "lsrv_byte_array_address"] opaque byteArrayAddress (a : @& ByteArray) : Nat
+
+/-- A receive that leaves the request incomplete appends to the buffer in
+place: `Conn.step` holds no reference to the state while `advance` answers a
+receive, so a buffer the connection holds alone, with room for the bytes,
+keeps its address. The first receive copies the buffer of `Conn.initial`,
+which every connection shares (a closed term), into one of capacity `inCap`
+that the connection holds alone; each receive after it must keep that
+address: 150 of 7 bytes of a head field, the head's end, then 150 of 7 bytes
+of the body. A `step` that reads the state after `advance` (as from 69c915a,
+docs/reports/chunked-receive-memory.md) copies the buffer on every receive
+and fails this at the first receive after the first. -/
+def receiveInPlaceScenario (ad : Adapter) : Check Unit := do
+  let h := ad.make {} App.Hello.app
+  let name := s!"receive in place, {ad.name}"
+  let start := "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 4000\r\nX: "
+  let (s1, a1) := Conn.step h 0 (Conn.initial h) (.received (bytes start))
+  expectRecv s!"{name}: after the head's start" a1 (inCap - s1.buf.size)
+  let cap := byteArrayCapacity s1.buf
+  if cap != inCap then fail s!"{name}: a buffer of capacity {cap} after the first receive, want {inCap}"
+  let addr := byteArrayAddress s1.buf
+  let pieces := List.replicate 150 "aaaaaaa" ++ ["\r\n\r\n"] ++ List.replicate 150 "bbbbbbb"
+  let mut s := s1
+  let mut i := 0
+  for piece in pieces do
+    i := i + 1
+    let (s', a) := Conn.step h 0 s (.received (bytes piece))
+    expectRecv s!"{name}: after receive {i + 1}" a (inCap - s'.buf.size)
+    let got := byteArrayAddress s'.buf
+    s := s'
+    if got != addr then
+      fail s!"{name}: receive {i + 1} moved the buffer, so it was copied rather than appended in place"
+      return
+  let want := start.length + 150 * 7 + 4 + 150 * 7
+  if s.buf.size != want then fail s!"{name}: {s.buf.size} bytes buffered after the last receive, want {want}"
+  match s.phase with
+  | .reading (.body _) => pure ()
+  | _ => fail s!"{name}: not reading the body after the last receive"
+
 /-! ## Pipelined responses in one send (item paarzq) -/
 
 /-- The response a new connection sends for `req` alone, or `none`. -/
@@ -1369,6 +1411,7 @@ def main : IO UInt32 := do
       connScenario ad
       limitScenario ad
       lawCases ad
+      receiveInPlaceScenario ad
     arenaScenario
     continueScenario
     refusedScenario

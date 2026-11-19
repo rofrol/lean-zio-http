@@ -95,3 +95,10 @@ LEAN_EXPORT lean_obj_res lsrv_retained_bytes(b_lean_obj_arg root) {
 LEAN_EXPORT lean_obj_res lsrv_byte_array_capacity(b_lean_obj_arg a) {
   return lean_usize_to_nat(lean_sarray_capacity(a));
 }
+
+// The address of a byte array's bytes (`lean_sarray_cptr`), as an integer, so
+// that lsrv-test can tell an append in place from a copy without holding a
+// reference to the array it compares against.
+LEAN_EXPORT lean_obj_res lsrv_byte_array_address(b_lean_obj_arg a) {
+  return lean_usize_to_nat((size_t)lean_sarray_cptr(a));
+}

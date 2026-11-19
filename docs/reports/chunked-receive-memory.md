@@ -75,3 +75,41 @@ cause. Fixing `step` so that it does not keep the state shared, and checking
 what the copy costs in CPU (the `lsrv-bench` table of
 [Fragmented requests](../fragmented-requests.md), measured 2026-11-17), were
 proposed as a follow-up item.
+
+## After the fix (item l46evh, 2026-11-19)
+
+This section adds to the record above; it replaces none of it.
+
+Item l46evh restated `Conn.step` so that it reads the phase and the
+generation before `advance` (`stamp` now takes them rather than the state),
+with no `implemented_by`, so the theorems cover the code that runs. The
+generated C of `lp_lsrv_Server_Conn_step___redArg` now increments the
+phase and the generation and passes the state to `advance` without
+`lean_inc_ref`; at the parent commit, 59eb1b1, it called `lean_inc_ref` on
+the state before `advance` (59eb1b1's `stamp` and `step` are 69c915a's
+unchanged). `lsrv-test`'s `receiveInPlaceScenario` checks, for both parsers,
+that receives into a buffer of capacity `inCap` that the connection holds
+alone keep the address of its bytes: 150 of 7 bytes of a head field, the
+head's end, and 150 of 7 bytes of the body; with 59eb1b1's
+`Server/Conn.lean` it fails at the first of them for both. (The buffer of
+`Conn.initial` is a closed term shared by every connection, so a
+connection's first receive, which appends to it, copies it into an array of
+capacity `inCap`; that copy is one per connection and the test starts after
+it.)
+
+Measured on the M1, toolchain nightly-2026-11-19, both trees built in the
+same worktree (59eb1b1 and the fix), run in alternation, four rounds:
+`bench/boundary/boundary -fixture ... -only "received 7 bytes at a time"`
+read 90.2, 86.7, 89.3, 86.7 KiB per connection at 59eb1b1 and 77.4, 76.5,
+76.2, 75.8 with the fix, near the 76.2 to 77.4 of 2026-11-17. The row of
+[Memory](../memory.md) now gives the fixed figures.
+
+`lsrv-bench`, two rounds each, alternated, showed no clear change: for example the
+largest request in 7-byte receives took 102.2 and 106.9 ms (hand-written)
+and 26.8 and 27.8 ms (H1) at 59eb1b1, against 107.1 and 108.2, and 27.2 and
+27.4 with the fix, and every row's allocation count was the same (the copies
+are of arrays of capacity `inCap`, which the small-object counter does not
+count). The copy was a memcpy of at most 16 KiB per receive; these runs do
+not separate its cost from the parsing's, but whatever it cost is within the
+runs' spread, so the table of
+[Fragmented requests](../fragmented-requests.md) (2026-11-17) stands.

@@ -172,7 +172,8 @@ lean_lib TestSupport where
   moreLinkArgs := #["-lpq"]
 
 /-- The test support in C that `lsrv-test` links: `lsrv_retained_bytes`, the
-allocator blocks a Lean value holds, and `lsrv_byte_array_capacity` (docs/memory.md). -/
+allocator blocks a Lean value holds, and `lsrv_byte_array_capacity` (docs/memory.md),
+and `lsrv_byte_array_address`, where a byte array's bytes are. -/
 target retained.o pkg : FilePath := do
   let src ← inputTextFile <| pkg.dir / "test" / "retained.c"
   buildLeanO (pkg.buildDir / "test" / "retained.o") src
