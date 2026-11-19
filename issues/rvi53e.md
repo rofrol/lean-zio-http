@@ -5,3 +5,5 @@ Left over from item 5ffu5o (values copied by hand). docs/memory.md states per-co
 What the work is, after jexowc: give each bound one source (a Lean definition the tests use, the Go copy checked by lsrv-test's benchValuesAgree, the way bench/boundary's other limits now are) and have lsrv-test check the numbers docs/memory.md prints, or have the document name the definitions instead of the numbers.
 
 Owner's choice: check the numbers in docs/memory.md mechanically, or remove them from the document in favour of naming the definitions.
+
+Decided 2026-11-19 by the coordinating session with sol and hydrogen (consult round 20261119-131820-9a89; calls 2457b2df, db84fdb7) under the user's delegation to decide the next items with the models: stays Proposed until alblg3 decides the allocator dependency.
