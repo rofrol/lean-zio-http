@@ -149,12 +149,13 @@ holds 484,960 bytes (473.6 KiB) of live blocks (`lsrv-test`), besides the
 connection's 20 KiB and its buffer; with the hand-written parser, which
 keeps no state, the same connections grew the resident set by 41.6 KiB each.
 The interim response shows that a connection
-holds its head; for a body or a request line, the socket queues (lsof on
-macOS, `/proc` on Linux, checked first against as many connections whose
-queues are known: `checkQueues`) show that the server has taken every byte
-from its sockets, which does not exclude a receive not yet handed to Lean
-(`awaitRead`): a drained queue does not prove that `Conn.step` processed the
-bytes. At 4,096 connections, connections holding the request line with
+holds its head; for a body or a request line, the server, started with
+`--report-recv`, prints `received <bytes>` once Lean's state has taken each
+receive, and the scenario waits until those add up to every byte its
+clients wrote (`awaitRead`, since 2026-11-19, item p7nicw). The runs above
+waited instead until the socket queues (lsof on macOS, `/proc` on Linux)
+showed every byte taken from the sockets, which did not exclude a receive
+not yet handed to Lean. At 4,096 connections, connections holding the request line with
 8,176 query parameters would take about 2.0 GiB resident.
 
 The last scenario: connections whose client writes 8,192 bytes at once (100
@@ -210,9 +211,9 @@ resident set sample): with them on (the host's `madvise`), the arena grew
 in 2 MiB steps, 41 KiB per connection over the 50 added, and the scenario
 read 58 or 99 KiB. The memory scenarios measure what a connection holds
 under base pages, not the resident set of a server with huge pages, which
-can hold memory in 2 MiB units. This scenario and those that wait on the
-socket queues with `awaitRead` (`queueSettle`) are skipped on
-systems other than macOS and Linux. Those three ran on Linux too (the same
+can hold memory in 2 MiB units. This scenario is skipped on systems other
+than macOS and Linux (and so, until 2026-11-19, were the three that waited
+on the socket queues). Those three ran on Linux too (the same
 container, one run per backend, 2026-11-18), per added
 connection with H1 on epoll and io_uring: 51.9 and 51.8 KiB holding all but
 one byte of a maximum body, 60.9 and 70.2 KiB for the nearly maximum head

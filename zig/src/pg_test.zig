@@ -387,6 +387,15 @@ const Fixture = struct {
         started_options = null;
         try self.loop.init(.{});
         self.pool.init(&self.loop, "fake", "fake options", budgets, self.slots[0..nslots], false);
+        // The pool leaves these undefined until it first adds them (it
+        // initializes each afresh then); fresh ones here give `expectInert`
+        // a phase to read before that.
+        for (self.pool.slots) |*s| {
+            s.rpoll.c = .init(.net_recv);
+            s.wpoll.c = .init(.net_poll);
+            s.closer.c = .init(.net_close);
+        }
+        self.pool.timer.c = .init(.timer);
     }
 
     /// A socketpair for the next session: returns the peer's end.
@@ -439,9 +448,56 @@ const Fixture = struct {
         }
     }
 
-    /// Steps the loop a few times: for checks that nothing happens.
-    fn idle(self: *Fixture) !void {
-        for (0..3) |_| try self.loop.poll(.zero);
+    /// For the checks that nothing happens: the pool can do nothing more by
+    /// itself. No completion it owns (each slot's two polls and its close,
+    /// the deadline timer, the turn of a yielded chain) is in zio, `running`,
+    /// or finished with its callback still to run, `completed` (zio's
+    /// `Completion.loadState`), so no callback into the pool can come until
+    /// the test acts; and no query waits or waits for its delivery. This
+    /// proves the absence from the state instead of stepping the loop a
+    /// number of times and seeing nothing.
+    fn expectInert(self: *Fixture) !void {
+        const p = &self.pool;
+        var owned: [3 * @typeInfo(@FieldType(Fixture, "slots")).array.len + 2]*const ev.Completion = undefined;
+        var n: usize = 0;
+        for (p.slots) |*s| {
+            for ([_]*const ev.Completion{ &s.rpoll.c, &s.wpoll.c, &s.closer.c }) |comp| {
+                owned[n] = comp;
+                n += 1;
+            }
+        }
+        owned[n] = &p.timer.c;
+        owned[n + 1] = &p.cont.c;
+        n += 2;
+        for (owned[0..n]) |comp| {
+            const phase = comp.loadState().phase;
+            if (phase == .running or phase == .completed) {
+                fake.dump();
+                std.debug.print("a completion of the pool's ({s}) is {s}\n", .{ @tagName(comp.op), @tagName(phase) });
+                return error.PoolNotInert;
+            }
+        }
+        try std.testing.expect(!p.cont_armed and p.timer_due == null);
+        try std.testing.expect(p.head == null and p.ready_head == null);
+    }
+
+    /// For the checks that nothing happens while a slot's polls are armed:
+    /// each armed poll is parked in zio (`running`, not `completed`), and the
+    /// kernel reports none of their directions ready on the socket (poll(2)
+    /// with timeout 0), so nothing can complete them until the test acts.
+    fn expectParked(s: *const pg.Slot) !void {
+        var events: i16 = 0;
+        if (s.rarmed) {
+            try std.testing.expectEqual(.running, s.rpoll.c.loadState().phase);
+            events |= c.POLL.IN;
+        }
+        if (s.warmed) {
+            try std.testing.expectEqual(.running, s.wpoll.c.loadState().phase);
+            events |= c.POLL.OUT;
+        }
+        try std.testing.expect(events != 0);
+        var pfd = [1]c.pollfd{.{ .fd = s.fd, .events = events, .revents = 0 }};
+        try std.testing.expectEqual(@as(c_int, 0), c.poll(&pfd, 1, 0));
     }
 
     fn allDisconnected(self: *Fixture) bool {
@@ -532,11 +588,7 @@ fn busyWithBothPolls(fx: *Fixture, w: *TestWaiter) !c.fd_t {
     try std.testing.expect(s.rarmed and s.warmed and s.flushing);
     // The duplicate is neither readable nor writable, so neither poll can
     // complete until the test acts.
-    var pfd = [1]c.pollfd{.{ .fd = s.fd, .events = c.POLL.IN | c.POLL.OUT, .revents = 0 }};
-    try std.testing.expectEqual(@as(c_int, 0), c.poll(&pfd, 1, 0));
-    const before = fake.calls;
-    try fx.idle();
-    try std.testing.expectEqual(before, fake.calls); // nothing is ready
+    try Fixture.expectParked(s);
     try std.testing.expectEqual(@as(usize, 0), w.n);
     return peer;
 }
@@ -959,7 +1011,7 @@ fn yieldingChain(fx: *Fixture) !void {
     // inline part and before its end.
     const seen = b.seen orelse return error.BystanderNeverRan;
     try std.testing.expect(seen >= pg.chain_inline and seen < chain);
-    try fx.idle();
+    try fx.expectInert();
     try std.testing.expectEqual(@as(usize, chain), w.n);
     try std.testing.expect(!fx.pool.cont_armed);
     try std.testing.expectEqualSlices(u8, "08006", &w.got[31].sqlstate);
@@ -1006,7 +1058,7 @@ test "d: a submit while a yielded chain waits queues behind it, not ahead of the
     try std.testing.expectEqual(@as(usize, pg.chain_inline), w.n);
     try std.testing.expectEqual(@as(usize, 0), v.n);
     try fx.until(&w, chainDone);
-    try fx.idle();
+    try fx.expectInert();
     try std.testing.expectEqual(@as(usize, chain), w.n);
     try std.testing.expectEqual(@as(usize, 1), v.n);
     try std.testing.expectEqualSlices(u8, "08006", &v.got[0].sqlstate);
@@ -1030,7 +1082,7 @@ test "d: the drain's end while a yielded chain waits answers the rest of it at o
             return !x.cont_armed;
         }
     }.f);
-    try fx.idle();
+    try fx.expectInert();
     try std.testing.expectEqual(@as(usize, chain), w.n);
     try std.testing.expectEqual(@as(u32, 1), max_depth);
     try fx.deinit();
@@ -1101,7 +1153,7 @@ test "d: a connect's first PQconnectPoll waits until libpq's socket is writable"
     const s = slot0(&fx);
     try std.testing.expectEqual(.connecting, s.state);
     try std.testing.expect(s.warmed and !s.rarmed);
-    try fx.idle();
+    try Fixture.expectParked(s);
     try expectKinds(mark, &.{ .start, .connect_first });
     // Writable: the first PQconnectPoll runs, and the query is sent.
     drain(peer);
@@ -1138,7 +1190,7 @@ test "d: a connect ended in its wait before the first PQconnectPoll, by its dead
         try std.testing.expectEqual(@as(usize, 1), w.n);
         try std.testing.expectEqual(.err, w.got[0].kind);
         try std.testing.expectEqualSlices(u8, if (drain_end) "57014" else "08006", &w.got[0].sqlstate);
-        try fx.idle();
+        try fx.expectInert();
         try std.testing.expectEqual(@as(usize, 1), w.n);
         try std.testing.expectEqual(@as(usize, 0), fake.count.get(.connect_poll));
         try std.testing.expectEqual(@as(usize, 1), fake.count.get(.finish));
@@ -1178,7 +1230,7 @@ test "e: one connect serves every query waiting; its failure fails each of them 
         try std.testing.expectEqualSlices(u8, "08006", &w.got[0].sqlstate);
     }
     try std.testing.expect(fx.allDisconnected());
-    try fx.idle();
+    try fx.expectInert();
     try std.testing.expectEqual(@as(usize, 1), fake.count.get(.start)); // no reconnect
     try fx.deinit();
 }
@@ -1651,7 +1703,7 @@ test "f: an update while the timer's callback is on its way is left to that call
     try std.testing.expect(fx.pool.timer_due == null);
     try std.testing.expectEqual(.new, fx.pool.timer.c.loadState().phase);
     try fx.until(&fx, Fixture.allDisconnected);
-    try fx.idle();
+    try fx.expectInert();
     try std.testing.expectEqual(.new, fx.pool.timer.c.loadState().phase);
     try fx.deinit();
 }

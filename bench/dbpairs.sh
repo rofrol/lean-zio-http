@@ -119,5 +119,5 @@ while [ "$round" -le "$rounds" ]; do
 done
 pid=$lean_pid name=lean-db
 stop graceful
-pid=$go_pid
+pid=$go_pid name=go-db
 stop

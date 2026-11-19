@@ -77,23 +77,17 @@ docker run --rm --platform linux/amd64 --security-opt seccomp=unconfined \
       LSRV_LINUX_BACKEND=$backend lake build lsrv-db
       cp .lake/build/bin/lsrv-db /out/db/.lake/build/bin/lsrv-db
     fi
-    touch /tmp/mark
-    # Built for the VPS'"'"'s glibc (Debian 13: 2.41). Zig also runs them here,
-    # under Rosetta, where io_uring_setup and other calls fail with ENOSYS
-    # (2026-11-17): that run says nothing about Linux, so its status is
-    # ignored; the binaries must exist (checked below), and
-    # bench/arena/run.sh tests runs them on the VPS.
-    (cd zig && zig build test -Dtarget=x86_64-linux-gnu.2.41 -Dlinux-backend=$backend -Dlean-include="$lean_prefix/include" -Dpq-include="$(pg_config --includedir)" \
-      -Dlean-lib="$lean_prefix/lib/lean" -Dpq-lib="$(pg_config --libdir)") || true
-    # zig build test names both test binaries "test"; serve_test is the one
-    # with the backend test in it. pg_glue_test runs no event loop, so it is
-    # built once, for both backends.
-    for f in $(find zig/.zig-cache/o -type f \( -name test -o -name pg_glue_test \) -newer /tmp/mark); do
-      case $f in
-        */pg_glue_test) cp "$f" /out/pg_glue_test ;;
-        *) if grep -q "the loops run on the backend" "$f"; then cp "$f" /out/serve_test-$backend; else cp "$f" /out/pg_test-$backend; fi ;;
-      esac
-    done
+    # Built for the VPS'"'"'s glibc (Debian 13: 2.41) and not run here: under
+    # Rosetta io_uring_setup and other calls fail with ENOSYS (2026-11-17),
+    # so a run here says nothing about Linux. bench/arena/run.sh tests runs
+    # them on the VPS. pg_glue_test runs no event loop, so one build serves
+    # both backends.
+    (cd zig && zig build test-bins --prefix /tmp/test-bins-$backend -Dtarget=x86_64-linux-gnu.2.41 -Dlinux-backend=$backend \
+      -Dlean-include="$lean_prefix/include" -Dpq-include="$(pg_config --includedir)" \
+      -Dlean-lib="$lean_prefix/lib/lean" -Dpq-lib="$(pg_config --libdir)")
+    cp /tmp/test-bins-$backend/bin/pg_test /out/pg_test-$backend
+    cp /tmp/test-bins-$backend/bin/serve_test /out/serve_test-$backend
+    cp /tmp/test-bins-$backend/bin/pg_glue_test /out/pg_glue_test
   done
   cp "$lean_prefix/lib/lean/libleanshared.so" /out/lib/
   { echo "lean: $(lean --version)"; echo "zig: $(zig version)"; echo "libpq (build): $(pg_config --version)"

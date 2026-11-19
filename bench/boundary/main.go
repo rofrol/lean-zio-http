@@ -952,9 +952,7 @@ func procAddr(s string) (string, error) {
 // 3,000 for the first three, and each further one a size no other has:
 // checkSize; awaitBytes shows they arrived) and has written nothing, so its
 // socket must show exactly k unread and nothing unacknowledged, and its
-// client's nothing unread. memoryFull checks 3 such connections; a scenario
-// of held that waits on the client-to-server queues checks as many as it
-// opens. A further server, with a send buffer far larger
+// client's nothing unread. memoryFull checks 3 such connections. A further server, with a send buffer far larger
 // than its client's receive buffer, writes until its send would block to a
 // client that writes nothing and never reads: of the w bytes it wrote, its
 // socket's unacknowledged and the client's unread (from a second, later
@@ -1372,67 +1370,65 @@ func readInterim(r io.Reader) error {
 	return nil
 }
 
-// awaitRead waits until the socket queues (tcpQueues: lsof on macOS, /proc
-// on Linux) show, for every connection of conns, nothing of the client's
-// unacknowledged and nothing unread by the server: the server has taken
-// every byte the clients wrote from its sockets. The producer is the
-// server's loop receiving; after `tries` readings without it, it fails with
-// what was still queued. A drained queue does not prove that `Conn.step`
-// processed the bytes: a receive the loop has completed but not yet passed
-// to `Conn.step` at the measurement is not excluded (as in memoryFull).
-func awaitRead(pid int, conns []*net.TCPConn) error {
-	// External polling, bounded: the queues are the kernel's socket state,
-	// read with lsof or from /proc, and neither sends a notification when the
-	// server's receive drains them. Exhausting the readings is a failure;
-	// the count is not measured, so add no sleep, delay or larger count
-	// without measured evidence.
-	const tries = 200
-	queued := ""
-	for range tries {
-		r, err := tcpQueues(pid, os.Getpid())
-		if err != nil {
-			return fmt.Errorf("socket queues: %w", err)
+// countConn counts the bytes written through it in n: what the clients of
+// held sent, which awaitRead waits for the server to have taken.
+type countConn struct {
+	*net.TCPConn
+	n *atomic.Int64
+}
+
+func (c countConn) Write(b []byte) (int, error) {
+	k, err := c.TCPConn.Write(b)
+	c.n.Add(int64(k))
+	return k, err
+}
+
+// awaitRead reads the "received N" lines of s, a server started with
+// --report-recv, adding N to *got, until *got reaches want, the bytes its
+// clients wrote since it started: the event that the server's loop has
+// received every byte they sent and Lean's state has taken it (`Conn.step`,
+// through ekk_recv; zig/src/serve.zig, `report_recv`). Each line adds at
+// least one byte, so it reads at most want lines; the end of the server's
+// output (its exit), a receive of 0 bytes (a client closed), any other
+// line, or more bytes than were sent fail it.
+func awaitRead(s *server, got *int64, want int64) error {
+	for *got < want {
+		line, ok := <-s.lines
+		if !ok {
+			return fmt.Errorf("server ended after reporting %d of %d bytes received: %s", *got, want, tail(s.output))
 		}
-		queued = ""
-		for i, c := range conns {
-			cl, sv := c.LocalAddr().String(), c.RemoteAddr().String()
-			cq, sq, err := r.pair(cl, sv)
-			if err != nil {
-				return fmt.Errorf("connection %d: %w", i, err)
-			}
-			if cq[1] != 0 || sq[0] != 0 {
-				queued = fmt.Sprintf("connection %d: %d bytes of the client's unacknowledged, %d unread by the server", i, cq[1], sq[0])
-				break
-			}
+		v, found := strings.CutPrefix(line, "received ")
+		k, err := strconv.ParseInt(v, 10, 64)
+		if !found || err != nil || k <= 0 {
+			s.output = append(s.output, line)
+			return fmt.Errorf("server printed %q while %d of %d bytes were reported received", line, *got, want)
 		}
-		if queued == "" {
-			return nil
-		}
+		*got += k
 	}
-	return fmt.Errorf("after %d socket-queue readings, %s", tries, queued)
+	if *got > want {
+		return fmt.Errorf("server reported %d bytes received, more than the %d the clients wrote", *got, want)
+	}
+	return nil
 }
 
 // held measures what n connections retain in a state each reaches through
 // hold (which sees its connection and ends at an event showing the server
-// holds that state, or, when queueSettle, after which awaitRead must show
-// the server has read every byte). Two measurements, after n/2 and after n
-// connections, as in memoryFull: their difference per added connection,
-// without the fixed component. args go to the server. When queueSettle, the
-// socket queues are first checked against n connections whose
-// client-to-server queues are known (checkQueues), on macOS and Linux only.
-func held(path string, args []string, n int, queueSettle bool, hold func(c *net.TCPConn) error) (string, error) {
-	if queueSettle {
-		if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
-			return "skipped: the socket queues it waits on are read on macOS and Linux only", nil
-		}
-		if err := checkQueues(n); err != nil {
-			return "", fmt.Errorf("the socket queues read wrong: %w", err)
-		}
+// holds that state, or, when awaitRecv, after which awaitRead must show
+// the server has taken every byte the clients wrote). Two measurements,
+// after n/2 and after n connections, as in memoryFull: their difference per
+// added connection, without the fixed component. args go to the server,
+// and with awaitRecv also --report-recv.
+func held(path string, args []string, n int, awaitRecv bool, hold func(c net.Conn) error) (string, error) {
+	args = append(append([]string{}, args...), "--max-conns", strconv.Itoa(n+100))
+	if awaitRecv {
+		args = append(args, "--report-recv")
 	}
-	s, err := start(path, append(args, "--max-conns", strconv.Itoa(n+100))...)
+	s, err := start(path, args...)
 	if err != nil {
 		return "", err
 	}
+	var written atomic.Int64 // bytes the clients wrote (countConn)
+	var received int64       // bytes the server reported (awaitRead)
 	defer s.stop()
 	conns := make([]*net.TCPConn, n)
 	defer func() {
@@ -1449,13 +1445,13 @@ func held(path string, args []string, n int, queueSettle bool, hold func(c *net.
 				return err
 			}
 			conns[lo+k] = c
-			return hold(c)
+			return hold(countConn{c, &written})
 		})
 		if err != nil {
 			return 0, err
 		}
-		if queueSettle {
-			if err := awaitRead(s.cmd.Process.Pid, conns[:hi]); err != nil {
+		if awaitRecv {
+			if err := awaitRead(s, &received, written.Load()); err != nil {
 				return 0, err
 			}
 		}
@@ -1480,10 +1476,10 @@ func held(path string, args []string, n int, queueSettle bool, hold func(c *net.
 // reports is checked against no bound, since the adapter's is on live blocks,
 // checked in lsrv-test, not on the resident set (docs/memory.md: these
 // measurements falsified the earlier 98 KiB).
-func adapterScenario(args []string, n int, queueSettle bool, hold func(c *net.TCPConn) error) func(path string) (string, error) {
+func adapterScenario(args []string, n int, awaitRecv bool, hold func(c net.Conn) error) func(path string) (string, error) {
 	return func(path string) (string, error) {
-		summary, err := held(path, args, n, queueSettle, hold)
-		if err != nil || strings.HasPrefix(summary, "skipped: ") {
+		summary, err := held(path, args, n, awaitRecv, hold)
+		if err != nil {
 			return summary, err
 		}
 		return summary + " (a measurement; no bound)", nil
@@ -1510,8 +1506,8 @@ func longFieldsHead() string {
 	return expectHead("/echo", b.String())
 }
 
-func holdHead(h string) func(c *net.TCPConn) error {
-	return func(c *net.TCPConn) error {
+func holdHead(h string) func(c net.Conn) error {
+	return func(c net.Conn) error {
 		if _, err := io.WriteString(c, h); err != nil {
 			return err
 		}
@@ -1522,10 +1518,10 @@ func holdHead(h string) func(c *net.TCPConn) error {
 // holdLine sends a complete request and reads its response, the event that
 // shows the server accepted the connection (one still in the listen queue
 // is no descriptor of the server's, so tcpQueues would not list it), then the start of a request, l, and
-// nothing more; that the server read l is the socket queues' to show
-// (queueSettle).
-func holdLine(l string) func(c *net.TCPConn) error {
-	return func(c *net.TCPConn) error {
+// nothing more; that the server read l is the server's "received" lines'
+// to show (awaitRecv).
+func holdLine(l string) func(c net.Conn) error {
+	return func(c net.Conn) error {
 		if _, err := io.WriteString(c, "POST /echo HTTP/1.1\r\nHost: a\r\nContent-Length: 0\r\n\r\n"); err != nil {
 			return err
 		}
@@ -1545,8 +1541,8 @@ func holdLine(l string) func(c *net.TCPConn) error {
 
 // holdBody sends head h, waits for the interim response, then sends all but
 // the last byte of the 8,192-byte body.
-func holdBody(h string) func(c *net.TCPConn) error {
-	return func(c *net.TCPConn) error {
+func holdBody(h string) func(c net.Conn) error {
+	return func(c net.Conn) error {
 		if err := holdHead(h)(c); err != nil {
 			return err
 		}
@@ -1558,10 +1554,10 @@ func holdBody(h string) func(c *net.TCPConn) error {
 // holdAfterPipelined sends k pipelined requests with empty bodies, then an
 // incomplete one in the same write, and reads the k responses and the
 // interim response.
-func holdAfterPipelined(k int) func(c *net.TCPConn) error {
+func holdAfterPipelined(k int) func(c net.Conn) error {
 	const echo = "POST /echo HTTP/1.1\r\nHost: a\r\nContent-Length: 0\r\n\r\n"
 	h := strings.Repeat(echo, k) + expectHead("/echo", "X: "+strings.Repeat("a", 4000)+"\r\n")
-	return func(c *net.TCPConn) error {
+	return func(c net.Conn) error {
 		if _, err := io.WriteString(c, h); err != nil {
 			return err
 		}

@@ -93,6 +93,11 @@ const Testing = struct {
     /// operation allocated, so a duplicate or stale completion hits a check in
     /// `Conn.finish` instead of reused memory. Test runs only: it never frees them.
     trace: bool = false,
+    /// Prints `received <bytes>` on stderr after Lean's state has taken each
+    /// completed receive (`ekk_recv`), before its action is applied: the
+    /// event the memory measurements wait for (bench/boundary, awaitRead).
+    /// It allocates nothing and keeps nothing, unlike `trace`. Test runs only.
+    report_recv: bool = false,
     /// When nonzero, the N-th successful receive (or send), counted across
     /// loops, prints `crash recv <id> <bytes>` (or `crash send`) and kills the
     /// process with SIGKILL after the kernel performed it and before Lean
@@ -619,6 +624,7 @@ pub const Conn = struct {
         }
         var act: Action = undefined;
         ekk_recv(&self.state, &self.in, n, &self.out, out_cap, &act);
+        if (testing.report_recv) std.debug.print("received {d}\n", .{n});
         self.apply(act);
     }
 
@@ -1168,8 +1174,9 @@ pub fn openListener(port: u16) ?Listening {
 /// per-connection deadlines' budgets (`budget_ms`); `query_ms` to
 /// `statement_ms` the pool's (`pg_budgets`, and PostgreSQL's
 /// statement_timeout in `pg_options`); `drain` the shutdown's (`drain_ms`). The rest are the test settings
-/// (`Testing`), all zero in normal runs. Returns 1 on setup failure.
-export fn ekk_serve(port: u16, threads: u32, maxc: u32, conninfo: *anyopaque, conns: u32, idle_ms: u32, head_ms: u32, body_ms: u32, write_ms: u32, query_ms: u32, query_max_ms: u32, connect_ms: u32, statement_ms: u32, drain: u32, chunk: usize, fail_every: u32, trace: u8, crash_recv: u32, crash_send: u32) callconv(.c) u8 {
+/// (`Testing`), all zero in normal runs; `flags` holds two of them, `trace`
+/// (1) and `report_recv` (2). Returns 1 on setup failure.
+export fn ekk_serve(port: u16, threads: u32, maxc: u32, conninfo: *anyopaque, conns: u32, idle_ms: u32, head_ms: u32, body_ms: u32, write_ms: u32, query_ms: u32, query_max_ms: u32, connect_ms: u32, statement_ms: u32, drain: u32, chunk: usize, fail_every: u32, flags: u8, crash_recv: u32, crash_send: u32) callconv(.c) u8 {
     if (threads == 0 or maxc == 0) return 1;
     budget_ms = .{ idle_ms, head_ms, body_ms, write_ms };
     for (budget_ms) |ms| if (ms == 0) return 1;
@@ -1194,10 +1201,21 @@ export fn ekk_serve(port: u16, threads: u32, maxc: u32, conninfo: *anyopaque, co
                 std.debug.print("the startup options of --pg (or PGOPTIONS) end in an unpaired backslash, which would escape the statement_timeout the pool appends\n", .{});
                 return 1;
             },
-            else => return 1,
+            4 => {
+                // libpq's message ends with a newline.
+                std.debug.print("--pg does not parse as a connection string: {s}", .{options.?});
+                std.c.free(options.?);
+                return 1;
+            },
+            2 => {
+                std.debug.print("out of memory while making the startup options of --pg\n", .{});
+                return 1;
+            },
+            // pg.c, ekk_pg_options, returns 0 to 4 only.
+            else => unreachable,
         }
     }
-    testing = .{ .chunk = chunk, .fail_every = fail_every, .trace = trace != 0, .crash_after_recv = crash_recv, .crash_after_send = crash_send };
+    testing = .{ .chunk = chunk, .fail_every = fail_every, .trace = flags & 1 != 0, .report_recv = flags & 2 != 0, .crash_after_recv = crash_recv, .crash_after_send = crash_send };
     max_conns = maxc;
     // Each database connection holds libpq's socket and the loop's duplicate.
     if (ekk_fd_room(@as(c_ulong, maxc) + fd_reserve + 2 * @as(c_ulong, threads) * (1 + @as(c_ulong, conns))) != 0) {

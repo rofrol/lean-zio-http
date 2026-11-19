@@ -24,6 +24,7 @@ trap cleanup EXIT INT TERM
 # host:port from the server's "listening on HOST:PORT" (or dusty's "Listening
 # on HOST:PORT") line, which must come first: the servers are started on a
 # port the kernel picks, so concurrent runs of other checks cannot take it.
+# What it prints after READY-TEXT goes to $tmp/NAME.out, which `stop` shows.
 start() {
   name=$1; ready=$2; shift 2
   mkfifo "$tmp/$name"
@@ -40,17 +41,28 @@ start() {
   done
   if [ "$up" != yes ]; then printf '%s exited before it listened; its output:\n%s' "$name" "$seen"; exit 1; fi
   if [ -z "$addr" ]; then printf '%s printed no listening address; its output:\n%s' "$name" "$seen"; exit 1; fi
-  cat <&3 >/dev/null &   # keep draining its output
+  cat <&3 >"$tmp/$name.out" &   # keep draining its output
+  echo $! >"$tmp/$name.drain"
   pids="$pids $!"
   exec 3<&-
 }
 
-# stop [graceful]: SIGTERM; with `graceful`, the server must exit with status
-# 0 (the Lean servers' shutdown, docs/production-contract.md).
+# stop [graceful]: SIGTERM to the server $pid started as $name, then its
+# exit; with `graceful`, it must exit with status 0 (the Lean servers'
+# shutdown, docs/production-contract.md). The drain of its output ends with
+# the server's output (its exit); then what it printed after its ready line,
+# other than the Lean servers' "stopped" alone (zig/src/serve.zig,
+# ekk_serve), is shown on stderr (the last 20 lines), so a late error is
+# seen.
 stop() {
-  kill -TERM "$pid"
   status=0
+  kill -TERM "$pid" || { wait "$pid" || status=$?; echo "$name exited with $status before SIGTERM; its output after ready:"; cat "$tmp/$name.out"; exit 1; }
   wait "$pid" 2>/dev/null || status=$?
+  wait "$(cat "$tmp/$name.drain")" || { echo "the drain of $name's output failed"; exit 1; }
+  if [ -s "$tmp/$name.out" ] && [ "$(cat "$tmp/$name.out")" != stopped ]; then
+    echo "$name printed $(wc -l <"$tmp/$name.out") lines after its ready line; the last ones:" >&2
+    tail -n 20 "$tmp/$name.out" >&2
+  fi
   if [ "${1:-}" = graceful ] && [ "$status" != 0 ]; then echo "$name exited with $status after SIGTERM"; exit 1; fi
 }
 

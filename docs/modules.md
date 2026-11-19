@@ -107,6 +107,9 @@ only `Server.Query` values.
   when a pool slot has ended its PostgreSQL session, and
   `stop <receives> <sends>` when a loop's shutdown starts, and
   keeps freed connections allocated, so a late completion hits that check,
+  `--report-recv` prints `received <bytes>` once Lean's state has taken
+  each completed receive, allocating nothing (the memory measurements in
+  `bench/boundary` wait for it),
   and `--crash-after-recv N` and `--crash-after-send N` kill the process with
   SIGKILL right after the N-th successful receive or send, before Lean hears
   of it.

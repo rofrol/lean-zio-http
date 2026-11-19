@@ -76,23 +76,59 @@ server_cmd() {
     go-fasthttp) echo "$d/go-fasthttp" ;;
   esac
 }
-pid=
+pid= drain= cur=
 start() {
-  # $(server_cmd) is unquoted on purpose: fixed words without spaces.
-  $(server_cmd "$1") >"$out/server-$1.log" 2>&1 &
-  pid=$!
-  # Retries an idempotent request until the server answers, at most 5000
-  # times; the server's exit ends the wait too.
-  i=0
-  until curl -s -o /dev/null "$url/pipeline"; do
-    kill -0 "$pid" 2>/dev/null || { echo "$1 exited before answering"; exit 1; }
-    i=$((i + 1))
-    [ $i -lt 5000 ] || { echo "$1 did not answer"; exit 1; }
-  done
+  cur=$1 log=$out/server-$1.log
+  : >"$log"
+  case $1 in
+    lsrv-*)
+      # lsrv-arena prints "ready" once every loop accepts (zig/src/serve.zig,
+      # ekk_serve): the wait reads its output up to that line, and the end of
+      # its output (its exit) ends the wait too. The rest of its output goes
+      # on into the log.
+      rm -f "$d/server.fifo"
+      mkfifo "$d/server.fifo"
+      # $(server_cmd) is unquoted on purpose: fixed words without spaces.
+      $(server_cmd "$1") >"$d/server.fifo" 2>&1 &
+      pid=$!
+      exec 3<"$d/server.fifo"
+      up=no
+      while IFS= read -r line <&3; do
+        printf '%s\n' "$line" >>"$log"
+        [ "$line" != ready ] || { up=yes; break; }
+      done
+      [ $up = yes ] || { echo "$1 exited before ready: $(tail -n 3 "$log")"; exit 1; }
+      cat <&3 >>"$log" &
+      drain=$!
+      exec 3<&-
+      ;;
+    *)
+      $(server_cmd "$1") >"$log" 2>&1 &
+      pid=$!
+      # HttpArena's go entries print nothing once listening (main.go at
+      # $arena_commit in build.sh: ListenAndServe, reuseport.Listen, no
+      # output), so this polls that external server: an idempotent request
+      # until it answers, at most 5000 times; its exit ends the wait too.
+      i=0
+      until curl -s -o /dev/null "$url/pipeline"; do
+        kill -0 "$pid" 2>/dev/null || { echo "$1 exited before answering"; exit 1; }
+        i=$((i + 1))
+        [ $i -lt 5000 ] || { echo "$1 did not answer"; exit 1; }
+      done
+      ;;
+  esac
 }
+# SIGTERM, then the server's exit status: lsrv-arena shuts down gracefully
+# and exits 0 (docs/production-contract.md); the go entries handle no signal
+# (main.go), so SIGTERM ends them with 128 + 15. Anything else (a crash, an
+# error exit) voids the run.
 stop() {
-  kill -TERM "$pid"
-  wait "$pid" || true
+  s=0
+  kill -TERM "$pid" || { wait "$pid" || s=$?; echo "$cur exited with $s before SIGTERM: $(tail -n 3 "$out/server-$cur.log")"; exit 1; }
+  wait "$pid" || s=$?
+  if [ -n "$drain" ]; then wait "$drain"; drain=; fi
+  case $cur in lsrv-*) want=0 ;; *) want=143 ;; esac
+  [ $s -eq $want ] || { echo "$cur exited with $s after SIGTERM, want $want: $(tail -n 3 "$out/server-$cur.log")"; exit 1; }
 }
 # User plus system CPU ticks of the whole process.
 ticks() { awk '{ print $14 + $15 }' "/proc/$1/stat"; }

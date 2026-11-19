@@ -23,16 +23,39 @@ for round in $(seq "$rounds"); do
         lsrv-*) cmd="/b/$srv 2 --port $port --max-conns 16384" ;;
         *) cmd="/b/$srv" ;;
       esac
-      # $cmd is unquoted on purpose: fixed words without spaces.
-      taskset -c 0,1 $cmd >"$out/server-$tag.log" 2>&1 &
-      pid=$!
-      # Retries an idempotent request until the server answers, at most 5000
-      # times; the server's exit ends the wait too (inner.sh).
-      i=0
-      until curl -s -o /dev/null "$url/pipeline"; do
-        kill -0 $pid 2>/dev/null || { echo "$srv exited before answering"; exit 1; }
-        i=$((i + 1)); [ $i -lt 5000 ] || { echo "$srv did not answer"; exit 1; }
-      done
+      log=$out/server-$tag.log drain=
+      case $srv in
+        lsrv-*)
+          # Read its output up to "ready" (every loop accepts), or to its
+          # end (its exit); the rest goes on into the log (inner.sh, start).
+          rm -f /tmp/server.fifo; mkfifo /tmp/server.fifo
+          # $cmd is unquoted on purpose: fixed words without spaces.
+          taskset -c 0,1 $cmd >/tmp/server.fifo 2>&1 &
+          pid=$!
+          exec 3</tmp/server.fifo
+          : >"$log"; up=no
+          while IFS= read -r line <&3; do
+            printf '%s\n' "$line" >>"$log"
+            [ "$line" != ready ] || { up=yes; break; }
+          done
+          [ $up = yes ] || { echo "$srv exited before ready:"; cat "$log"; exit 1; }
+          cat <&3 >>"$log" &
+          drain=$!
+          exec 3<&-
+          ;;
+        *)
+          taskset -c 0,1 $cmd >"$log" 2>&1 &
+          pid=$!
+          # HttpArena's go entries print nothing once listening: this polls
+          # that external server with an idempotent request until it
+          # answers, at most 5000 times; its exit ends the wait too (inner.sh).
+          i=0
+          until curl -s -o /dev/null "$url/pipeline"; do
+            kill -0 $pid 2>/dev/null || { echo "$srv exited before answering"; exit 1; }
+            i=$((i + 1)); [ $i -lt 5000 ] || { echo "$srv did not answer"; exit 1; }
+          done
+          ;;
+      esac
       : >"$out/trace-$tag.txt"
       ns=$(stat -L -c %i /proc/self/ns/net)
       bpftrace -B line /s/trace.bt "$(echo "$srv" | cut -c1-6)" "$ns" >"$out/trace-$tag.txt" 2>&1 &
@@ -62,7 +85,15 @@ for round in $(seq "$rounds"); do
       c1=$(awk '{ print $14 + $15 }' /proc/$pid/stat)
       wait $bt || true
       [ -z "$pf" ] || { kill -INT $pf; wait $pf || true; }
-      kill -TERM $pid; wait $pid || true
+      # lsrv-arena exits 0 after SIGTERM (its graceful shutdown); the go
+      # entries handle no signal, so SIGTERM ends them with 128 + 15
+      # (inner.sh, stop). Anything else is a crash or an error exit.
+      s=0
+      kill -TERM $pid || { wait $pid || s=$?; echo "$srv exited with $s before SIGTERM:"; tail -n 5 "$log"; exit 1; }
+      wait $pid || s=$?
+      [ -z "$drain" ] || wait $drain
+      case $srv in lsrv-*) want=0 ;; *) want=143 ;; esac
+      [ $s -eq $want ] || { echo "$srv exited with $s after SIGTERM, want $want:"; tail -n 5 "$log"; exit 1; }
       g() { awk -v k="$1" '$1 == k { print $2 }' "$out/trace-$tag.txt"; }
       resp=$(awk '/requests in/ { print $1 }' "$out/gc-$tag.txt")
       echo "$tag cpu_ticks=$((c1 - c0)) responses=$resp over5s=$(awk '/overflow/ { print $NF }' "$out/gc-$tag.txt")" \

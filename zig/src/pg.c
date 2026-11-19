@@ -183,11 +183,26 @@ unsigned ekk_query_timeout_ms(lean_object *q, unsigned dflt, unsigned ceiling) {
    may hold options this explicit value would replace; 2 out of memory;
    3 when those options end in an unpaired backslash, which PostgreSQL
    would read as escaping the separator, joining the next token to the
-   last one (its option splitting, pg_split_opts). */
+   last one (its option splitting, pg_split_opts); 4 with *out set
+   (malloc'd) to libpq's message when the conninfo does not parse
+   (PQconninfoParse: "If errmsg is not NULL, then *errmsg is set to NULL on
+   success, else to a malloc'd error string explaining the problem").
+   PQconninfoParse returns NULL with no message only when out of memory
+   (that passage: "It is also possible for *errmsg to be set to NULL and the
+   function to return NULL; this indicates an out-of-memory condition"). */
 int ekk_pg_options(const char *conninfo, unsigned statement_ms, char **out) {
     const char *base = NULL;
     int named_service = getenv("PGSERVICE") != NULL;
-    PQconninfoOption *opts = PQconninfoParse(conninfo, NULL);
+    char *err = NULL;
+    PQconninfoOption *opts = PQconninfoParse(conninfo, &err);
+    if (opts == NULL) {
+        if (err == NULL) return 2;
+        size_t n = strlen(err) + 1;
+        *out = malloc(n);
+        if (*out != NULL) memcpy(*out, err, n);
+        PQfreemem(err);
+        return *out == NULL ? 2 : 4;
+    }
     for (PQconninfoOption *o = opts; o && o->keyword; o++) {
         if (o->val == NULL) continue;
         if (strcmp(o->keyword, "service") == 0) named_service = 1;

@@ -174,12 +174,13 @@ structure Options where
   chunk : Nat := 0
   failEvery : Nat := 0
   trace : Bool := false
+  reportRecv : Bool := false
   crashAfterRecv : Nat := 0
   crashAfterSend : Nat := 0
 
 @[extern "ekk_serve"]
 opaque serve (port : UInt16) (threads : UInt32) (maxConns : UInt32) (pg : @& String) (pgConns : UInt32)
-  (idleMs headMs bodyMs writeMs : UInt32) (pgQueryMs pgQueryMaxMs pgConnectMs pgStatementMs : UInt32) (drainMs : UInt32) (chunk : USize) (failEvery : UInt32) (trace : UInt8) (crashAfterRecv : UInt32) (crashAfterSend : UInt32) : UInt8
+  (idleMs headMs bodyMs writeMs : UInt32) (pgQueryMs pgQueryMaxMs pgConnectMs pgStatementMs : UInt32) (drainMs : UInt32) (chunk : USize) (failEvery : UInt32) (flags : UInt8) (crashAfterRecv : UInt32) (crashAfterSend : UInt32) : UInt8
 
 def parseArgs : List String → Options → Except String Options
   | [], o => .ok o
@@ -204,10 +205,12 @@ def parseArgs : List String → Options → Except String Options
     | "--crash-after-recv", some k => parseArgs rest { o with crashAfterRecv := k }
     | "--crash-after-send", some k => parseArgs rest { o with crashAfterSend := k }
     | "--trace", _ => parseArgs (n :: rest) { o with trace := true }
+    | "--report-recv", _ => parseArgs (n :: rest) { o with reportRecv := true }
     | _, _ => match flag.toNat? with
       | some k => parseArgs (n :: rest) { o with threads := k }
       | none => .error s!"unknown argument or not a number: {flag} {n}"
   | ["--trace"], o => .ok { o with trace := true }
+  | ["--report-recv"], o => .ok { o with reportRecv := true }
   | [a], o => match a.toNat? with
     | some k => .ok { o with threads := k }
     | none => .error s!"unknown argument: {a}"
@@ -215,8 +218,8 @@ def parseArgs : List String → Options → Except String Options
 /-- `[THREADS] [--port N] [--max-conns N] [--pg CONNINFO] [--pg-conns N]
 [--idle-ms N] [--head-ms N] [--body-ms N] [--write-ms N] [--pg-query-ms N]
 [--pg-query-max-ms N] [--pg-connect-ms N] [--pg-statement-ms N] [--drain-ms N] [--chunk N]
-[--fail-every N] [--trace] [--crash-after-recv N] [--crash-after-send N]`;
-the last five are the loop's test settings. Serves on 127.0.0.1:PORT (default
+[--fail-every N] [--trace] [--report-recv] [--crash-after-recv N]
+[--crash-after-send N]`; the last six are the loop's test settings. Serves on 127.0.0.1:PORT (default
 8083) until SIGTERM or SIGINT, then shuts down gracefully and returns 0
 (docs/production-contract.md). Once listening it prints `listening on
 127.0.0.1:PORT ...` to stderr; when the port cannot be had it prints why,
@@ -247,6 +250,6 @@ def main (args : List String) : IO UInt32 := do
     return (serve o.port.toUInt16 o.threads.toUInt32 o.maxConns.toUInt32 o.pg pgConns.toUInt32
       o.idleMs.toUInt32 o.headMs.toUInt32 o.bodyMs.toUInt32 o.writeMs.toUInt32
       o.pgQueryMs.toUInt32 o.pgQueryMaxMs.toUInt32 o.pgConnectMs.toUInt32 o.pgStatementMs.toUInt32 o.drainMs.toUInt32 o.chunk.toUSize o.failEvery.toUInt32
-      (if o.trace then 1 else 0) o.crashAfterRecv.toUInt32 o.crashAfterSend.toUInt32).toUInt32
+      ((if o.trace then 1 else 0) ||| (if o.reportRecv then 2 else 0)) o.crashAfterRecv.toUInt32 o.crashAfterSend.toUInt32).toUInt32
 
 end Server.Transport

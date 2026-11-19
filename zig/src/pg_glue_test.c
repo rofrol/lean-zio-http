@@ -787,6 +787,11 @@ static void startup_options(void) {
     char *out = NULL;
     CHECK(ekk_pg_options("host=/tmp", ms, &out) == 1, "PGSERVICE not refused");
     unsetenv("PGSERVICE");
+    /* A conninfo libpq cannot parse is refused with libpq's own message. */
+    char *msg = NULL;
+    CHECK(ekk_pg_options("host=/tmp x", ms, &msg) == 4, "an unparsable conninfo not refused");
+    CHECK(msg != NULL && strstr(msg, "missing \"=\" after \"x\"") != NULL, "message \"%s\"", msg ? msg : "(none)");
+    free(msg);
 }
 
 /* ---- what a result costs (pg.c: rows_take, charge, object_cost) ----

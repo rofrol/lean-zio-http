@@ -42,6 +42,10 @@ pub fn build(b: *std.Build) void {
     // libpq against a fake PostgreSQL server, so it links libpq and the Lean
     // runtime.
     const test_step = b.step("test", "Run the PostgreSQL pool's and the transport's tests");
+    // `zig build test-bins`: the same test binaries, built and installed under
+    // their own names (bin/pg_test, bin/serve_test, bin/pg_glue_test) without
+    // running them, for a run on another machine (bench/arena/build.sh).
+    const bins_step = b.step("test-bins", "Build and install the test binaries without running them");
     const pool_mod = b.createModule(.{
         .root_source_file = b.path("src/pg_test.zig"),
         .target = target,
@@ -49,8 +53,9 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     pool_mod.addImport("zio", zio.module("zio"));
-    const pool_tests = b.addTest(.{ .root_module = pool_mod });
+    const pool_tests = b.addTest(.{ .name = "pg_test", .root_module = pool_mod });
     test_step.dependOn(&b.addRunArtifact(pool_tests).step);
+    bins_step.dependOn(&b.addInstallArtifact(pool_tests, .{}).step);
     // serve_test.zig runs serve.zig's shutdown and admission on real loops,
     // with a fake of glue.c (docs/production-contract.md).
     const serve_mod = b.createModule(.{
@@ -64,8 +69,9 @@ pub fn build(b: *std.Build) void {
     const test_options = b.addOptions();
     test_options.addOption(LinuxBackend, "linux_backend", linux_backend);
     serve_mod.addOptions("build_options", test_options);
-    const serve_tests = b.addTest(.{ .root_module = serve_mod });
+    const serve_tests = b.addTest(.{ .name = "serve_test", .root_module = serve_mod });
     test_step.dependOn(&b.addRunArtifact(serve_tests).step);
+    bins_step.dependOn(&b.addInstallArtifact(serve_tests, .{}).step);
 
     // `zig build cleanup-controls`: serve_test.zig's tests after two negative
     // controls of Single.deinit (src/cleanup_controls_test.zig). It fails by
@@ -86,6 +92,7 @@ pub fn build(b: *std.Build) void {
     const pq_lib = b.option([]const u8, "pq-lib", "libpq library directory (tests)");
     if (lean_lib == null or pq_lib == null) {
         test_step.dependOn(&b.addFail("zig build test needs -Dlean-lib and -Dpq-lib").step);
+        bins_step.dependOn(&b.addFail("zig build test-bins needs -Dlean-lib and -Dpq-lib").step);
         return;
     }
     const glue_mod = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true });
@@ -108,4 +115,5 @@ pub fn build(b: *std.Build) void {
     // libraries) needs dladdr from libdl.so.2. Recheck at a Zig update.
     const glue_tests = b.addExecutable(.{ .name = "pg_glue_test", .root_module = glue_mod });
     test_step.dependOn(&b.addRunArtifact(glue_tests).step);
+    bins_step.dependOn(&b.addInstallArtifact(glue_tests, .{}).step);
 }

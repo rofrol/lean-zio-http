@@ -2052,10 +2052,14 @@ var multi: *Multi = undefined;
 
 fn snapCb(_: *ev.Loop, comp: *ev.Completion) void {
     const a: *ev.Async = @fieldParentPtr("c", comp);
-    a.getResult() catch {
-        // Canceled by the loop's shutdown: the handle ends here.
-        comp.flags.rearm = false;
-        return;
+    // An exhaustive switch: an error other than the shutdown's cancel (none in
+    // the pinned zio, whose Async.Error is Cancelable) fails to compile here.
+    a.getResult() catch |err| switch (err) {
+        error.Canceled => {
+            // Canceled by the loop's shutdown: the handle ends here.
+            comp.flags.rearm = false;
+            return;
+        },
     };
     const lp: *serve.LoopCtx = @ptrCast(@alignCast(comp.userdata.?));
     var conns: u32 = 0;
