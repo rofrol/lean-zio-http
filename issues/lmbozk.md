@@ -4,7 +4,7 @@ Found by item r4q3yu's diff review (consult round 20261119-004751-15c7; sol and 
 
 The same scripts tag their images with fixed names (`lsrv-linux-check`; profile.sh's `lsrv-parse-profile` is `FROM lsrv-linux-check`), so two overlapping runs that change linux/Dockerfile may build and run against different images.
 
-Options:
+Options considered:
 1. Share one snapshot helper (in bench/lib.sh or a small script) that lists only paths present in the working tree (symlinks kept), and use it in the three scripts.
 2. Leave it: a deleted tracked file is staged or restored before such a run.
 
