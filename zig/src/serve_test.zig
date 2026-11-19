@@ -31,14 +31,18 @@
 //! Linux (epoll and io_uring, `./linux-check.sh`, docs/running.md; rerun it
 //! at each zio update and update this record). Each run below names the
 //! commit it ran and counts the tests that commit held; a test added after
-//! the last run here has not run on Linux. Last Linux run, 2026-11-18
-//! (item qgrnr3, commit 7b4e08f): OrbStack on the M1, aarch64, kernel
+//! the last run here has not run on Linux. Last Linux run, 2026-11-19
+//! (item 3pund6, on the tree of the commit that moved zio's pin to
+//! f8ca47367765): OrbStack on the M1, aarch64, kernel
 //! 7.2.12-orbstack-00394-gbecdd6130068, Debian 13.7, Zig 0.17.1, Lean
-//! nightly-2026-11-17, libpq 17.12, zio 53ed3c377317. `./linux-check.sh`
-//! exit 0, on epoll and on io_uring each: `zig build test` passed (it prints
-//! no count; at 7b4e08f serve_test.zig held 40 tests and pg_test.zig 32),
-//! pg_glue_test passed, and the rest of `./check.sh`, bench/dbcheck on the
-//! container's private cluster included. On the production host, 2026-11-17 (item 53rwgc,
+//! nightly-2026-11-17, libpq 17.12, zio f8ca47367765. A copy of
+//! `./linux-check.sh` that runs `git init -q && git add -A` in the
+//! container before `./check.sh` (the script as committed fails there:
+//! check.sh's mdlinks runs `git ls-files`, and the container's tree has no
+//! repository), exit 0, on epoll and on io_uring each: `zig build test`
+//! passed (it prints no count; serve_test.zig held 45 tests and pg_test.zig
+//! 40), pg_glue_test passed, and the rest of `./check.sh`, mdlinks and
+//! bench/dbcheck on the container's private cluster included. On the production host, 2026-11-17 (item 53rwgc,
 //! commit 3ce9bdc; its rerun of 2026-11-18 is in docs/reports/httparena-vps.md): x86_64, 2 vCPU, kernel 6.12.74+deb13+1-amd64,
 //! Debian 13.4, the same versions, binaries cross-built by
 //! bench/arena/build.sh: serve_test's 25 tests and pg_test's 31 (all that
@@ -557,6 +561,8 @@ pub const Single = struct {
         due_injected = null;
         serve.testing = .{};
         serve.accept_batch = serve.default_accept_batch;
+        // A backoff's timer ends only when a test makes it due.
+        serve.backoff_first_ms = never;
         serve.budget_ms = .{ never, never, never, never };
         serve.drain_ms = never;
         stops = 0;
@@ -721,7 +727,7 @@ test "startLoop joins its loop to no LoopGroup: the loop alone services its sock
     // LoopGroup joins them (serve.zig, the comment above
     // `for (loops) |*lp| lp.* = .{ .lfd = lfd };` in `ekk_serve`). Checked
     // on the state `loop.init` left, not on how its options are spelled: in
-    // the pinned zio (53ed3c377317) a loop given no `loop_group` uses its own
+    // the pinned zio (f8ca47367765) a loop given no `loop_group` uses its own
     // `internal_loop_group`, and every loop of a group counts in its `loops`
     // (src/ev/loop.zig:515-516, 559-563, 574); the registration table its
     // sockets park on is that group's (loop.zig:582). Recheck at each update
@@ -912,7 +918,7 @@ const due_at_once: u32 = 0;
 
 /// Moves the connection's current deadline to now (a test hook): its timer
 /// is due at the loop's next timer check, which comes before its I/O in
-/// every poll (zio 53ed3c377317, `Loop.poll`: `checkTimers`, then the
+/// every poll (zio f8ca47367765, `Loop.poll`: `checkTimers`, then the
 /// backend, then the queued completions).
 fn dueNow(s: *Single) void {
     const conn = s.lp.head.?;
@@ -1555,7 +1561,7 @@ fn partialSend(s: *Single) !PartialSend {
 /// callback (whether the send was still in the kernel when the expiry ran,
 /// and whether the cancel was asked after it), `sendSpy` before the send's
 /// (what its one completion carried). zio's `Loop.cancel`
-/// (pinned 53ed3c377317, src/ev/loop.zig) says "the completion's callback
+/// (pinned f8ca47367765, src/ev/loop.zig) says "the completion's callback
 /// will still be invoked when the operation completes (either with
 /// error.Canceled or its natural result)", and a cancel of a completion
 /// already completed is a no-op (src/ev/completion.zig, `requestCancel`:
@@ -1690,7 +1696,7 @@ test "a write deadline the loop runs before a ready send's completion closes, an
     // The parked send can make progress and the write deadline is due
     // before the loop polls again. In that poll zio checks the timers, then
     // the backend completes the send with what it wrote, then the queued
-    // callbacks run, the timer's first (zio 53ed3c377317, `Loop.poll`): the
+    // callbacks run, the timer's first (zio f8ca47367765, `Loop.poll`): the
     // expiry closes and asks to cancel the send, too late, and the send's
     // completion, with its natural result, only leads to the close.
     try spyOnSend(conn);
@@ -1893,8 +1899,8 @@ test "connections pending when the accept's callback runs are all opened in that
     try std.testing.expectEqual(@as(usize, 5), s.count(.open));
     // EAGAIN ended the batch with slots free: the accept is armed again,
     // holding one slot beside the five connections'.
-    try std.testing.expect(s.lp.armed);
-    try std.testing.expect(!s.lp.paused);
+    try std.testing.expect(s.lp.acceptor == .armed);
+    try std.testing.expect(s.lp.acceptor != .paused);
     try std.testing.expectEqual(@as(u32, 6), serve.slots_used.load(.monotonic));
     // And it takes a client that comes later.
     const late = try s.listener.connect();
@@ -1985,8 +1991,8 @@ test "when the slots run out the callback stops, admission pauses, and a release
     // still in the listen queue.
     try s.stepUntil(.open, 1);
     try std.testing.expectEqual(@as(usize, 3), s.count(.open));
-    try std.testing.expect(!s.lp.armed);
-    try std.testing.expect(s.lp.paused);
+    try std.testing.expect(s.lp.acceptor != .armed);
+    try std.testing.expect(s.lp.acceptor == .paused);
     try std.testing.expectEqual(@as(u32, 3), serve.slots_used.load(.monotonic));
     // The first client hangs up: its close releases a slot, the acceptor
     // re-arms with it and opens one more, then finds no slot again.
@@ -1997,8 +2003,8 @@ test "when the slots run out the callback stops, admission pauses, and a release
     try s.lp.loop.poll(.zero);
     s.collect();
     try std.testing.expectEqual(@as(usize, 4), s.count(.open));
-    try std.testing.expect(!s.lp.armed);
-    try std.testing.expect(s.lp.paused);
+    try std.testing.expect(s.lp.acceptor != .armed);
+    try std.testing.expect(s.lp.acceptor == .paused);
     try std.testing.expectEqual(@as(u32, 3), serve.slots_used.load(.monotonic));
     try std.testing.expectEqual(@as(u32, 3), openConns(&s));
     s.lp.stop.notify();
@@ -2022,7 +2028,7 @@ test "a direct accept that fails releases its slot, and the callback goes on wit
     // Only the completion's connection opened; both failed accepts gave
     // their slots back, and the accept is armed again.
     try std.testing.expectEqual(@as(usize, 1), s.count(.open));
-    try std.testing.expect(s.lp.armed);
+    try std.testing.expect(s.lp.acceptor == .armed);
     try std.testing.expectEqual(@as(u32, 2), serve.slots_used.load(.monotonic));
     // The two failed connections were taken from the queue and closed:
     // their clients read the end of input at once (a client still queued,
@@ -2033,6 +2039,80 @@ test "a direct accept that fails releases its slot, and the callback goes on wit
     }
     s.lp.stop.notify();
     try s.stepUntil(.free, 1);
+    try s.finish();
+}
+
+test "a backoff starts at its first delay, doubles while accepts keep failing, and stops at its cap" {
+    serve.backoff_first_ms = serve.LoopCtx.default_backoff_first_ms;
+    defer serve.backoff_first_ms = never;
+    const want = [_]u32{ 5, 10, 20, 40, 80, 160, 320, 640, 1000, 1000 };
+    var ms: u32 = 0;
+    for (want) |w| {
+        ms = serve.LoopCtx.nextBackoff(ms);
+        try std.testing.expectEqual(w, ms);
+    }
+}
+
+/// Takes the connection the first accept completes and backs off on the
+/// next, which a direct accept reports as SystemResources (a shortage of
+/// memory; zio's documentation, at `Server.accept`: back off rather than
+/// exit). `clients[2]` stays queued.
+fn backOffOnSecond(s: *Single, clients: *[3]c.fd_t) !void {
+    serve.testing.fail_accept_every = 1;
+    serve.testing.fail_accept_with = error.SystemResources;
+    try connectAll(s, clients);
+    try s.stepUntil(.open, 1);
+    // The completion's connection opened; the failed direct accept gave its
+    // slot back and stopped the callback, and no accept is armed while the
+    // backoff runs.
+    try std.testing.expectEqual(@as(usize, 1), s.count(.open));
+    try std.testing.expect(s.lp.acceptor == .backing_off);
+    try std.testing.expectEqual(serve.backoff_first_ms, s.lp.backoff_ms);
+    try std.testing.expectEqual(@as(u32, 1), serve.slots_used.load(.monotonic));
+    var b: [1]u8 = undefined;
+    // The failed connection was taken from the queue and closed.
+    try std.testing.expectEqual(@as(isize, 0), c.recv(clients[1], &b, 1, c.MSG.DONTWAIT));
+}
+
+test "an accept short of memory backs off without a slot or an accept armed, and the backoff's end accepts again" {
+    var s: Single = undefined;
+    try s.initOn(64, .unix);
+    defer s.deinit();
+    var clients = [3]c.fd_t{ -1, -1, -1 };
+    defer closeAll(&clients);
+    try backOffOnSecond(&s, &clients);
+    // Polls before the backoff ends arm nothing: the third client stays queued.
+    for (0..3) |_| try s.lp.loop.poll(.zero);
+    s.collect();
+    try std.testing.expectEqual(@as(usize, 1), s.count(.open));
+    try std.testing.expect(s.lp.acceptor == .backing_off);
+    // The backoff ends: the accept re-arms and takes the third client, a
+    // successful accept, which ends the episode (the next failure starts
+    // again from the first delay).
+    s.lp.loop.setTimer(&s.lp.backoff, .{ .duration = .zero });
+    try s.stepUntil(.open, 2);
+    try std.testing.expectEqual(@as(u32, 0), s.lp.backoff_ms);
+    try s.lp.loop.poll(.zero);
+    s.collect();
+    try std.testing.expect(s.lp.acceptor == .armed);
+    try std.testing.expectEqual(@as(u32, 3), serve.slots_used.load(.monotonic));
+    s.lp.stop.notify();
+    try s.stepUntil(.free, 2);
+    try s.finish();
+}
+
+test "the shutdown takes off a backoff's timer, so the loop ends without it" {
+    var s: Single = undefined;
+    try s.initOn(64, .unix);
+    defer s.deinit();
+    var clients = [3]c.fd_t{ -1, -1, -1 };
+    defer closeAll(&clients);
+    try backOffOnSecond(&s, &clients);
+    s.lp.stop.notify();
+    try s.stepUntil(.free, 1);
+    // The backoff's timer (never due here) is out of the loop, so its run
+    // returns; a timer left in it would hold the run.
+    try std.testing.expect(s.lp.acceptor == .idle);
     try s.finish();
 }
 
@@ -2065,7 +2145,7 @@ fn snapCb(_: *ev.Loop, comp: *ev.Completion) void {
     var conns: u32 = 0;
     var it = lp.head;
     while (it) |conn| : (it = conn.next) conns += 1;
-    emit(.{ .kind = .snapshot, .loop = loop_index, .armed = lp.armed, .paused = lp.paused, .n = conns, .slots = serve.slots_used.load(.acquire) });
+    emit(.{ .kind = .snapshot, .loop = loop_index, .armed = lp.acceptor == .armed, .paused = lp.acceptor == .paused, .n = conns, .slots = serve.slots_used.load(.acquire) });
 }
 
 /// The shutdown in the multi-loop test: serve.zig's, then the end of the
@@ -2465,7 +2545,7 @@ test "the loop does not take its stop while the stop's notifier is still waking 
 // (`forward`) in the order the test names. zio allows this: "The completion
 // is already dead when it runs, and for a completion with neither `rearm`
 // nor a group or queue owner the loop does not touch it after the callback
-// returns" (53ed3c377317, src/ev/completion.zig, `Completion.callback`, as
+// returns" (f8ca47367765, src/ev/completion.zig, `Completion.callback`, as
 // cited at serve.zig's `Op`), and no completion held here has either. So
 // serve.zig sees the same calls, with the results the kernel gave, as when a
 // backend completes them in that order. The tests assert what serve.zig

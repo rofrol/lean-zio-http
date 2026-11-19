@@ -57,7 +57,7 @@ only `Server.Query` values.
   carries no data ([Production contract](production-contract.md), "Deadlines"),
   and a close waits for that poll's completion. Reusing a
   connection's completion from its own callback relies on zio's documented
-  contract (pinned 53ed3c377317, `src/ev/completion.zig`, `Completion.callback`,
+  contract (pinned f8ca47367765, `src/ev/completion.zig`, `Completion.callback`,
   https://github.com/lalinsky/zio/pull/929): "The completion is already dead
   when it runs, and for a completion with neither `rearm` nor a group or queue
   owner the loop does not touch it after the callback returns. The callback

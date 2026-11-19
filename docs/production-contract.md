@@ -96,30 +96,36 @@
   backlog is taken. At startup the soft `RLIMIT_NOFILE`
   is raised to fit `--max-conns` plus a reserve, or the server refuses to
   start.
-- **Accept errors.** Errors of the one pending connection (`ECONNABORTED`,
-  protocol and firewall errors, `ENETDOWN`) and a spurious `EAGAIN` re-arm
-  the accept. Exhaustion (`EMFILE`, `ENFILE`, `ENOBUFS`/`ENOMEM`) and errors
-  of the listening socket itself end the process with status 1 and a
-  `fatal:` line: the descriptor limit was checked at startup, so exhaustion
-  comes from outside the server and nothing in it waits for that to end; a
-  supervisor restarts it. Linux's accept(2) lists further errors of a
-  pending connection (`ENETUNREACH`, `EHOSTUNREACH`, `EHOSTDOWN`, `ENONET`,
-  `ENOPROTOOPT`, `EOPNOTSUPP`: "treat them like EAGAIN by retrying"). The
-  pinned zio maps them to `Unexpected` (through `unexpectedError`, which logs
-  "please file a bug report") or `OperationNotSupported`, which also stand
-  for errors of a broken listening socket (`src/os/net.zig`,
-  `errnoToAcceptError`), so they end the process. In the Linux sources read
-  (v5.4, v6.1 and mainline aebb727, on 2026-11-16), TCP's accept, for IPv4
-  and IPv6 and also through io_uring, passes no pending connection's network
-  error to the caller: `inet_accept` returns only the error of
-  `inet_csk_accept`, which fails only with `EINVAL` (not listening),
-  `EAGAIN` or the error of its wait for a connection. That is a reading of
-  those revisions, not a guarantee for every kernel or security module. zio
-  documents no meaning for these errnos and no passage names them as a
-  limitation; whether its mapping is a bug stays unresolved, and the owner
-  decides whether anything follows (item xihdtw's outcome). Re-arming on
-  `Unexpected` unconditionally would repeat a persistent error of the
-  listening socket.
+- **Accept errors.** They follow zio's documented `AcceptError`
+  (`src/os/net.zig` at the pin) and its advice on `Server.accept`
+  (`src/net.zig`). An error of the one pending connection
+  (`ConnectionAborted`: "A queued connection failed before it was
+  accepted: aborted or reset by the peer, or (Linux) a network error that
+  was pending on it. The queue has moved past it, so the next accept gets
+  another connection"), a firewall's or security module's refusal
+  (`BlockedByFirewall`, `EPERM` or `EACCES`) and a spurious `EAGAIN`
+  re-arm the accept. On Linux zio maps accept(2)'s pending-connection
+  errnos (`ENETDOWN`, `EPROTO`, `ENETUNREACH`, `EHOSTUNREACH`, `EHOSTDOWN`,
+  `ENONET`, `ENOPROTOOPT`, `ETIMEDOUT`) to `ConnectionAborted` since
+  https://github.com/lalinsky/zio/pull/934, the answer to our question
+  https://github.com/lalinsky/zio/issues/931; elsewhere `EPROTO` and
+  `ENETDOWN` arrive as `ProtocolFailure` and `NetworkDown` and re-arm too.
+  A shortage of descriptors or memory (`EMFILE`, `ENFILE`,
+  `ENOBUFS`/`ENOMEM`) backs off: "The descriptor limits and
+  `SystemResources` are a temporary shortage, so a server should back off
+  and accept again rather than exit on them." The loop gives back the
+  accept's slot, arms no accept, and when its backoff timer ends arms it
+  again, or pauses as under "Admission" when no slot is free then:
+  5 ms after the first failure since a successful accept, doubling with
+  each further failure up to 1 s (as Go's net/http does); a successful
+  accept ends the episode. It prints `accept: <error>; backing off until
+  an accept succeeds` at an episode's first failure and `accept:
+  recovered` at its end. Established connections are served meanwhile, and
+  the shutdown takes the timer off. Errors of the listening socket itself
+  (`EOPNOTSUPP`, which zio keeps as `OperationNotSupported`: "The socket
+  type does not accept connections, such as a datagram socket"; `EINVAL`)
+  and errors zio does not name (`Unexpected`) end the process with status
+  1 and a `fatal:` line; re-arming on them would repeat a persistent error.
 - **Shutdown.** SIGTERM or SIGINT starts a graceful shutdown: each loop stops
   accepting (its armed accept is canceled; a connection accepted meanwhile is
   closed), cancels every receive in flight and declines every later one

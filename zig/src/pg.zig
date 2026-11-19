@@ -153,7 +153,7 @@ fn due(t: zio.Timestamp, at: zio.Timestamp) bool {
 /// checks that `startLoop` joins none). This is the runtime backstop behind
 /// that test: grouped loops complete each other's parked socket ops on the
 /// completing loop's thread, and zio passes that completing loop to the
-/// callback. It relies on zio's callback dispatch at the pin (53ed3c377317):
+/// callback. It relies on zio's callback dispatch at the pin (f8ca47367765):
 /// `Completion.call(loop)` calls the callback with the loop whose state
 /// completes it (src/ev/completion.zig:491-495, src/ev/loop.zig:310-362);
 /// recheck at each update of zio. An explicit `@panic`, not
@@ -209,7 +209,7 @@ pub const Slot = struct {
     /// `recvReady` and `sendReady` re-arm their own completion through here,
     /// and `closed` may re-add `closer` (through `connectStep`, `Pool.next`
     /// and a failed send's `teardown`). zio documents that a callback may
-    /// reuse its completion's memory and `add` it again (pinned 53ed3c377317,
+    /// reuse its completion's memory and `add` it again (pinned f8ca47367765,
     /// src/ev/completion.zig:294-305, `Completion.callback`,
     /// https://github.com/lalinsky/zio/pull/929): "for a completion with
     /// neither `rearm` nor a group or queue owner the loop does not touch it
@@ -716,7 +716,7 @@ pub const Pool = struct {
     /// Puts the rest of a chain on the loop's runnable queue: `cont`, added
     /// and notified, completes at the loop's next check of its handles, and
     /// a completion queued while the loop runs callbacks waits for the next
-    /// tick (pinned 53ed3c377317, src/ev/completion.zig `Async.Pending`;
+    /// tick (pinned f8ca47367765, src/ev/completion.zig `Async.Pending`;
     /// src/ev/loop.zig `processCompletions`: "Drain only what was queued at
     /// entry ... The rest runs next tick"), so the loop serves the other
     /// work that is ready before the chain goes on. An armed handle keeps
@@ -773,7 +773,7 @@ pub const Pool = struct {
 
     /// Arms the unregistered timer for `at` by initializing it afresh and
     /// adding it, which zio documents for a timer that is not registered
-    /// (pinned 53ed3c377317): from `timerCb`, the completion whose callback
+    /// (pinned f8ca47367765): from `timerCb`, the completion whose callback
     /// is running, `Completion.callback` (src/ev/completion.zig:294-305,
     /// https://github.com/lalinsky/zio/pull/929): "for a completion with
     /// neither `rearm` nor a group or queue owner the loop does not touch it

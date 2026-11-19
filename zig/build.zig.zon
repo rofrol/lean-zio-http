@@ -6,8 +6,8 @@
     .paths = .{ "build.zig", "build.zig.zon", "src" },
     .dependencies = .{
         .zio = .{
-            .url = "git+https://github.com/lalinsky/zio#53ed3c3773179a5c34aeca6b7e61aa5817accaee",
-            .hash = "zio-0.20.1-xHbVVHZrLwDgu_C5K7zM6If_GttrcgX8_lhwwnml3s-N",
+            .url = "git+https://github.com/lalinsky/zio#f8ca47367765b46a0636e3836bc059dcd10630a7",
+            .hash = "zio-0.20.1-xHbVVHJ5LwDFkA-H60i6talbpUANhbMq2ZrtL_FU8ygK",
         },
     },
 }

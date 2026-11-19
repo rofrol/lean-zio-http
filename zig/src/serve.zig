@@ -106,8 +106,10 @@ const Testing = struct {
     crash_after_send: u32 = 0,
     /// Every this-many-th connection an accept callback takes itself
     /// (`LoopCtx.acceptOne`, counted across loops) is closed and reported as
-    /// an accept error when nonzero. Set only by the transport's tests.
+    /// an accept error when nonzero, `fail_accept_with`. Set only by the
+    /// transport's tests.
     fail_accept_every: u32 = 0,
+    fail_accept_with: net.AcceptError = error.ConnectionAborted,
 };
 pub var testing: Testing = .{};
 var accept_count = std.atomic.Value(u32).init(0);
@@ -154,13 +156,16 @@ fn fatal(comptime fmt: []const u8, args: anytype) noreturn {
 /// see its close (a slot held by an armed accept becomes a connection or is
 /// released on that loop; one reserved for a direct accept is, within the
 /// same callback), so whenever a slot is free some acceptor is armed or is
-/// about to re-arm.
+/// about to re-arm. A loop backing off from a shortage of descriptors or
+/// memory (`LoopCtx.backOff`) holds no slot and counts as about to re-arm:
+/// when its timer ends it arms, or pauses if the slots were taken meanwhile,
+/// so a free slot may wait up to the backoff's delay for an acceptor.
 pub var slots_used = std.atomic.Value(u32).init(0);
 pub var max_conns: u32 = 0;
 
 /// The most connections one accept callback opens, counting the one its
 /// completion returned (item sakmfp). zio queues the completion of an accept
-/// added from its own callback for the loop's next turn (53ed3c377317,
+/// added from its own callback for the loop's next turn (f8ca47367765,
 /// src/ev/loop.zig, `processCompletions`: "Drain only what was queued at
 /// entry ... The rest runs next tick"), so one connection per callback
 /// admitted one per turn, and under HttpArena's 4,096 connections about half
@@ -170,6 +175,8 @@ pub var max_conns: u32 = 0;
 /// while a backlog is taken. The tests (serve_test.zig) lower it.
 pub const default_accept_batch: u32 = 64;
 pub var accept_batch: u32 = default_accept_batch;
+/// The first delay of an accept's backoff (`LoopCtx.nextBackoff`).
+pub var backoff_first_ms: u32 = LoopCtx.default_backoff_first_ms;
 
 fn reserveSlot() bool {
     var used = slots_used.load(.monotonic);
@@ -263,7 +270,7 @@ const OpKind = enum { recv, send, wrote, close, query };
 /// connection that holds it (`closeCb` through `destroy`); `pollCb` re-adds
 /// `poll`; `acceptCb` re-initializes and re-adds `accept`; `Arm.timerCb`
 /// frees the `Arm` that holds its timer; `readyCb` may re-add `wake`. zio
-/// documents that this is allowed (pinned 53ed3c377317, src/ev/completion.zig:294-305,
+/// documents that this is allowed (pinned f8ca47367765, src/ev/completion.zig:294-305,
 /// `Completion.callback`, https://github.com/lalinsky/zio/pull/929): "The
 /// completion is already dead when it runs, and for a completion with
 /// neither `rearm` nor a group or queue owner the loop does not touch it
@@ -330,7 +337,7 @@ pub const Conn = struct {
     /// Retired arms whose callbacks are still to run: the connection is
     /// freed only after the last of them.
     ///
-    /// Under the pinned zio (53ed3c377317) a close never completes before a
+    /// Under the pinned zio (f8ca47367765) a close never completes before a
     /// retired arm's callback, so `closeCb` always finds this at 0 and the
     /// `closed` branch in `Arm.timerCb` is not taken. From zio's source:
     /// every completion here keeps `defer_callback = true`
@@ -748,13 +755,30 @@ pub const Conn = struct {
 /// shutdown handle. Touched only by the loop's own thread, except `stop`,
 /// which the signal thread notifies.
 pub const LoopCtx = struct {
+    /// The acceptor's state.
+    pub const Acceptor = enum {
+        /// Nothing armed or waited for: within an accept callback, before
+        /// the first arm, and after the shutdown.
+        idle,
+        /// An accept is in flight (it holds a slot).
+        armed,
+        /// No slot was free when the acceptor was to be re-armed; a close
+        /// of one of this loop's connections re-arms it (`resumeAccept`).
+        paused,
+        /// An accept failed for want of descriptors or memory; the
+        /// `backoff` timer re-arms it (`backOff`).
+        backing_off,
+    };
+
     loop: ev.Loop = undefined,
     lfd: ev.Backend.NetHandle,
     accept: ev.NetAccept = undefined,
-    /// An accept is in flight (it holds a slot).
-    armed: bool = false,
-    /// No slot was free when the acceptor was to be re-armed.
-    paused: bool = false,
+    acceptor: Acceptor = .idle,
+    /// The exhaustion backoff's timer, in the loop while `.backing_off`.
+    backoff: ev.Timer = undefined,
+    /// The delay of the last backoff since the last successful accept (0:
+    /// none), so consecutive failures double it (`nextBackoff`).
+    backoff_ms: u32 = 0,
     stopping: bool = false,
     stop: ev.Async = undefined,
     /// The shutdown's drain (`drain_ms`), armed by the stop while
@@ -795,7 +819,7 @@ pub const LoopCtx = struct {
     /// the ready list as it was when the turn began. A connection that
     /// performs its next send meanwhile joins a new list, taken by the
     /// next turn, so one connection's response does not hold the loop.
-    /// zio documents what this relies on (53ed3c377317, src/ev/completion.zig,
+    /// zio documents what this relies on (f8ca47367765, src/ev/completion.zig,
     /// `Async.Pending`, and `Completion.callback` as cited at `Op`): a handle
     /// is out of the loop from when the loop completes it until the next
     /// `add`, and a notify of a handle in the
@@ -831,15 +855,19 @@ pub const LoopCtx = struct {
     }
 
     /// Arms the accept with a free slot, or pauses until a connection of this
-    /// loop closes.
+    /// loop closes. An armed accept, a backoff (its timer re-arms) and the
+    /// shutdown leave it as it is.
     fn armAccept(self: *LoopCtx) void {
-        if (self.stopping or self.armed) return;
+        if (self.stopping) return;
+        switch (self.acceptor) {
+            .armed, .backing_off => return,
+            .idle, .paused => {},
+        }
         if (!reserveSlot()) {
-            self.paused = true;
+            self.acceptor = .paused;
             return;
         }
-        self.paused = false;
-        self.armed = true;
+        self.acceptor = .armed;
         self.accept = ev.NetAccept.init(self.lfd, null, null);
         self.accept.c.callback = acceptCb;
         self.accept.c.userdata = self;
@@ -847,43 +875,95 @@ pub const LoopCtx = struct {
     }
 
     fn resumeAccept(self: *LoopCtx) void {
-        if (self.paused) self.armAccept();
+        if (self.acceptor == .paused) self.armAccept();
     }
 
+    /// What follows an accept error other than a cancel.
+    const AcceptNext = enum { next, back_off };
+
     /// Classifies an accept error other than a cancel: an error of the one
-    /// pending connection, or a spurious EAGAIN, returns (the caller goes
-    /// on accepting); every other ends the process.
-    fn acceptFailed(err: net.AcceptError) void {
+    /// pending connection, or a spurious EAGAIN, goes on accepting (`next`);
+    /// a shortage of descriptors or memory backs off (`back_off`); every
+    /// other ends the process. zio documents its `AcceptError`
+    /// (f8ca47367765, src/os/net.zig), and on `Server.accept` (src/net.zig)
+    /// what a server should do with the shortage.
+    fn acceptFailed(err: net.AcceptError) AcceptNext {
         switch (err) {
-            // Errors of the one pending connection (accept(2) on Linux:
-            // "treat them like EAGAIN by retrying"), and a spurious wake.
-            error.WouldBlock, error.ConnectionAborted, error.ProtocolFailure, error.BlockedByFirewall, error.NetworkDown => {},
-            // Out of descriptors or memory: --max-conns is checked against
-            // RLIMIT_NOFILE at startup, so this is pressure from outside the
-            // server; nothing of ours waits for it to end (docs/production-contract.md).
-            error.ProcessFdQuotaExceeded, error.SystemFdQuotaExceeded, error.SystemResources => fatal("accept: {}", .{err}),
-            // An error of the listening socket itself, or one zio does not
-            // name (Unexpected), or a cancel, which only the shutdown makes
-            // and only of the armed accept: fatal. Linux's other
-            // pending-connection errnos in accept(2) (ENETUNREACH,
-            // EHOSTUNREACH, EHOSTDOWN, ENONET, ENOPROTOOPT, EOPNOTSUPP) would
-            // reach here too, as the pinned zio maps them to Unexpected or
-            // OperationNotSupported (src/os/net.zig, errnoToAcceptError); the
-            // Linux sources read do not return them from TCP's accept
-            // (docs/production-contract.md, "Accept errors").
+            // "A queued connection failed before it was accepted: aborted or
+            // reset by the peer, or (Linux) a network error that was pending
+            // on it. The queue has moved past it, so the next accept gets
+            // another connection." On Linux zio maps accept(2)'s
+            // pending-connection errnos here (ENETDOWN, EPROTO, ENETUNREACH,
+            // EHOSTUNREACH, EHOSTDOWN, ENONET, ENOPROTOOPT, ETIMEDOUT;
+            // https://github.com/lalinsky/zio/issues/931). ProtocolFailure and
+            // NetworkDown are EPROTO and ENETDOWN elsewhere; BlockedByFirewall:
+            // "Firewall rules or a security policy forbid the connection"
+            // (EPERM, EACCES). WouldBlock is a spurious wake.
+            error.WouldBlock, error.ConnectionAborted, error.ProtocolFailure, error.BlockedByFirewall, error.NetworkDown => return .next,
+            // "The descriptor limits and `SystemResources` are a temporary
+            // shortage, so a server should back off and accept again rather
+            // than exit on them." (`Server.accept`)
+            error.ProcessFdQuotaExceeded, error.SystemFdQuotaExceeded, error.SystemResources => return .back_off,
+            // An error of the listening socket itself (OperationNotSupported:
+            // "The socket type does not accept connections", which zio keeps
+            // for Linux's EOPNOTSUPP too), one zio does not name (Unexpected),
+            // or a cancel, which only the shutdown makes and only of the
+            // armed accept: fatal.
             else => fatal("accept: {}", .{err}),
         }
+    }
+
+    /// The first backoff after a successful accept, and the most one grows
+    /// to by doubling: designed backoff, as Go's net/http `Server.Serve`
+    /// does on a temporary accept error (5 ms doubling to 1 s), decided in
+    /// consult round 20261119-091547-b605 (item 3pund6). Nothing announces
+    /// the end of a shortage of descriptors or kernel memory, which other
+    /// processes cause as well; the first value lets a brief one pass
+    /// unnoticed, the cap bounds the failing accepts a long one costs while
+    /// keeping recovery within 1 s. The tests (serve_test.zig) set the
+    /// first value.
+    pub const default_backoff_first_ms: u32 = 5;
+    pub const backoff_max_ms: u32 = 1000;
+
+    /// The delay after `prev` (0: the first since a successful accept).
+    pub fn nextBackoff(prev: u32) u32 {
+        return if (prev == 0) backoff_first_ms else @min(prev *| 2, backoff_max_ms);
+    }
+
+    /// The accept failed for want of descriptors or memory: no accept is
+    /// armed (its slot was released) until the backoff's timer ends. The
+    /// first failure since a successful accept prints one line; the accept
+    /// that ends the episode prints another (`open`).
+    fn backOff(self: *LoopCtx, err: net.AcceptError) void {
+        if (self.stopping) return;
+        self.backoff_ms = nextBackoff(self.backoff_ms);
+        if (self.backoff_ms == backoff_first_ms) std.debug.print("accept: {}; backing off until an accept succeeds\n", .{err});
+        self.acceptor = .backing_off;
+        self.backoff = ev.Timer.init(.none);
+        self.backoff.c.callback = backoffCb;
+        self.backoff.c.userdata = self;
+        self.loop.setTimer(&self.backoff, .fromMilliseconds(self.backoff_ms));
+    }
+
+    fn backoffCb(loop: *ev.Loop, c: *ev.Completion) void {
+        const self: *LoopCtx = @ptrCast(@alignCast(c.userdata.?));
+        pg.ownLoop(loop, &self.loop);
+        self.acceptor = .idle;
+        self.armAccept();
     }
 
     fn acceptCb(loop: *ev.Loop, c: *ev.Completion) void {
         const self: *LoopCtx = @ptrCast(@alignCast(c.userdata.?));
         pg.ownLoop(loop, &self.loop);
-        self.armed = false;
+        self.acceptor = .idle;
         const fd = self.accept.getResult() catch |err| {
             releaseSlot();
             if (err == error.Canceled) {
                 if (!self.stopping) fatal("accept canceled outside the shutdown", .{});
-            } else acceptFailed(err);
+            } else switch (acceptFailed(err)) {
+                .next => {},
+                .back_off => return self.backOff(err),
+            }
             return self.armAccept();
         };
         if (self.stopping) {
@@ -902,7 +982,8 @@ pub const LoopCtx = struct {
     /// completion returned, each with a slot reserved first. It stops at
     /// EAGAIN (the queue is empty, or another loop took the rest) and when
     /// no slot is free; `armAccept` then re-arms, or pauses until a slot of
-    /// this loop's is released. The flags are those of zio's `NetAccept`
+    /// this loop's is released. A shortage of descriptors or memory ends it
+    /// in a backoff (`backOff`), which `armAccept` leaves to its timer. The flags are those of zio's `NetAccept`
     /// (nonblocking and close-on-exec, src/ev/completion.zig), so a
     /// connection is the same whichever path accepted it.
     fn acceptMore(self: *LoopCtx) void {
@@ -912,8 +993,10 @@ pub const LoopCtx = struct {
             const fd = acceptOne(self.lfd) catch |err| {
                 releaseSlot();
                 if (err == error.WouldBlock) return;
-                acceptFailed(err);
-                continue;
+                switch (acceptFailed(err)) {
+                    .next => continue,
+                    .back_off => return self.backOff(err),
+                }
             };
             self.open(fd);
         }
@@ -921,18 +1004,22 @@ pub const LoopCtx = struct {
 
     /// One direct accept. With `testing.fail_accept_every`, every that-many-th
     /// connection it takes (counted across loops) is closed and reported as
-    /// `ConnectionAborted`, an error of the one pending connection.
+    /// `testing.fail_accept_with`.
     fn acceptOne(lfd: ev.Backend.NetHandle) net.AcceptError!ev.Backend.NetHandle {
         const fd = try net.accept(lfd, null, null, .{ .nonblocking = true });
         if (testing.fail_accept_every != 0 and (accept_count.fetchAdd(1, .monotonic) + 1) % testing.fail_accept_every == 0) {
             net.close(fd);
-            return error.ConnectionAborted;
+            return testing.fail_accept_with;
         }
         return fd;
     }
 
     /// Opens the connection `fd` accepted, with the slot it holds.
     fn open(self: *LoopCtx, fd: ev.Backend.NetHandle) void {
+        if (self.backoff_ms != 0) {
+            std.debug.print("accept: recovered\n", .{});
+            self.backoff_ms = 0;
+        }
         // TCP_NODELAY comes from the listener (openListener).
         const conn = alloc.create(Conn) catch fatal("no memory for a connection", .{});
         conn.* = .{ .fd = fd, .lp = self, .id = conn_ids.fetchAdd(1, .monotonic) };
@@ -960,8 +1047,16 @@ pub const LoopCtx = struct {
         const self: *LoopCtx = @ptrCast(@alignCast(c.userdata.?));
         pg.ownLoop(loop, &self.loop);
         self.stopping = true;
-        if (self.armed) self.loop.cancel(&self.accept.c);
-        self.paused = false; // armAccept refuses from now on
+        // armAccept refuses from now on. A backoff timer whose callback is
+        // already on its way is left to it; it finds the stop.
+        switch (self.acceptor) {
+            .armed => self.loop.cancel(&self.accept.c),
+            .paused => self.acceptor = .idle,
+            .backing_off => if (self.loop.clearTimer(&self.backoff)) {
+                self.acceptor = .idle;
+            },
+            .idle => {},
+        }
         var receives: u32 = 0;
         var sends: u32 = 0;
         var it = self.head;
@@ -1099,7 +1194,7 @@ fn awaitReadyThenStop(ready: std.c.fd_t, threads: u32, stop_fd: c_int) void {
     }
     // zio's `Async.notify` is safe at any time while the `Async` itself is
     // alive, also against its loop ending and being deinitialized (zio
-    // 53ed3c377317, https://github.com/lalinsky/zio/pull/928). Each `stop`
+    // f8ca47367765, https://github.com/lalinsky/zio/pull/928). Each `stop`
     // lives in `loops`, which is never freed, so it outlives every notify
     // here, also one still running after `ekk_serve` has returned (this
     // thread is detached and never joined).
@@ -1233,7 +1328,7 @@ export fn ekk_serve(port: u16, threads: u32, maxc: u32, conninfo: *anyopaque, co
     loops = alloc.alloc(LoopCtx, threads) catch return 1;
     // Every loop accepts on the same `lfd`, yet each accept's callback runs
     // on the thread of the loop it was added to, because the loops share no
-    // zio LoopGroup (startLoop passes none). In the pinned zio (53ed3c377317)
+    // zio LoopGroup (startLoop passes none). In the pinned zio (f8ca47367765)
     // a socket op parked on another loop's (fd, direction) registration is
     // completed by that loop, on its thread (src/ev/sockreg.zig:213-271,
     // `service` at 276-315 calling `markCompletedFromBackend`, which calls the
