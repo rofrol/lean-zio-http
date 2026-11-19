@@ -31,6 +31,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -40,8 +41,8 @@ import (
 )
 
 // Values this suite states again from the server: the limits of
-// Server/Wire.lean and Server/H1Adapter.lean, the receive buffer of
-// zig/src/serve.zig (recv_cap), and the size of App/Fixture.lean's body
+// Server/Wire.lean and Server/H1Adapter.lean, the receive and send buffers
+// of zig/src/serve.zig (recv_cap, out_cap), and the size of App/Fixture.lean's body
 // (longer than serve.zig's out_cap and no multiple of it). lsrv-test
 // (Test.lean, benchValuesAgree) checks each line, and that property of the
 // body; it reads the file's lines, so a local declaration shadowing one of
@@ -52,6 +53,7 @@ const maxHeaders = 100
 const maxPathSegments = 255
 const maxQueryParams = 1000
 const recvCap = 8192
+const outCap = 8192
 const bodySize = 60001
 
 var body = func() []byte {
@@ -154,7 +156,8 @@ func (s *server) stop() (*os.ProcessState, error) {
 }
 
 // trace checks the server's trace lines: each connection opened once and
-// freed once after its open, and no other output. No scenario allows a
+// freed once after its open, and no other output but the "received N"
+// lines of --report-recv, kept in order. No scenario allows a
 // warning: the server sets no option on an accepted socket (serve.zig,
 // openListener), so even the churn scenario's connections reset before the
 // accept give zio nothing to warn about.
@@ -165,6 +168,7 @@ type trace struct {
 	stopped          int
 	// Sends in flight when a loop's stop arrived (its "stop R S" lines).
 	sendsAtStop uint64
+	received    []uint64
 }
 
 func newTrace() *trace {
@@ -190,6 +194,8 @@ func (t *trace) take(line string) error {
 		t.ops += num(2)
 		t.injRecv += num(3)
 		t.injSend += num(4)
+	case len(f) == 2 && f[0] == "received":
+		t.received = append(t.received, num(1))
 	case len(f) == 3 && f[0] == "stop":
 		t.sendsAtStop += num(2)
 	case line == "stopped":
@@ -410,6 +416,108 @@ func expectations(addr string) (int64, string, error) {
 		return 2, "", fmt.Errorf("/too-big: X-Robots-Tag %q, want the fixture's own field", got)
 	}
 	return 2, "", expectEOF(r2, "after the 500")
+}
+
+// batchOverOutCap sends k pipelined POST /echo requests, each with a
+// two-byte body naming its place, in one write to a one-loop server whose
+// receives and sends take at most `chunk` bytes, and checks that one receive
+// held them all (--report-recv; a single write under the loopback
+// interface's MTU goes out as one segment, and the check fails, not passes,
+// if that premise ever breaks), that their responses come back whole and in
+// order with nothing after them, and that the server sent them in the sends
+// one batch takes, fewer than any split of them into batches of at most
+// outCap bytes would take: Lean answered them in one
+// batch (Conn.batch) over outCap bytes, which glue.c copies out at most
+// outCap bytes at a time, and the first send wrote only `chunk` bytes of its
+// copy, ending inside a response, so Lean asked again from that offset (item
+// vxcuze). k is odd and `chunk` just over half the responses' bytes, so one
+// batch takes two sends and every split at a response boundary three; the
+// check computes both from the responses received. Test.lean's
+// batchScenario and batchEdgeScenario check the batch itself.
+func batchOverOutCap(path string) (string, error) {
+	const k = 71
+	const chunk = 4199
+	const echo = "POST /echo HTTP/1.1\r\nHost: a\r\nContent-Length: 2\r\n\r\n"
+	var reqs strings.Builder
+	for i := range k {
+		fmt.Fprintf(&reqs, "%s%02d", echo, i)
+	}
+	if reqs.Len() > chunk {
+		return "", fmt.Errorf("%d bytes of requests do not fit one receive of %d", reqs.Len(), chunk)
+	}
+	s, err := start(path, "1", "--chunk", strconv.Itoa(chunk), "--trace", "--report-recv")
+	if err != nil {
+		return "", err
+	}
+	defer s.stop()
+	c, err := dial(s.addr)
+	if err != nil {
+		return "", err
+	}
+	defer c.Close()
+	if _, err := io.WriteString(c, reqs.String()); err != nil {
+		return "", err
+	}
+	var raw bytes.Buffer
+	r := bufio.NewReader(io.TeeReader(c, &raw))
+	ends := []int{0} // offsets in the stream where a response ends
+	for i := range k {
+		resp, err := http.ReadResponse(r, &http.Request{Method: "POST"})
+		if err != nil {
+			return "", fmt.Errorf("response %d: %w", i, err)
+		}
+		got, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			return "", fmt.Errorf("response %d: %w", i, err)
+		}
+		if want := fmt.Sprintf("%02d", i); resp.StatusCode != 200 || string(got) != want {
+			return "", fmt.Errorf("response %d: status %d body %q, want 200 %q", i, resp.StatusCode, got, want)
+		}
+		ends = append(ends, raw.Len()-r.Buffered())
+	}
+	// Nothing follows the last response: the client's half close makes the
+	// server close, and the next read finds that close.
+	if err := c.CloseWrite(); err != nil {
+		return "", err
+	}
+	if err := expectEOF(r, fmt.Sprintf("after the %d responses", k)); err != nil {
+		return "", err
+	}
+	total := ends[k]
+	sends := func(n int) int { return (n + chunk - 1) / chunk }
+	// least[j]: the fewest sends of the first j responses split at response
+	// boundaries into batches of at most outCap bytes.
+	least := make([]int, k+1)
+	for j := 1; j <= k; j++ {
+		least[j] = -1
+		for i := j - 1; i >= 0 && ends[j]-ends[i] <= outCap; i-- {
+			if least[i] >= 0 && (least[j] < 0 || least[i]+sends(ends[j]-ends[i]) < least[j]) {
+				least[j] = least[i] + sends(ends[j]-ends[i])
+			}
+		}
+	}
+	// The premise: the responses take more than one copy, a send of `chunk`
+	// bytes ends inside one, and one batch takes fewer sends than any split.
+	if total <= outCap || slices.Contains(ends, chunk) || sends(total) >= least[k] {
+		return "", fmt.Errorf("%d bytes of responses, ending at %v: the scenario needs more than %d, none ending at %d, and fewer sends in one batch (%d) than in batches of at most %d bytes (%d)",
+			total, ends, outCap, chunk, sends(total), outCap, least[k])
+	}
+	t := newTrace()
+	summary, err := s.account(t, 1)
+	if err != nil {
+		return "", err
+	}
+	if len(t.received) == 0 || t.received[0] != uint64(reqs.Len()) {
+		return "", fmt.Errorf("receives of %v bytes; want the first to hold all %d requests' %d bytes", t.received, k, reqs.Len())
+	}
+	// The connection's operations: the receive of the requests, the sends,
+	// the receive of the client's close, the close.
+	if t.ops != uint64(3+sends(total)) {
+		return "", fmt.Errorf("%d operations: %d sends for %d response bytes, want one batch's %d (batches of at most %d bytes take %d)",
+			t.ops, int(t.ops)-3, total, sends(total), outCap, least[k])
+	}
+	return fmt.Sprintf("%s; %d requests in one receive of %d bytes, %d response bytes in %d sends", summary, k, reqs.Len(), total, t.ops-3), nil
 }
 
 // shutdown sends SIGTERM to a one-loop server while it holds three
@@ -1725,6 +1833,7 @@ func main() {
 		{"every 29th receive and every 29th send fail", []string{"2", "--fail-every", "29", "--trace"}, true, failures, nil, false},
 		{"connection churn with resets", []string{"4", "--trace"}, false, churn, nil, false},
 		{"Expect: 100-continue and a response over the bound, operations of at most 7 bytes", []string{"2", "--chunk", "7", "--trace"}, false, expectations, nil, true},
+		{"pipelined requests in one receive, answered in one batch over out_cap sent in short writes", nil, false, nil, batchOverOutCap, false},
 		{"graceful shutdown with a response in flight, an idle and a partial connection", nil, false, nil, shutdown, false},
 		{"admission: at most 2 connections", nil, false, nil, admission, false},
 		{"deadlines: idle, head and body expire and close", nil, false, nil, deadlines, false},

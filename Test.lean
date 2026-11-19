@@ -1044,6 +1044,96 @@ def batchScenario : Check Unit := do
   expectRecv "batch: after a full buffer" fa2 inCap
   if f2.buf.size != 0 then fail "batch: a full buffer was not consumed"
 
+/-- An adapter whose requests are one byte each, all answered at once and
+keeping the connection open, for the stops of `Conn.gather` and
+`Conn.batch` that `H1Adapter` cannot produce: `Z` consumes no byte, `O` one
+byte more than is buffered, `E` answers an empty response, `B` one of
+`maxResponseBytes + 1` bytes; any other byte answers itself. An empty
+buffer needs more of the head. -/
+def oneByte : Server.Adapter Unit where
+  init := ()
+  handle _ buf := ((), match buf[0]? with
+    | none => .needMore .head
+    | some c =>
+      if c == 'Z'.toUInt8 then .respond 0 fun _ => (ByteArray.mk #[c], false)
+      else if c == 'O'.toUInt8 then .respond (buf.size + 1) fun _ => (ByteArray.mk #[c], false)
+      else if c == 'E'.toUInt8 then .respond 1 fun _ => (ByteArray.empty, false)
+      else if c == 'B'.toUInt8 then .respond 1 fun _ => (ByteArray.mk (Array.replicate (maxResponseBytes + 1) c), false)
+      else .respond 1 fun _ => (ByteArray.mk #[c], false))
+
+/-- The edges of pipelined batching that `batchScenario` leaves out (item
+vxcuze). A batch stops before a request that consumes no byte, more bytes
+than are buffered, or answers an empty response, as before one that would
+pass the bound, and the connection closes when it serves that request once
+the batch is sent; an empty first response (`Conn.batch`'s `first.size =
+0` branch) or an oversized one (`startSend`) sends nothing, not even the
+responses to the requests behind it. Complete requests left behind the
+bound are answered in consecutive batches, in order, each in an array
+whose capacity is its size. A full buffer that ends on an incomplete
+request is answered in several batches, then that request is read with the
+room the buffer has left, under its head deadline. -/
+def batchEdgeScenario : Check Unit := do
+  let o := oneByte
+  let closed (s : Conn.State Unit) : Bool := match s.phase with
+    | .closed => true
+    | _ => false
+  let run (input : String) : Check (Array ByteArray × Conn.State Unit × Conn.Action) := do
+    let (s, a) := Conn.step o 0 (Conn.initial o) (.received (bytes input))
+    drain s!"batch edges: {input}" o 8192 s a
+  let (ok, _, okA) ← run "abc"
+  if ok != #[bytes "abc"] then fail "batch edges: abc is not one batch of the three responses"
+  expectRecv "batch edges: after abc" okA inCap
+  -- Each defensive stop: the batch ends before it, then serving it closes.
+  for stop in ["Z", "O", "E", "B"] do
+    let (sends, s, a) ← run s!"a{stop}b"
+    if sends != #[bytes "a"] then fail s!"batch edges: a{stop}b: {sends.size} sends, not the first response alone"
+    expectClose s!"batch edges: a{stop}b, after the first response" a
+    unless closed s do fail s!"batch edges: a{stop}b: the connection is not closed"
+  -- An empty or oversized first response closes, sending nothing.
+  for first in ["E", "B"] do
+    let (s, a) := Conn.step o 0 (Conn.initial o) (.received (bytes s!"{first}ab"))
+    expectClose s!"batch edges: {first}ab" a
+    unless closed s do fail s!"batch edges: {first}ab: the connection is not closed"
+  -- Requests left behind the bound are answered in consecutive batches, as
+  -- `gather` takes them (each next response while the batch stays within
+  -- `maxResponseBytes`): a buffer of GET / (200) and GET /nope (404) in
+  -- turn, alone, or followed by an incomplete request that fills the buffer
+  -- to `inCap` exactly, whose rest is then received under its head deadline
+  -- in the period the last batch's head budget ran in (`gen + 1` of each
+  -- send, one send per batch).
+  let h := H1Adapter.adapter {} App.Hello.app
+  let get := "GET / HTTP/1.1\r\nHost: a\r\n\r\n"
+  let miss := "GET /nope HTTP/1.1\r\nHost: a\r\n\r\n"
+  let some rGet := aloneResponse h get | fail "batch edges: GET / alone"; return
+  let some rMiss := aloneResponse h miss | fail "batch edges: GET /nope alone"; return
+  let head := "GET / HTTP/1.1\r\nHo"
+  for incomplete in [false, true] do
+    let what := if incomplete then "batch edges: a full buffer ending on an incomplete request" else "batch edges: consecutive batches"
+    let mut reqs : Array String := #[]
+    let mut size := 0
+    for i in [0:inCap] do
+      let r := if i % 2 == 0 then get else miss
+      if size + r.length + head.length > inCap then break
+      reqs := reqs.push r
+      size := size + r.length
+    let tail := if incomplete then "".pushn 'o' (inCap - size - head.length) |> (head ++ ·) else ""
+    let input := String.join reqs.toList ++ tail
+    if incomplete && input.length != inCap then fail s!"{what}: {input.length} bytes, not {inCap}"
+    let want := (reqs.map fun r => if r == get then rGet else rMiss).foldl (init := (#[] : Array ByteArray)) fun bs r =>
+      match bs.back? with
+      | some b => if b.size + r.size ≤ maxResponseBytes then bs.pop.push (b ++ r) else bs.push r
+      | none => #[r]
+    if want.size < 2 then fail s!"{what}: the responses of {reqs.size} requests fit one batch"
+    let (s1, a1) := Conn.step h 0 (Conn.initial h) (.received (bytes input))
+    let (sends, s2, a2) ← drain what h 8192 s1 a1
+    if sends != want then
+      fail s!"{what}: {sends.size} sends of {sends.map (·.size)} bytes, not the responses of {reqs.size} requests in batches of {want.map (·.size)}"
+    for d in sends do
+      if byteArrayCapacity d != d.size then fail s!"{what}: capacity {byteArrayCapacity d} for {d.size} bytes"
+    if s2.buf != bytes tail then fail s!"{what}: {s2.buf.size} bytes left, not the {tail.length} of the incomplete request"
+    expectRecv what a2 (inCap - tail.length)
+    expectDeadline what s2 (some (if incomplete then .head else .idle)) (sends.size + 1)
+
 /-! ## Values the Zig and C sources state again
 
 `zig/` cannot read a Lean definition, so it states some again; these checks
@@ -1149,8 +1239,8 @@ def transportCodesAgree : Check Unit := do
 
 /-- The Go programs `check.sh` runs state values of the server again, each a
 `const NAME = VALUE` line: the request limits (`Server.Wire`,
-`H1Adapter`), the transport's receive buffer (`recv_cap` of `serve.zig`,
-read from it), the size of `App.Fixture.body` and the query of `App.Db`.
+`H1Adapter`), the transport's receive and send buffers (`recv_cap` and
+`out_cap` of `serve.zig`, read from it), the size of `App.Fixture.body` and the query of `App.Db`.
 That body takes several sends and ends with a short one (App/Fixture.lean)
 only while it is longer than `out_cap` and no multiple of it. -/
 def benchValuesAgree : Check Unit := do
@@ -1166,6 +1256,7 @@ def benchValuesAgree : Check Unit := do
       ("maxQueryParams", H1Adapter.maxQueryParams), ("bodySize", App.Fixture.body.size)] do
     goConst boundary n v
   if let some c := recvCap then goConst boundary "recvCap" c
+  if let some c := outCap then goConst boundary "outCap" c
   -- Exactly, not through definedOnce, which collapses runs of spaces.
   let pg ← IO.FS.readFile "bench/pgserver/main.go"
   unless (pg.splitOn s!"\nconst worldSql = \"{App.Db.worldSql}\"\n").length == 2 do
@@ -1283,6 +1374,7 @@ def main : IO UInt32 := do
     refusedScenario
     queryScenario
     batchScenario
+    batchEdgeScenario
     deadlineScenario
     clockScenario
     corpusScenario
