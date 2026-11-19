@@ -421,10 +421,16 @@ func expectations(addr string) (int64, string, error) {
 // batchOverOutCap sends k pipelined POST /echo requests, each with a
 // two-byte body naming its place, in one write to a one-loop server whose
 // receives and sends take at most `chunk` bytes, and checks that one receive
-// held them all (--report-recv; a single write under the loopback
-// interface's MTU goes out as one segment, and the check fails, not passes,
-// if that premise ever breaks), that their responses come back whole and in
-// order with nothing after them, and that the server sent them in the sends
+// held them all (--report-recv). That one receive is a premise, not a
+// guarantee: TCP may split a write into several receives on any interface
+// (the MTU bounds a packet's size, not how a write is split; a partial copy
+// into a full send buffer makes Go's write loop over several syscalls while
+// the server already receives the first part). On loopback the write has
+// been observed to arrive as one receive; when it does not, the check fails
+// as a split receive, naming the receives' sizes, never as a batching
+// failure, and never passes falsely. It also checks that their responses
+// come back whole and in order with nothing after them, and that the server
+// sent them in the sends
 // one batch takes, fewer than any split of them into batches of at most
 // outCap bytes would take: Lean answered them in one
 // batch (Conn.batch) over outCap bytes, which glue.c copies out at most
@@ -508,8 +514,10 @@ func batchOverOutCap(path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	// Checked before the sends: a split receive lets the server answer the
+	// first part on its own, so the sends no longer show one batch.
 	if len(t.received) == 0 || t.received[0] != uint64(reqs.Len()) {
-		return "", fmt.Errorf("receives of %v bytes; want the first to hold all %d requests' %d bytes", t.received, k, reqs.Len())
+		return "", fmt.Errorf("premise not met, split receive: the client's one write of %d bytes (%d requests) arrived in receives of %v bytes, not one; this is not a batching failure", reqs.Len(), k, t.received)
 	}
 	// The connection's operations: the receive of the requests, the sends,
 	// the receive of the client's close, the close.
