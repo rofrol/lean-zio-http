@@ -18,3 +18,5 @@ Proposed work: run the row at p7nicw's parent and at p7nicw (same toolchain)
 to confirm or refute that the wait change moved it, then update the row and its
 note in docs/memory.md with the cause; if neither commit moves it, trace further.
 The row checks no bound ("a measurement; no bound"), so nothing fails today.
+
+Decided 2026-11-19 by the coordinating session with sol and hydrogen (consult round 20261119-131820-9a89; calls 2457b2df, db84fdb7) under the user's delegation to decide the next items with the models: approved into Next (both): compare p7nicw and its parent on the same toolchain; update docs/memory.md only with supported findings.
