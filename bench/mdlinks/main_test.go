@@ -212,3 +212,20 @@ func TestCheck(t *testing.T) {
 		t.Errorf("checked %d relative links, want 21", n)
 	}
 }
+
+// A NUL-delimited list, as `git ls-files -z` and linux-check.sh write it:
+// names with spaces or newlines stay whole, and empty names (the final
+// terminator, or none at all) are no files.
+func TestFileSet(t *testing.T) {
+	cases := map[string]map[string]bool{
+		"":                               {},
+		"a.md\x00":                       {"a.md": true},
+		"a.md\x00dir/b c.md\x00x\ny\x00": {"a.md": true, "dir/b c.md": true, "x\ny": true},
+		"a.md\x00a.md":                   {"a.md": true},
+	}
+	for in, want := range cases {
+		if got := fileSet([]byte(in)); !reflect.DeepEqual(got, want) {
+			t.Errorf("fileSet(%q) = %v, want %v", in, got, want)
+		}
+	}
+}

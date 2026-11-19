@@ -30,7 +30,9 @@ case $backend in
 esac
 . bench/lib.sh
 # The relative links and anchors between the tracked Markdown files (item
-# g4vate): its unit tests, then the check itself; it needs only Go and git.
+# g4vate): its unit tests, then the check itself; it needs only Go and git,
+# or, in a copy of the tree without .git, the list of its files in
+# MDLINKS_FILES (linux-check.sh).
 (cd bench/mdlinks && go test ./... && go build -o mdlinks .)
 bench/mdlinks/mdlinks
 # lake builds the Zig library (extern_lib zsrv in lakefile.lean, ZIG_OPTIMIZE

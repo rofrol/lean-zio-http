@@ -10,6 +10,13 @@
 // runs it there), prints each broken link with its file, line, destination
 // and whether the path or the anchor failed, and exits 1 when any is broken.
 //
+// The files it reads and resolves links against are `git ls-files -z`'s.
+// Where the tree is no git repository (linux-check.sh's copy in a
+// container), MDLINKS_FILES names a file holding them instead, NUL-delimited
+// and relative to the root, as `git ls-files -z` prints them: linux-check.sh
+// gives it the list it built the copy from, which also holds the untracked
+// files git does not ignore: there they count as tracked.
+//
 // It parses the subset of CommonMark these documents use, not all of it.
 // Known differences, none met in this repository's documents: headings in
 // block quotes or list items, and HTML anchors (<a id=...>), are not targets;
@@ -69,17 +76,18 @@ type block struct {
 }
 
 func main() {
-	out, err := exec.Command("git", "ls-files", "-z").Output()
+	var out []byte
+	var err error
+	if list := os.Getenv("MDLINKS_FILES"); list != "" {
+		out, err = os.ReadFile(list)
+	} else if out, err = exec.Command("git", "ls-files", "-z").Output(); err != nil {
+		err = fmt.Errorf("git ls-files: %w", err)
+	}
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "mdlinks: git ls-files:", err)
+		fmt.Fprintln(os.Stderr, "mdlinks:", err)
 		os.Exit(2)
 	}
-	tracked := map[string]bool{}
-	for _, f := range strings.Split(strings.TrimSuffix(string(out), "\x00"), "\x00") {
-		if f != "" {
-			tracked[f] = true
-		}
-	}
+	tracked := fileSet(out)
 	docs := map[string]string{}
 	for f := range tracked {
 		if !strings.HasSuffix(f, ".md") {
@@ -105,6 +113,17 @@ func main() {
 		os.Exit(1)
 	}
 	fmt.Printf("mdlinks: %d relative links in %d Markdown files resolve\n", links, len(docs))
+}
+
+// fileSet is the set of paths in a NUL-delimited list.
+func fileSet(list []byte) map[string]bool {
+	set := map[string]bool{}
+	for _, f := range strings.Split(string(list), "\x00") {
+		if f != "" {
+			set[f] = true
+		}
+	}
+	return set
 }
 
 // check returns the broken relative links of docs (path to content) and the
