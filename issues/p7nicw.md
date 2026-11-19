@@ -9,3 +9,5 @@ Found by the comment audit the user asked for on 2026-11-19:
 - zig/src/serve_test.zig:2050: `a.getResult() catch {` treats any error as the shutdown's cancel.
 - zig/src/pg.c:182: a PQconninfoParse failure is ignored silently.
 - bench/lib.sh:43: the server's output after "ready" is drained to /dev/null, so late errors are not seen.
+
+Decided 2026-11-19 by the coordinating session with sol and hydrogen (consult round 20261119-075953-d7f4; calls 88cb5a16, 0bf8ac07) at the user's request to decide the best order of the issues with the models: approved into Next while 4bngph waits. Waits on our own processes wait for their events (the server's "listening on" line, the child's exit and status, a test hook), never a count of polls; no sleep, retry or larger bound is a fix.
