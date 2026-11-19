@@ -1,5 +1,0 @@
-Trace the single-sample round trips of 0.2 to 76 ms that bench/fairness's probe sees in every configuration
-
-Found by item vhvejg (docs/reports/full-buffer-step.md): the probe's maxima reach 0.2 to 76 ms in single samples in every configuration, also with no loader and on the 0164ce4 build, while the medians are 40 µs to 1.1 ms; no conclusion of the report rests on them and their cause is not known. Consult round 20261119-155048-fb47 (sol 1a24ea90, hydrogen 0cacf4e9): a separate item; batching is not needed for them, so they are not gather's. First reproduce on an idle host (the measured runs had a load average of 7 to 14), then correlate timestamps of the probe's send and receive, the server's readiness, step entry and exit, and the OS scheduling on both sides, to tell the probe's descheduling, the server's descheduling and the server's own work (runtime, allocator, kqueue) apart.
-
-Decided 2026-11-19 by the coordinating session with sol and hydrogen (consult round 20261119-160527-668d; calls ee644153, 2b769faf) under the user's delegation to decide the next items with the models: approved into Next (both; no batching decision needed), after lmbozk.
