@@ -1,6 +1,5 @@
 ## Next, in order
 
-paarzq Write a connection's pipelined responses with one send, as go-fasthttp does, instead of one send and one loop turn per response
 5ffu5o Derive or mechanically check the values copied by hand between languages, files and upstream
 
 ## Proposed
@@ -16,6 +15,9 @@ g62mok Decide whether to measure the pool's readiness probe (peek against NetPol
 zoswdj Explain why bench/boundary's 7-byte nearly-maximum-head row measures 82 to 89 KiB against the 76.2 to 77.4 KiB in docs/memory.md
 2mb4o4 Decide whether to propose cheaper head parsing to leanprover/lean4's Std.Http, or accept H1's parse cost
 k57kba Correct bench/parse/profile.sh's count of perf's "unwind: get_proc_name unsupported" messages
+gaf5x5 Decide whether a pipelined batch is bounded by maxResponseBytes (65,536) or by the transport's out_cap (8,192)
+vxcuze Add the remaining edge-case tests of pipelined batching
+vhvejg Measure the step cost of a large pipelined batch and the quadratic copying of the receive buffer's suffix
 
 ## Needs a decision
 
