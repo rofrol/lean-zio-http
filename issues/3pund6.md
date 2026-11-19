@@ -1,9 +1,9 @@
 Decide what follows from the classification of Linux pending-connection accept errnos (xihdtw)
 
-Posted 2026-11-19 by the coordinating session at the user's go: https://github.com/lalinsky/zio/issues/931 (the draft below, unchanged). Today's exit on these errnos and README "Accept errors" stay as they are. This item now waits for a maintainer's answer and is not approved work until one arrives: a statement that they stay Unexpected/OperationNotSupported is quoted next to the server's accept handling as a documented limitation; a fix upstream is adopted at the next zio update (re-arm on the new named error); a confirmed bug that upstream won't fix follows Rule 6 (fork and PR) after the owner's go. Check the issue at session start and at each zio update. ekklesiai.org's session was told the link for its decision record 0001.
+Posted 2026-11-19 by the coordinating session at the user's go: https://github.com/lalinsky/zio/issues/931 (the draft below, unchanged). Today's exit on these errnos and "Accept errors" in docs/production-contract.md stay as they are. This item now waits for a maintainer's answer and is not approved work until one arrives: a statement that they stay Unexpected/OperationNotSupported is quoted next to the server's accept handling as a documented limitation; a fix upstream is adopted at the next zio update (re-arm on the new named error); a confirmed bug that upstream won't fix follows Rule 6 (fork and PR) after the owner's go. Check the issue at session start and at each zio update. ekklesiai.org's session was told the link for its decision record 0001.
 
 
-Needs a decision (item xihdtw's outcome, commit "boundary: classify Linux pending-connection accept errnos under the pinned zio"; README "Production contract", "Accept errors").
+Needs a decision (item xihdtw's outcome, commit "boundary: classify Linux pending-connection accept errnos under the pinned zio"; docs/production-contract.md, "Accept errors").
 
 What was found:
 - The pinned zio (lalinsky/zio 9bef33d, also upstream HEAD on 2026-11-16) maps ENETUNREACH, EHOSTUNREACH, EHOSTDOWN, ENONET and ENOPROTOOPT to `Unexpected` through `unexpectedError` (src/os/base.zig: "Report an errno, an NTSTATUS or an error value that a caller's switch could not map"; it logs "please file a bug report"), and EOPNOTSUPP to `OperationNotSupported` (src/os/net.zig `errnoToAcceptError`). No zio passage names them as a limitation or defines a contract for them, so under the policy (Rule 6) whether this is a zio bug is unresolved, not a documented limitation.
@@ -11,7 +11,7 @@ What was found:
 - So on those kernels the server's exit on these errors cannot be triggered by a pending connection or a remote peer.
 
 Options:
-(a) Close the question: keep exiting on them (today's behavior), with the README stating the kernel evidence as it does now.
+(a) Close the question: keep exiting on them (today's behavior), with docs/production-contract.md stating the kernel evidence as it does now.
 (b) Ask zio upstream (an issue citing accept(2) and the kernel source) whether these errnos should get names or stay `Unexpected`; an outward action, and per Rule 6 the answer would settle bug versus limitation.
 (c) Also ask man-pages to correct accept(2)'s note; outward, not this repository's concern unless the owner wants it.
 
@@ -23,7 +23,7 @@ Options: keep exiting and keep the item open as a bounded finding | ask zio upst
 
 Checked 2026-11-17 with sol (consult round 20261117-011832-74e7) under the user's delegation: deferred: keep today's exit and the bounded kernel finding; asking zio upstream needs the user's go. No local workaround.
 
-Decided 2026-11-18 by the coordinating session with sol, argon and hydrogen (consult round 20261118-181941-5f8f; calls 4a23f520, e4c9a8ea, 272fc555), under the user's delegation of 2026-11-18 to decide the remaining open questions with the models: approved (all three agree): keep today's exit on these errnos and the bounded kernel finding in README; no local workaround. Ask zio upstream with one issue on https://github.com/lalinsky/zio from the user's gh account: the mappings (src/os/base.zig unexpectedError for ENETUNREACH, EHOSTUNREACH, EHOSTDOWN, ENONET, ENOPROTOOPT; src/os/net.zig errnoToAcceptError EOPNOTSUPP -> OperationNotSupported) at the pinned commit and HEAD; accept(2)'s retry note; the Linux sources read (v5.4, v6.1, mainline aebb727: inet_accept returns only inet_csk_accept's EINVAL, EAGAIN or wait errors, also through io_uring); that there is no reproducer and other kernels and security-module hooks were not read; the question whether these should get named accept errors or stay Unexpected as documented behavior. No man-pages report. Tell ekklesiai.org's session the finding and the issue link for its decision record 0001. Track the answer in this item; a confirmed bug follows Rule 6 (fork and PR).
+Decided 2026-11-18 by the coordinating session with sol, argon and hydrogen (consult round 20261118-181941-5f8f; calls 4a23f520, e4c9a8ea, 272fc555), under the user's delegation of 2026-11-18 to decide the remaining open questions with the models: approved (all three agree): keep today's exit on these errnos and the bounded kernel finding in docs/production-contract.md; no local workaround. Ask zio upstream with one issue on https://github.com/lalinsky/zio from the user's gh account: the mappings (src/os/base.zig unexpectedError for ENETUNREACH, EHOSTUNREACH, EHOSTDOWN, ENONET, ENOPROTOOPT; src/os/net.zig errnoToAcceptError EOPNOTSUPP -> OperationNotSupported) at the pinned commit and HEAD; accept(2)'s retry note; the Linux sources read (v5.4, v6.1, mainline aebb727: inet_accept returns only inet_csk_accept's EINVAL, EAGAIN or wait errors, also through io_uring); that there is no reproducer and other kernels and security-module hooks were not read; the question whether these should get named accept errors or stay Unexpected as documented behavior. No man-pages report. Tell ekklesiai.org's session the finding and the issue link for its decision record 0001. Track the answer in this item; a confirmed bug follows Rule 6 (fork and PR).
 
 Blocked 2026-11-18: posting the issue (`gh issue create -R lalinsky/zio --body-file ...`) was denied by Claude Code's auto-mode classifier ("Unsanctioned Communication"). Not retried. Checked first: the mapping is unchanged at zio 53ed3c3, which is also upstream HEAD (src/os/net.zig errnoToAcceptError lines 896-913; src/os/base.zig unexpectedError line 40); no existing zio issue matches (gh search: "accept errno", ENETUNREACH, errnoToAcceptError); the accept(2) quote was checked against man7.org.
 
@@ -49,6 +49,6 @@ Draft body:
     
     Question: are these six meant to stay `Unexpected` / `OperationNotSupported`? If so, could the docs say so? Or should they get a named, retryable accept error, like `NetworkDown` and `ProtocolFailure`? We'd like to rely on what zio documents rather than on our reading of the kernel.
     
-    Context: our server ([lean-zio-http](https://github.com/rofrol/lean-zio-http), README "Accept errors") currently exits on these errors and documents why.
+    Context: our server ([lean-zio-http](https://github.com/rofrol/lean-zio-http), README "Accept errors", since moved to docs/production-contract.md) currently exits on these errors and documents why.
 
 Decided by the user 2026-11-19: yes, the session posts the drafted zio issue above from the user's gh account.
