@@ -9,8 +9,10 @@
 # filter off (beside the flag below). It copies the working tree (tracked
 # files and untracked ones git does not ignore) into the container, so it
 # checks uncommitted
-# changes too, and leaves nothing of the build on the host but the image and
-# the cache volume `lsrv-linux-cache` (Zig's and Go's downloads).
+# changes too, and leaves nothing of the build on the host but the cache
+# volume `lsrv-linux-cache` (Zig's and Go's downloads) and docker's build
+# cache: the image is tagged for this run only and untagged when it ends
+# (linux/run-images.sh).
 #
 # Required at each update of zio (build.zig.zon), with its result recorded
 # in the commit (README, "Running"). It is development evidence on the host's
@@ -21,12 +23,13 @@
 # the Go modules). Any failure stops it with a nonzero status.
 set -eu
 cd "$(dirname "$0")"
-image=lsrv-linux-check
 nightly=$(sed -n 's/^ARG LEAN_NIGHTLY=//p' linux/Dockerfile)
 if [ "$(cat lean-toolchain)" != "leanprover/lean4:$nightly" ]; then
   echo "lean-toolchain names $(cat lean-toolchain); linux/Dockerfile installs $nightly: update the Dockerfile"; exit 1
 fi
-docker build -q -t "$image" linux >/dev/null
+. linux/run-images.sh
+image=lsrv-linux-check:$run_tag
+run_image_build "$image" linux
 # The run's environment, for the record.
 env=$(docker run --rm --network none "$image" sh -c '
   echo "architecture: $(uname -m)"; echo "kernel: $(uname -r)"
@@ -64,8 +67,6 @@ fi
 # script instead of hiding behind the container's status. COPYFILE_DISABLE:
 # macOS's tar would add AppleDouble `._` files, which the build reads as
 # sources.
-tmp=$(mktemp -d)
-trap 'rm -rf "$tmp"' EXIT INT TERM
 git ls-files -z --cached --others --exclude-standard >"$tmp/files"
 COPYFILE_DISABLE=1 tar --null -T "$tmp/files" -cf "$tmp/tree.tar"
 for backend in epoll io_uring; do

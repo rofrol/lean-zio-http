@@ -8,7 +8,9 @@
 # output, the traces and summary.txt, one line per sample. ARENA is a checkout
 # of https://github.com/MDA2AV/HttpArena at build.sh's commit, for the Go
 # entries and the request templates. PERF=1 adds a CPU profile of each lsrv
-# sample (OUT/perf-*.data; read it with `perf report` in the same image).
+# sample (OUT/perf-*.data; read it with `perf report` in an image built from
+# local.Dockerfile: the run's own images are untagged when it ends,
+# linux/run-images.sh).
 #
 # Builds lsrv-arena (epoll) from the working tree and the Go entries natively
 # in linux/Dockerfile's image, gcannon in local.Dockerfile's, then runs
@@ -26,14 +28,14 @@ out=$(cd "$out" && pwd) arena=$(cd "$arena" && pwd)
 cd "$(dirname "$0")/../.."
 mkdir "$out/b"
 
-tmp=$(mktemp -d)
-trap 'rm -rf "$tmp"' EXIT INT TERM
+. linux/run-images.sh
 git ls-files -z --cached --others --exclude-standard >"$tmp/files"
 COPYFILE_DISABLE=1 tar --null -T "$tmp/files" -cf "$tmp/tree.tar"
 COPYFILE_DISABLE=1 tar -C "$arena" -cf "$tmp/arena.tar" frameworks/go-stdlib frameworks/go-fasthttp requests
-docker build -q -t lsrv-linux-check linux >/dev/null
+base=lsrv-linux-check:$run_tag
+run_image_build "$base" linux
 docker run --rm -v lsrv-linux-cache:/home/check/.cache -v "$tmp/tree.tar:/tree.tar:ro" -v "$tmp/arena.tar:/arena.tar:ro" \
-  -v "$out/b:/out" lsrv-linux-check sh -c '
+  -v "$out/b:/out" "$base" sh -c '
   set -eu
   mkdir src arena && tar --warning=no-unknown-keyword -xf /tree.tar -C src && tar -xf /arena.tar -C arena
   cd src && . bench/lib.sh
@@ -42,7 +44,7 @@ docker run --rm -v lsrv-linux-cache:/home/check/.cache -v "$tmp/tree.tar:/tree.t
   cp .lake/build/bin/lsrv-arena /out/lsrv-arena
   for e in go-stdlib go-fasthttp; do (cd ../arena/frameworks/$e && CGO_ENABLED=0 go build -trimpath -o /out/$e main.go); done
   cp -r ../arena/requests /out/'
-image=lsrv-arena-local
-docker build -q -t "$image" -f bench/arena/local.Dockerfile bench/arena >/dev/null
+image=lsrv-arena-local:$run_tag
+run_image_build "$image" -f bench/arena/local.Dockerfile bench/arena
 docker run --rm --privileged -v "$out/b:/b:ro" -v "$PWD/bench/arena:/s:ro" -v "$out:/out" "$image" \
   sh /s/local-inner.sh /out "$rounds" "${PERF:-0}" lsrv-arena go-stdlib go-fasthttp

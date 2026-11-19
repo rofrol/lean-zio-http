@@ -40,12 +40,11 @@ mkdir "$out/lib" "$out/requests"
 # db/ mirrors the repository paths bench/dbpairs.sh runs from (run.sh db).
 mkdir -p "$out/db/.lake/build/bin" "$out/db/bench/load" "$out/db/bench/pgserver"
 
-tmp=$(mktemp -d)
-trap 'rm -rf "$tmp"' EXIT INT TERM
+. linux/run-images.sh
 git ls-files -z --cached --others --exclude-standard >"$tmp/files"
 COPYFILE_DISABLE=1 tar --null -T "$tmp/files" -cf "$tmp/tree.tar"
-image=lsrv-linux-check-amd64
-docker build -q --platform linux/amd64 -t "$image" linux >/dev/null
+image=lsrv-linux-check-amd64:$run_tag
+run_image_build "$image" --platform linux/amd64 linux
 # seccomp off: docker's default profile refuses io_uring_setup (linux-check.sh).
 zig_version=$(sed -n 's/^ARG ZIG_VERSION=//p' linux/Dockerfile)
 zig_sum=$(sed -n 's/^ARG ZIG_SHA256_AARCH64=//p' linux/Dockerfile)

@@ -22,7 +22,8 @@
 # reports with and without the callees' samples included
 # (OUT/linux-children.txt, OUT/linux-self.txt), the program's output
 # (OUT/linux-run.txt), and the binary (OUT/b/lsrv-parsebench) to read the
-# data again in the same image. perf report's own messages go to
+# data again in an image built as this one (the run's own images are untagged
+# when it ends: linux/run-images.sh). perf report's own messages go to
 # OUT/linux-report.log: on the M1 (Debian trixie's perf, arm64, 2026-11-19)
 # one "unwind: get_proc_name unsupported" per few samples, while 99.6 % of
 # the samples still had their whole chain up to `_lean_main`. Needs docker and, for a first build of the
@@ -61,20 +62,21 @@ m1)
   ;;
 linux)
   mkdir "$out/b"
-  tmp=$(mktemp -d)
-  trap 'rm -rf "$tmp"' EXIT INT TERM
+  . linux/run-images.sh
   git ls-files -z --cached --others --exclude-standard >"$tmp/files"
   COPYFILE_DISABLE=1 tar --null -T "$tmp/files" -cf "$tmp/tree.tar"
-  docker build -q -t lsrv-linux-check linux >/dev/null
-  docker build -q -t lsrv-parse-profile bench/parse >/dev/null
+  # bench/parse/Dockerfile builds on this run's base (BASE_IMAGE).
+  base=lsrv-linux-check:$run_tag image=lsrv-parse-profile:$run_tag
+  run_image_build "$base" linux
+  run_image_build "$image" --build-arg BASE_IMAGE="$base" bench/parse
   docker run --rm -v lsrv-linux-cache:/home/check/.cache -v "$tmp/tree.tar:/tree.tar:ro" -v "$out/b:/out" \
-    lsrv-linux-check sh -c '
+    "$base" sh -c '
     set -eu
     mkdir src && tar --warning=no-unknown-keyword -xf /tree.tar -C src
     cd src && . bench/lib.sh
     lake build lsrv-parsebench >/out/build.log 2>&1 || { tail -20 /out/build.log; exit 1; }
     cp .lake/build/bin/lsrv-parsebench /out/lsrv-parsebench'
-  docker run --rm --privileged --user root -v "$out:/out" lsrv-parse-profile \
+  docker run --rm --privileged --user root -v "$out:/out" "$image" \
     sh -c 'set -eu
     perf record -q -F 999 -g -o /out/linux-perf.data -- /out/b/lsrv-parsebench "$@" >/out/linux-run.txt 2>&1 ||
       { cat /out/linux-run.txt; exit 1; }

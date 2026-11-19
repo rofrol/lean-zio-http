@@ -1169,6 +1169,24 @@ covered by an OrbStack run; the suite's run on the deployed server's own
 host is in "HttpArena on the VPS". Its last recorded result is in
 `zig/src/serve_test.zig`'s header.
 
+The scripts that build images on this machine's docker
+(`./linux-check.sh`, `bench/arena/local.sh`, `bench/arena/build.sh`,
+`bench/parse/profile.sh`) may run at once from several sessions and
+worktrees against one daemon (item amjip6). Each run therefore tags its
+images `NAME:run-…`, a tag of its own (`linux/run-images.sh`), runs those,
+builds `bench/parse/Dockerfile` on its own base (`--build-arg BASE_IMAGE`),
+and removes exactly those tags when it ends, also on SIGINT or SIGTERM (a
+tag the daemon sets only after that cleanup, when the interrupt came as a
+build was exporting its image, stays: `docker image ls '*:run-*'` lists
+them); the download cache volumes stay shared, and docker's build cache
+keeps a rebuild of unchanged Dockerfiles quick. No image is left tagged for later use: to
+read a profile again, build the image as the script does.
+`linux/run-images-test.sh` checks it with two overlapping runs whose
+`linux/Dockerfile` differs by a marker, forced into the order that would
+mix them up with a shared tag: each run's containers must report its own
+marker, and each run's tags must be gone after it. Run it for every change
+to how those scripts build or name images; it needs docker.
+
 `./bench.sh` runs in the same image (item rqc3ql: it has `bc`, which
 `bench.sh` needs for the CPU per request and lean's share of Go).
 `./linux-check.sh` runs only `./check.sh`; to measure in the container,
