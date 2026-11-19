@@ -10,3 +10,10 @@ Found by the comment audit the user asked for on 2026-11-19. Second sources of t
 - The expected row {"id":42,"randomNumber":2599} in bench/lib.sh, bench/dbcheck/main.go:220, bench.sh:79, bench/dbpairs.sh:86; bench/pgserver's copy of App.Db's query; `cpu()` copied from bench.sh into bench/rows.sh although bench/lib.sh exists.
 - Arch.lean's import rules beside docs/modules.md's table.
 Prefer deriving one from the other; where that is not possible, a check in check.sh that fails on disagreement (pg.c's maxResultBytes line, checked by Test.lean `resultBoundAgrees`, is the model).
+
+Added 2026-11-19 from the audit's second pass over the Lean tests (Test.lean:47-56 against Corpus.lean:16-26 checked by the coordinating session):
+- Test.lean:47-56 redefines `big`, `maxHeadRequest` and `maxRequest` word for word from Corpus.lean:16-26, although it imports Corpus.
+- Test.lean (:49, :62, :111), Corpus.lean (:18-26, :62-69) and Compare.lean:208-237 write sizes derived from maxHeadBytes, maxHeaders and maxBodyBytes as literals (`Content-Length: 8192`, 8193, 100/101, labels "(8192 B)", "(16388 B)"); Corpus.lean:69 `fragmentCorpus` selects rows by those label strings, so editing a label silently drops a row from lsrv-test and lsrv-bench.
+- Compare.lean:208-237: the rows "field lines of 8192/8193 bytes (H1's count)" expect 431 from the adapter's whole-head bound, which their request already exceeds, so H1's own field-bytes limit is never probed at its boundary; it also cites H1.lean line numbers without a pinned commit.
+- App/Fixture.lean:13: the 60,001-byte body is repeated in bench/boundary/main.go:42, and its "several sends, ends with a short one" property depends on serve.zig's out_cap (8192), unchecked.
+- Test.lean:699-736, :825: the memory bounds (163,880, 1,024, 81,920) are repeated by hand in docs/memory.md, and the exact `retainedBytes out != 81920` rests on mimalloc's size classes (with jexowc's test/retained.c point).
