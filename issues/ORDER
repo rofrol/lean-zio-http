@@ -9,7 +9,6 @@ fbqrqb Run bench/arena/build.sh and local.sh end to end on the run-scoped image 
 rvi53e Derive or check the memory bounds docs/memory.md repeats (163,880, 1,024, 81,920 bytes) once jexowc decides the allocator dependency
 gihgde Check zig/src/pg.c's model of a query result's Lean allocation cost against the runtime's real block sizes
 srx6tz Trace the single-sample round trips of 0.2 to 76 ms that bench/fairness's probe sees in every configuration
-ov7ele Decide how to report Zig's "failed command:" line printed for a passing test step (an upstream bug)
 
 ## Needs a decision
 
@@ -24,3 +23,4 @@ g62mok Decide whether to measure the pool's readiness probe (peek against NetPol
 gaf5x5 Decide whether a pipelined batch is bounded by maxResponseBytes (65,536) or by the transport's out_cap (8,192)
 udpq6h Decide whether the head budget of a request left behind several responses or batches may restart with each of them
 umtm4l Decide whether to bound the work one Conn.step does for a connection's pipelined requests
+ov7ele Decide how to report Zig's "failed command:" line printed for a passing test step (an upstream bug)
