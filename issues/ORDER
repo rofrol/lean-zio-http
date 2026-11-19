@@ -1,6 +1,5 @@
 ## Next, in order
 
-g4vate Make check.sh fail on a broken relative Markdown link or anchor
 4bngph Move the toolchain to the first nightly with lean4 PR 16562 and set maxPathSegments and maxQueryParams in the H1 adapter
 owgate Find where H1's parse spends 40 % of lsrv-arena's CPU (about 4-6 µs per request), or accept that cost
 paarzq Write a connection's pipelined responses with one send, as go-fasthttp does, instead of one send and one loop turn per response
@@ -18,6 +17,7 @@ uo5qcn Bring the pool's libpq calls in line with libpq's documented call order, 
 p7nicw Stop discarding statuses and errors that can hide a failure, and replace waits on our own processes with their events (Rule 10)
 b3lisr Retire or record the local workarounds in the HttpArena build: the Rosetta zig wrapper and the gcannon patch
 c6yngw Fix stale and contradictory comments found by the comment audit
+dhosug Decide whether bench/mdlinks keeps its own CommonMark subset parser or uses a CommonMark library
 
 ## Needs a decision
 
