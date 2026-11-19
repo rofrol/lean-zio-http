@@ -119,6 +119,7 @@ naming its date and what it measured):
 - [Where H1's parse spends lsrv-arena's CPU](docs/reports/h1-parse-profile.md)
 - [The dusty failure at 256 connections](docs/reports/dusty-256-connections.md)
 - [dusty on the real zio](docs/reports/dusty-real-zio.md)
+- [Why the 7-byte receive row of Memory grew](docs/reports/chunked-receive-memory.md)
 
 Decisions: decision D1 (the HTTP/1.1 parser) is recorded in ekklesiai.org,
 in its decision record 0001

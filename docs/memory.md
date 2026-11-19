@@ -160,7 +160,7 @@ metadata, which is not derived (`sendingBound`):
 | an 8,000-byte head, after `100 Continue` | 1,000 | 52.0 to 52.1 |
 | a head of 100 short fields, after `100 Continue` | 400 | 49.7 to 49.8 |
 | all but one byte of an 8,192-byte body | 400 | 73.0 to 73.2 |
-| a head of 97 fields of 72-byte values and all but one body byte, received 7 bytes at a time (`--chunk 7`) | 100 | 76.2 to 77.4 |
+| a head of 97 fields of 72-byte values and all but one body byte, received 7 bytes at a time (`--chunk 7`) | 100 | 81.3 to 93.1 |
 | an incomplete request after 50 pipelined ones | 400 | 31.4 to 32.1 |
 | a head whose request-target has 255 path segments | 400 | 51.9 |
 | a head whose request-target has 1,000 query parameters | 400 | 104.6 to 105.1 |
@@ -172,7 +172,13 @@ metadata, which is not derived (`sendingBound`):
 2026-11-19, toolchain nightly-2026-11-19, with the limits; before them, a
 head of 4,000 path segments grew it by 207.8 to 208.0 KiB, one of 4,000
 query parameters by 301.8 to 301.9, and a request line of 8,176 empty query
-parameters by 500.7 to 501.0.) For the line with the most elements the
+parameters by 500.7 to 501.0. The row of 7-byte receives: four runs,
+2026-11-19, toolchain nightly-2026-11-19; it read 76.2 to 77.4 when first
+measured, 2026-11-17, and grew because `Conn.step` keeps the connection's
+state shared while `advance` runs, so each receive copies the whole buffer
+instead of appending in place; with that copy removed the same tree measured
+75.5 to 78.1. The rows that receive whole did not move:
+[the report](reports/chunked-receive-memory.md).) For the line with the most elements the
 limits allow, the adapter's state holds 126,168 bytes (123.2 KiB) of live
 blocks (`lsrv-test`), besides the connection's 20 KiB and its buffer; with
 the hand-written parser, which keeps no state, the same connections grew the
@@ -181,11 +187,13 @@ The interim response shows that a connection
 holds its head; for a body or a request line, the server, started with
 `--report-recv`, prints `received <bytes>` once Lean's state has taken each
 receive, and the scenario waits until those add up to every byte its
-clients wrote (`awaitRead`, since 2026-11-19, item p7nicw): the row of the
-request line, 2026-11-19. The two rows of a body, run 2026-11-17, waited
-instead until the socket queues (lsof on macOS, `/proc` on
+clients wrote (`awaitRead`, since 2026-11-19, item p7nicw): the rows of the
+request line and of 7-byte receives, 2026-11-19. The row of a whole body, run
+2026-11-17, waited instead until the socket queues (lsof on macOS, `/proc` on
 Linux) showed every byte taken from the sockets, which did not exclude a
-receive not yet handed to Lean. At
+receive not yet handed to Lean; for the row of 7-byte receives the change of
+wait made no measurable difference (p7nicw and its parent on the same
+toolchain: 84.5 to 88.6 and 83.8 to 89.6). At
 4,096 connections, connections holding the request line with the most
 elements would take about 668 MiB resident (2.0 GiB before the limits).
 
