@@ -83,7 +83,7 @@ go_pid=$pid go_addr=$addr
 # sample NAME PID ADDR: one run of REQUESTS requests; sets rps.
 sample() {
   snap "$2" >"$tmp/before"
-  result=$(bench/load/load -url "http://$3/db?id=42" -c 1 -n "$requests" -body '{"id":42,"randomNumber":2599}') ||
+  result=$(bench/load/load -url "http://$3/db?id=42" -c 1 -n "$requests" -body "$world42") ||
     { echo "$1 $result" >&2; exit 1; }
   snap "$2" >"$tmp/after"
   rps=$(echo "$result" | sed -n -E 's/^req\/s=([0-9]+) .*/\1/p')

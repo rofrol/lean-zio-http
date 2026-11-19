@@ -19,6 +19,9 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+// App.Db.worldSql; lsrv-test (Test.lean, benchValuesAgree) checks this line.
+const worldSql = "SELECT id, randomnumber FROM world WHERE id = $1"
+
 func main() {
 	conninfo := flag.String("pg", "", "libpq conninfo")
 	conns := flag.Int("conns", 32, "the pool's size")
@@ -42,7 +45,7 @@ func main() {
 			return
 		}
 		var i, n int32
-		err = pool.QueryRow(r.Context(), "SELECT id, randomnumber FROM world WHERE id = $1", id).Scan(&i, &n)
+		err = pool.QueryRow(r.Context(), worldSql, id).Scan(&i, &n)
 		if errors.Is(err, pgx.ErrNoRows) {
 			http.Error(w, "no such row", 404)
 			return

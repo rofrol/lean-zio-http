@@ -76,6 +76,7 @@ var (
 	pgdata   = flag.String("pgdata", "", "the private cluster's data directory, for pg_ctl")
 	pgopts   = flag.String("pgopts", "", "the options pg_ctl starts the cluster with (-o)")
 	pglog    = flag.String("pglog", "", "the cluster's log file")
+	world42  = flag.String("world42", "", "the body GET /db?id=42 answers on the cluster's world (bench/lib.sh)")
 	// The running server's base URL, from its "listening on" line; the tests
 	// run one server at a time.
 	addr     = ""
@@ -217,8 +218,6 @@ func pending(what string, ch chan answer) {
 	}
 }
 
-const world42 = `{"id":42,"randomNumber":2599}`
-
 func connect() *pgx.Conn {
 	c, err := pgx.Connect(ctx, *conninfo+" application_name=dbcheck")
 	if err != nil {
@@ -278,7 +277,7 @@ func pgctl(args ...string) {
 
 func testResults() {
 	s := start("1", "--pg-conns", "2")
-	expect("results: id 42", get("/db?id=42"), 200, world42)
+	expect("results: id 42", get("/db?id=42"), 200, *world42)
 	expect("results: no such row", get("/db?id=999999"), 404, "")
 	expect("results: chained queries", get("/chain"), 200, "2")
 	expect("results: no query", get("/"), 200, "Hello, World!")
@@ -293,7 +292,7 @@ func testSlowQuery() {
 		fail("slow query: the query never waited for the lock")
 	}
 	expect("slow query: a request with no query on the same loop", get("/"), 200, "Hello, World!")
-	expect("slow query: a query on the other slot", get("/db?id=42"), 200, world42)
+	expect("slow query: a query on the other slot", get("/db?id=42"), 200, *world42)
 	pending("slow query: the waiting query", slow)
 	l.Close(ctx)
 	expect("slow query: once released", <-slow, 200, "released")
@@ -323,7 +322,7 @@ func testExhaustion() {
 	l.Close(ctx)
 	expect("exhaustion: the slow query", <-slow, 200, "released")
 	for i, ch := range queued {
-		expect(fmt.Sprintf("exhaustion: queued query %d", i), <-ch, 200, world42)
+		expect(fmt.Sprintf("exhaustion: queued query %d", i), <-ch, 200, *world42)
 	}
 	if n := backends(connect()); n != 1 {
 		fail("exhaustion: %d backends of lsrv after the queue, want 1", n)
@@ -339,7 +338,7 @@ func testRestart() {
 	if !awaitWaiters(l, 1) {
 		fail("restart: the warm-up query never waited for the lock")
 	}
-	expect("restart: warm-up", get("/db?id=42"), 200, world42)
+	expect("restart: warm-up", get("/db?id=42"), 200, *world42)
 	l.Close(ctx)
 	expect("restart: warm-up", <-warm, 200, "released")
 	// A prepared transaction holds the lock across the restart.
@@ -361,7 +360,7 @@ func testRestart() {
 	h = connect()
 	run(h, "COMMIT PREPARED 'dbcheck'")
 	for i := 0; i < 4; i++ {
-		expect("restart: after the restart", get("/db?id=42"), 200, world42)
+		expect("restart: after the restart", get("/db?id=42"), 200, *world42)
 	}
 	// Both slots again: one waits, the other answers.
 	l = lockHeld(9)
@@ -369,7 +368,7 @@ func testRestart() {
 	if !awaitWaiters(l, 1) {
 		fail("restart: the query after the restart never waited for the lock")
 	}
-	expect("restart: the second slot after the restart", get("/db?id=42"), 200, world42)
+	expect("restart: the second slot after the restart", get("/db?id=42"), 200, *world42)
 	l.Close(ctx)
 	expect("restart: the first slot after the restart", <-warm, 200, "released")
 	h.Close(ctx)
@@ -379,12 +378,12 @@ func testRestart() {
 func testErrors() {
 	s := start("1", "--pg-conns", "1")
 	expect("errors: a query that cannot be prepared", get("/bad"), 500, "database error 42703\n")
-	expect("errors: the next query", get("/db?id=42"), 200, world42)
+	expect("errors: the next query", get("/db?id=42"), 200, *world42)
 	expect("errors: a statement prepared", get("/div?d=1"), 200, "1")
 	expect("errors: the cached statement failing", get("/div?d=0"), 500, "database error 22012\n")
 	expect("errors: the cached statement again", get("/div?d=2"), 200, "0")
 	expect("errors: a transaction left open", get("/begin"), 500, "database error 25000\n")
-	expect("errors: after the transaction", get("/db?id=42"), 200, world42)
+	expect("errors: after the transaction", get("/db?id=42"), 200, *world42)
 	s.stop("errors")
 }
 
@@ -401,12 +400,12 @@ func backendPid(c *pgx.Conn) int {
 func testSchemaChange() {
 	s := start("1", "--pg-conns", "1")
 	c := connect()
-	expect("schema change: the statement prepared", get("/db?id=42"), 200, world42)
+	expect("schema change: the statement prepared", get("/db?id=42"), 200, *world42)
 	pid := backendPid(c)
 	for _, typ := range []string{"bigint", "int"} {
 		run(c, "ALTER TABLE world ALTER COLUMN randomnumber TYPE "+typ)
 		expect("schema change to "+typ+": the cached statement", get("/db?id=42"), 500, "database error 0A000\n")
-		expect("schema change to "+typ+": prepared again", get("/db?id=42"), 200, world42)
+		expect("schema change to "+typ+": prepared again", get("/db?id=42"), 200, *world42)
 		if p := backendPid(c); p != pid {
 			fail("schema change to %s: backend %d, want the same session's %d", typ, p, pid)
 		}
@@ -451,7 +450,7 @@ func testOversized() {
 	if n := count(c, "SELECT count(*) FROM big"); n != 10 && n != 2010 {
 		fail("oversized: %d rows in big, want 10 (rolled back) or 2010 (committed)", n)
 	}
-	expect("oversized: the next query", get("/db?id=42"), 200, world42)
+	expect("oversized: the next query", get("/db?id=42"), 200, *world42)
 	run(c, "DROP TABLE big")
 	c.Close(ctx)
 	s.stop("oversized")
@@ -459,14 +458,14 @@ func testOversized() {
 
 func testDown() {
 	s := start("1", "--pg-conns", "2")
-	expect("down: before", get("/db?id=42"), 200, world42)
+	expect("down: before", get("/db?id=42"), 200, *world42)
 	pgctl("stop", "-m", "fast")
 	for i := 0; i < 3; i++ {
 		expect("down: while stopped", get("/db?id=42"), 503, "")
 	}
 	expect("down: no query while stopped", get("/"), 200, "Hello, World!")
 	pgctl("start")
-	expect("down: after the start", get("/db?id=42"), 200, world42)
+	expect("down: after the start", get("/db?id=42"), 200, *world42)
 	s.stop("down")
 }
 
@@ -494,7 +493,7 @@ const short = "300"
 func testQueryDeadline() {
 	s := start("1", "--pg-conns", "1", "--trace", "--pg-query-max-ms", "600000")
 	c := connect()
-	expect("query deadline: a session opened", get("/db?id=42"), 200, world42)
+	expect("query deadline: a session opened", get("/db?id=42"), 200, *world42)
 	pid := backendPid(c)
 	// Expiry in flight: the query waits on the lock past its budget.
 	l := lockHeld(12)
@@ -509,7 +508,7 @@ func testQueryDeadline() {
 	if !awaitNoBackends(c) {
 		fail("query deadline: the closed session's backend never ended")
 	}
-	expect("query deadline: the next query", get("/db?id=42"), 200, world42)
+	expect("query deadline: the next query", get("/db?id=42"), 200, *world42)
 	if p := backendPid(c); p == pid {
 		fail("query deadline: backend %d serves again after its session expired", p)
 	}
@@ -525,7 +524,7 @@ func testQueryDeadline() {
 	pending("query deadline: the busy query", busy)
 	l.Close(ctx)
 	expect("query deadline: the busy query", <-busy, 200, "released")
-	expect("query deadline: after the queue", get("/db?id=42"), 200, world42)
+	expect("query deadline: after the queue", get("/db?id=42"), 200, *world42)
 	if p := backendPid(c); p != pid {
 		fail("query deadline: backend %d, want the busy session's %d", p, pid)
 	}
@@ -539,12 +538,12 @@ func testQueryDeadline() {
 func testStatementTimeout() {
 	s := start("1", "--pg-conns", "1", "--pg-statement-ms", short)
 	c := connect()
-	expect("statement_timeout: a session opened", get("/db?id=42"), 200, world42)
+	expect("statement_timeout: a session opened", get("/db?id=42"), 200, *world42)
 	pid := backendPid(c)
 	l := lockHeld(16)
 	expect("statement_timeout: the statement ended by PostgreSQL", get("/lock?key=16"), 504, "database error 57014\n")
 	l.Close(ctx)
-	expect("statement_timeout: the next query", get("/db?id=42"), 200, world42)
+	expect("statement_timeout: the next query", get("/db?id=42"), 200, *world42)
 	if p := backendPid(c); p != pid {
 		fail("statement_timeout: backend %d, want the same session's %d", p, pid)
 	}
@@ -610,8 +609,8 @@ func testDrain() {
 
 func main() {
 	flag.Parse()
-	if *conninfo == "" || *pgdata == "" || *pglog == "" {
-		fmt.Println("usage: dbcheck -pg CONNINFO -pgdata DIR -pgopts OPTS -pglog FILE [-server PATH]")
+	if *conninfo == "" || *pgdata == "" || *pglog == "" || *world42 == "" {
+		fmt.Println("usage: dbcheck -pg CONNINFO -pgdata DIR -pgopts OPTS -pglog FILE -world42 BODY [-server PATH]")
 		os.Exit(2)
 	}
 	for _, t := range []struct {

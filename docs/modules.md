@@ -4,8 +4,10 @@ Lake libraries (`lakefile.lean`) and what each may import. `lsrv-arch`
 (`Arch.lean`) reads the imports of every `.lean` file of the package and
 fails on an import its module's rule does not allow, and on a file no rule
 names, so a new module, an application included, fails until its row is
-added; `bench.sh` runs it, and runs it on a fixture package whose forbidden
-imports it must report.
+added; it also fails when this table says otherwise than its rules, for
+any module of the package and any import among them and
+`Std.Http.Protocol.H1`. `check.sh` runs it, and runs it on a fixture
+package whose forbidden imports it must report.
 
 | module | role | may import |
 |---|---|---|
@@ -23,7 +25,7 @@ imports it must report.
 | `App.Arena` | HttpArena's HTTP/1.1 endpoints ([HttpArena on the VPS](reports/httparena-vps.md)) | `Server.Handler` |
 | `Main`, `Fixture`, `MainDb`, `MainArena` | composition roots `lsrv`, `lsrv-fixture`, `lsrv-db`, `lsrv-arena`: H1 and one application | `Server.Transport`, `Server.H1Adapter`, `App.*` |
 | `MainHand`, `FixtureHand` | `lsrv-hand`, `lsrv-fixture-hand`: the same with the hand-written parser | `Server.Transport`, `Server.HandParser`, `App.*` |
-| `Test`, `Bench`, `Compare`, `Corpus`, `Arch` | tests and measurements | anything |
+| `Test`, `Bench`, `ParseBench`, `Compare`, `Corpus`, `Arch` | tests and measurements | anything |
 | `docs.upstream.*` | reproducers for the drafts of upstream reports in `docs/upstream/`, run with `lean --run`, not built by Lake | `Std.Http.Protocol.H1` |
 
 "Contracts" are `Server.Query`, `Server.Wire` and `Server.Handler`. The

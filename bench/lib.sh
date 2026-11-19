@@ -66,9 +66,25 @@ stop() {
   if [ "${1:-}" = graceful ] && [ "$status" != 0 ]; then echo "$name exited with $status after SIGTERM"; exit 1; fi
 }
 
+# cpu PID: the process's CPU time (user + system) in seconds: /proc on Linux,
+# ps on macOS, whose TIME column is [[dd-]hh:]mm:ss.ss.
+cpu() {
+  if [ -r "/proc/$1/stat" ]; then
+    awk -v hz="$(getconf CLK_TCK)" '{print ($14 + $15) / hz}' "/proc/$1/stat"
+  else
+    ps -o time= -p "$1" | awk '{
+      t = $1; d = 0
+      if (index(t, "-")) { split(t, a, "-"); d = a[1]; t = a[2] }
+      n = split(t, p, ":"); s = 0
+      for (i = 1; i <= n; i++) s = s * 60 + p[i]
+      print d * 86400 + s }'
+  fi
+}
+
 # pg_start: creates and starts the private cluster (trust authentication on
 # its own Unix socket under $tmp only, no TCP listener) with the table world
-# filled; sets pgdata, pgopts and pg (the connection string).
+# filled; sets pgdata, pgopts and pg (the connection string). world42 is the
+# body GET /db?id=42 answers (App/Db.lean) on that table.
 pg_start() {
   pgdata="$tmp/pgdata"
   pgopts="-c listen_addresses= -c unix_socket_directories=$tmp -p 5499 -c max_prepared_transactions=4 -c max_connections=200"
@@ -78,6 +94,7 @@ pg_start() {
   initdb -D "$pgdata" -U postgres --auth=trust -E UTF8 --no-locale --no-sync >"$tmp/initdb.log" 2>&1 || { cat "$tmp/initdb.log"; exit 1; }
   pg_ctl -D "$pgdata" -w -l "$tmp/pg.log" -o "$pgopts" start >/dev/null
   # The rows of world: randomnumber = (id * 7919) mod 10000 + 1 (42 -> 2599).
+  world42='{"id":42,"randomNumber":2599}'
   psql "$pg" -q -v ON_ERROR_STOP=1 -c "CREATE TABLE world (id int PRIMARY KEY, randomnumber int NOT NULL);
     INSERT INTO world SELECT i, (i * 7919) % 10000 + 1 FROM generate_series(1, 10000) i; ANALYZE world;"
 }

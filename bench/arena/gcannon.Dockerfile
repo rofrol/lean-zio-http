@@ -6,7 +6,7 @@
 #
 # The base image is linux/Dockerfile's debian:trixie index digest as of
 # 2026-11-18 (item ugay7c); linux/Dockerfile is its source of truth: move
-# this copy with it. Debian's apt packages still float with the archive.
+# this copy with it (lsrv-test, Test.lean's pinsAgree, checks it). Debian's apt packages still float with the archive.
 # A docker build, unlike `docker run`, resolves the index for the requested
 # platform: on OrbStack's classic image store, `docker run --platform
 # linux/amd64` of this digest fails with "cannot overwrite digest" once the

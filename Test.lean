@@ -1150,7 +1150,7 @@ def transportCodesAgree : Check Unit := do
 /-- The Go programs `check.sh` runs state values of the server again, each a
 `const NAME = VALUE` line: the request limits (`Server.Wire`,
 `H1Adapter`), the transport's receive buffer (`recv_cap` of `serve.zig`,
-read from it) and the size of `App.Fixture.body`.
+read from it), the size of `App.Fixture.body` and the query of `App.Db`.
 That body takes several sends and ends with a short one (App/Fixture.lean)
 only while it is longer than `out_cap` and no multiple of it. -/
 def benchValuesAgree : Check Unit := do
@@ -1166,9 +1166,44 @@ def benchValuesAgree : Check Unit := do
       ("maxQueryParams", H1Adapter.maxQueryParams), ("bodySize", App.Fixture.body.size)] do
     goConst boundary n v
   if let some c := recvCap then goConst boundary "recvCap" c
+  -- Exactly, not through definedOnce, which collapses runs of spaces.
+  let pg ← IO.FS.readFile "bench/pgserver/main.go"
+  unless (pg.splitOn s!"\nconst worldSql = \"{App.Db.worldSql}\"\n").length == 2 do
+    fail s!"bench values: bench/pgserver/main.go has no line `const worldSql = \"{App.Db.worldSql}\"`"
   if let some c := outCap then
     if App.Fixture.body.size ≤ c || App.Fixture.body.size % c == 0 then
       fail s!"bench values: App.Fixture.body has {App.Fixture.body.size} bytes, not over out_cap ({c}) and no multiple of it"
+
+/-- Pins stated in more than one file, each copy checked against its source
+of truth: linux/Dockerfile's debian:trixie digest in the two images of
+bench/arena, bench/arena/build.sh's liburing and gcannon commits in
+bench/arena/local.Dockerfile, and zig/build.zig.zon's zio (URL and hash) in
+dusty-hello/build.zig.zon, which runs dusty on the zio the server uses. -/
+def pinsAgree : Check Unit := do
+  let what := "pins"
+  if let some base ← definition what "linux/Dockerfile" "FROM" "debian:trixie@sha256:" then
+    definedOnce what "bench/arena/local.Dockerfile" "FROM" "debian:trixie" base
+    definedOnce what "bench/arena/gcannon.Dockerfile" "FROM" "debian:trixie" s!"{base} AS build"
+  let localSrc ← IO.FS.readFile "bench/arena/local.Dockerfile"
+  let localLines := (localSrc.splitOn "\n").map fun l =>
+    " ".intercalate ((l.splitToList Char.isWhitespace).filter (· ≠ ""))
+  for (name, repo) in [("liburing_commit", "axboe/liburing.git"), ("gcannon_commit", "MDA2AV/gcannon")] do
+    if let some line ← definition what "bench/arena/build.sh" s!"{name}=" name then
+      -- The value is the assignment's whole first word; a comment may follow.
+      let commit := (((line.dropPrefix? s!"{name}=").map (·.toString)).getD "").splitOn " " |>.headD ""
+      if commit.length != 40 || !commit.all fun c => c.isDigit || ('a' ≤ c && c ≤ 'f') then
+        fail s!"{what}: bench/arena/build.sh has `{line}`, want `{name}=<40 hex digits>`"
+      else
+        -- The checkout must follow the clone of its own repository.
+        let clone := s!"RUN git clone -q https://github.com/{repo} "
+        match (localLines.zip (localLines.drop 1)).filter (·.1.startsWith clone) with
+        | [(_, next)] =>
+          if next != s!"&& git checkout -q {commit} \\" then
+            fail s!"{what}: bench/arena/local.Dockerfile checks out `{next}` after cloning {repo}, want commit {commit}"
+        | cs => fail s!"{what}: bench/arena/local.Dockerfile clones {repo} {cs.length} times, want 1"
+  for key in [".url", ".hash"] do
+    if let some line ← definition what "zig/build.zig.zon" key "zio" then
+      definedOnce what "dusty-hello/build.zig.zon" key "zio" line
 
 /-! ## A value stated again from upstream
 
@@ -1232,6 +1267,7 @@ def main : IO UInt32 := do
     transportCodesAgree
     errorStatusAgrees
     benchValuesAgree
+    pinsAgree
     rawTargetCases
     retainedScenario
     responseCapacityScenario

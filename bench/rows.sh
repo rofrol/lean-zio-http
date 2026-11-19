@@ -36,20 +36,6 @@ done
 [ -x bench/load/load ] || { echo "bench/load/load is missing: go build -o load . in bench/load" >&2; exit 2; }
 . bench/lib.sh
 
-# CPU seconds (user + system) of process $1, as bench.sh's cpu().
-cpu() {
-  if [ -r "/proc/$1/stat" ]; then
-    awk -v hz="$(getconf CLK_TCK)" '{print ($14 + $15) / hz}' "/proc/$1/stat"
-  else
-    ps -o time= -p "$1" | awk '{
-      t = $1; d = 0
-      if (index(t, "-")) { split(t, a, "-"); d = a[1]; t = a[2] }
-      n = split(t, p, ":"); s = 0
-      for (i = 1; i <= n; i++) s = s * 60 + p[i]
-      print d * 86400 + s }'
-  fi
-}
-
 case $(uname) in
   Darwin) timeflag=-l; rsspat='maximum resident set size' ;;
   *) timeflag=-v; rsspat='Maximum resident set size' ;;

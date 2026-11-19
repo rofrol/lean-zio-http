@@ -24,21 +24,6 @@ command -v bc >/dev/null || { echo "bench.sh needs bc (CPU per request, lean-db/
 (cd bench/goserver && go build -o server .)
 (cd bench/pgserver && go build -o server .)
 
-# Server CPU time (user + system) in seconds: /proc on Linux, ps on macOS,
-# whose TIME column is [[dd-]hh:]mm:ss.ss.
-cpu() {
-  if [ -r "/proc/$1/stat" ]; then
-    awk -v hz="$(getconf CLK_TCK)" '{print ($14 + $15) / hz}' "/proc/$1/stat"
-  else
-    ps -o time= -p "$1" | awk '{
-      t = $1; d = 0
-      if (index(t, "-")) { split(t, a, "-"); d = a[1]; t = a[2] }
-      n = split(t, p, ":"); s = 0
-      for (i = 1; i <= n; i++) s = s * 60 + p[i]
-      print d * 86400 + s }'
-  fi
-}
-
 # measure NAME: the server `start` started last, at $addr.
 measure() {
   name=$1
@@ -76,7 +61,7 @@ measure_db() {
   name=$1
   for c in 1 64; do
     before=$(cpu "$pid")
-    result=$(bench/load/load -url "http://$addr/db?id=42" -c "$c" -d 10s -body '{"id":42,"randomNumber":2599}') || { echo "$name c=$c $result"; exit 1; }
+    result=$(bench/load/load -url "http://$addr/db?id=42" -c "$c" -d 10s -body "$world42") || { echo "$name c=$c $result"; exit 1; }
     after=$(cpu "$pid")
     n=$(echo "$result" | sed -E 's/.* n=([0-9]+).*/\1/')
     echo "$name c=$c $result cpu_us_per_req=$(echo "($after - $before) * 1000000 / $n" | bc)"

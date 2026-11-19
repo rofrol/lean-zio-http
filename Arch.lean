@@ -4,7 +4,8 @@ import Lean.Elab.ParseImportsFast
 checked on the imports every Lean file of this package declares. Each module
 may import only what its rule below allows; a file no rule names fails, so a
 new module must be placed in the map before it builds into a passing check.
-Run from the repository root (or pass the package directory); exit status 1 on any
+Run without an argument, it also compares the rules with the table of
+docs/modules.md (`tableAgrees`). Run from the repository root (or pass the package directory); exit status 1 on any
 violation. -/
 
 open Lean
@@ -55,10 +56,69 @@ partial def modules (root dir : System.FilePath) : IO (Array (Name × System.Fil
       out := out.push (parts.foldl Name.str .anonymous, e.path)
   return out
 
+/-- The names in backticks in a cell of docs/modules.md's table, each with
+what it matches: `` `X` `` matches X, `` `X.*` `` what lies under X. -/
+def ticked (cell : String) : List (String × (Name → Bool)) :=
+  ((cell.splitOn "`").zipIdx.filter (·.2 % 2 == 1)).map fun (t, _) =>
+    match t.dropSuffix? ".*" with
+    | some pre => (t, under pre.toString.toName)
+    | none => (t, fun n => n == t.toName)
+
+/-- The comma-separated words of a cell outside its backticks. -/
+def plainWords (cell : String) : List String :=
+  ((cell.splitOn "`").zipIdx.filter (·.2 % 2 == 0)).flatMap fun (s, _) =>
+    (s.splitOn ",").map (·.trimAscii.toString)
+
+/-- What a cell of docs/modules.md's table names, as a predicate on modules:
+`` `X` `` is X, `` `X.*` `` what lies under X, `contracts` the contracts and
+`anything` every module (`nothing` names none). -/
+def cellNames (cell : String) : Name → Bool :=
+  let words := plainWords cell
+  fun n => (ticked cell).any (·.2 n) || (words.contains "contracts" && contracts.contains n) ||
+    words.contains "anything"
+
+/-- docs/modules.md's table of the modules and what each may import must say
+what `rule` says, for every module of the package and every import among the
+package's modules and `Std.Http.Protocol.H1`; returns the disagreements. -/
+def tableAgrees (doc : String) (mods : List Name) : List String := Id.run do
+  let lines := (doc.splitOn "\n").filter (·.startsWith "| `")
+  -- Each row as its line and its module and may-import cells.
+  let rows := lines.filterMap fun line =>
+    match line.splitOn "|" with
+    | [_, who, _, may, _] => some (line, who, may)
+    | _ => none
+  let imports := `Std.Http.Protocol.H1 :: mods
+  let mut out := (lines.filter fun l => (l.splitOn "|").length != 5).map
+    (s!"docs/modules.md: cannot read `{·}`")
+  for (line, who, may) in rows do
+    -- Outside backticks the cells hold only these words.
+    for w in plainWords who ++ plainWords may do
+      unless ["contracts", "nothing", "anything", ""].contains w do
+        out := out ++ [s!"docs/modules.md: unknown word `{w}` in `{line}`"]
+    for (t, hit) in ticked who do
+      unless mods.any hit do out := out ++ [s!"docs/modules.md: no module of the package is `{t}`"]
+    for (t, hit) in ticked may do
+      unless imports.any hit do out := out ++ [s!"docs/modules.md: `{t}` is no module this package may import"]
+  for m in mods do
+    match rows.filter (cellNames ·.2.1 m) with
+    | [(_, _, may)] =>
+      for i in imports do
+        let doc := cellNames may i
+        if (rule m).any (· i) != doc then
+          out := out ++ [s!"docs/modules.md says {m} may{if doc then "" else " not"} import {i}; its rule in Arch.lean says otherwise"]
+    | rs => out := out ++ [s!"docs/modules.md: {rs.length} rows name {m}, want 1"]
+  return out
+
 def main (args : List String) : IO UInt32 := do
   let root : System.FilePath := args.headD "."
   let mut failures := 0
   let mods ← modules root root
+  -- The table is checked on this repository, not on a fixture package given
+  -- as an argument.
+  if args.isEmpty then
+    for f in tableAgrees (← IO.FS.readFile "docs/modules.md") (mods.toList.map (·.1)) do
+      IO.println s!"FAIL {f}"
+      failures := failures + 1
   for (m, path) in mods.qsort (·.1.toString < ·.1.toString) do
     let header ← parseImports' (← IO.FS.readFile path) path.toString
     match rule m with

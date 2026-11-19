@@ -72,8 +72,12 @@ def first : Query.Result → Option (Option String)
   | .rows _ rows => rows[0]? >>= (·[0]?)
   | .error .. | .abandoned .. => none
 
+/-- The query of `/db`; bench/pgserver, the Go server bench.sh compares
+`lsrv-db` with, sends it too, and `lsrv-test` checks its copy. -/
+def worldSql : String := "SELECT id, randomnumber FROM world WHERE id = $1"
+
 def world (id : Nat) : Await Response := do
-  match ← Await.run { sql := "SELECT id, randomnumber FROM world WHERE id = $1", params := #[some (toString id)] } with
+  match ← Await.run { sql := worldSql, params := #[some (toString id)] } with
   | .error st _ => pure (failed st)
   | .abandoned st _ => pure (abandoned st)
   | .rows _ rows =>

@@ -169,4 +169,4 @@ bench/check/check -addr "$addr"
 stop graceful
 
 pg_start
-bench/dbcheck/dbcheck -pg "$pg" -pgdata "$pgdata" -pgopts "$pgopts" -pglog "$tmp/pg.log"
+bench/dbcheck/dbcheck -pg "$pg" -pgdata "$pgdata" -pgopts "$pgopts" -pglog "$tmp/pg.log" -world42 "$world42"
