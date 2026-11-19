@@ -182,6 +182,11 @@ target retained.o pkg : FilePath := do
 @[default_target] lean_exe «lsrv-bench» where
   root := `Bench
 
+-- The H1 parse path on HttpArena's request shapes, for profiling (item
+-- r4q3yu; bench/parse/profile.sh).
+@[default_target] lean_exe «lsrv-parsebench» where
+  root := `ParseBench
+
 @[default_target] lean_exe «lsrv-compare» where
   root := `Compare
 

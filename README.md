@@ -1084,6 +1084,20 @@ integrating a change (item cxhvkb). Both scripts share their helpers and the
 private cluster's setup through `bench/lib.sh`; `bench.sh` measures on a
 fresh cluster after `check.sh`'s has been removed.
 
+The H1 parse path as lsrv-arena drives it has a harness of its own, outside
+both scripts (item r4q3yu, for item owgate): `lsrv-parsebench` runs
+HttpArena's baseline (`get.raw`, `post_cl.raw`, one request per receive) and
+pipelined (16 gcannon requests in one receive) shapes through the adapter's
+parses of each receive (`parse`) and through `Conn.step` with `App.Arena`
+(`step`), printing nanoseconds and allocations per request; `lsrv-parsebench
+SHAPE LEVEL RECEIVES` runs one loop for a profiler. `lsrv-test` checks that
+each shape completes its requests and gets `200` with App.Arena's body
+(`Corpus.arenaShapesCheck`). `bench/parse/profile.sh OUT m1|linux [SHAPE LEVEL
+RECEIVES]` records a call-graph profile of that loop: with Instruments' Time
+Profiler (`xctrace`) on the M1, or with `perf record -g` in
+`linux/Dockerfile`'s image with perf added (`bench/parse/Dockerfile`). No
+figures from it are recorded here yet.
+
 The boundary tests open thousands of loopback connections, and each closed
 one stays in TIME_WAIT for 2*MSL (30 s on macOS) on the side that closed it
 first. On the M1 (item laxhsb) the suite's two runs in one `check.sh` raised

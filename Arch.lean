@@ -37,7 +37,7 @@ def rule (m : Name) : Option (Name → Bool) :=
   | `App.Hello | `App.Arena => some (· == `Server.Handler)
   | `App.Fixture | `App.Db => some (· ∈ [`Server.Handler, `App.Hello])
   -- Tests and measurement tools may import anything.
-  | `Test | `Bench | `Compare | `Corpus | `Arch => some fun _ => true
+  | `Test | `Bench | `ParseBench | `Compare | `Corpus | `Arch => some fun _ => true
   -- Reproducers for upstream reports, run with `lean --run` and not built by
   -- Lake: Std's HTTP/1.1 machine alone, so each stays self-contained.
   | m => if under `docs.upstream m then some (· == `Std.Http.Protocol.H1) else none
