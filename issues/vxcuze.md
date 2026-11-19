@@ -6,3 +6,5 @@ hydrogen (consult round 20261119-120420-c1d1, call 9f681ce4) listed cases batchS
 3. gather's defensive stops (`consumed = 0`, `consumed > buf.size`, an empty response), which H1Adapter cannot produce; they need a synthetic Adapter;
 4. a full buffer answered in several batches that ends on an incomplete request (recv of inCap - tail with the head deadline).
 Also (round 20261119-122005-1e00, sol, call c948e7dc): bench/check's "150 pipelined requests" case cannot show that one receive held them, so the end-to-end batch over 8,192 bytes is checked only in Lean; a Zig-level test of a send over out_cap split across a response boundary with a short write would close that.
+
+Decided 2026-11-19 by the coordinating session with sol and hydrogen (consult round 20261119-131820-9a89; calls 2457b2df, db84fdb7) under the user's delegation to decide the next items with the models: approved into Next (both): batching invariants and short writes, including the Zig-level test with all requests in one receive; leave assertions specific to the batch bound to gaf5x5.
