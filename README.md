@@ -116,6 +116,7 @@ naming its date and what it measured):
 - [PostgreSQL measurements: lean-db against Go](docs/reports/postgresql-throughput.md)
 - [What the dependency assumptions rest on](docs/reports/dependency-assumptions.md)
 - [`Std.Http.Protocol.H1` compared with the hand-written parser](docs/reports/h1-vs-hand-parser.md)
+- [Where H1's parse spends lsrv-arena's CPU](docs/reports/h1-parse-profile.md)
 - [The dusty failure at 256 connections](docs/reports/dusty-256-connections.md)
 - [dusty on the real zio](docs/reports/dusty-real-zio.md)
 

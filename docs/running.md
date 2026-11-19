@@ -54,8 +54,9 @@ each shape completes its requests and gets `200` with App.Arena's body
 (`Corpus.arenaShapesCheck`). `bench/parse/profile.sh OUT m1|linux [SHAPE LEVEL
 RECEIVES]` records a call-graph profile of that loop: with Instruments' Time
 Profiler (`xctrace`) on the M1, or with `perf record -g` in
-`linux/Dockerfile`'s image with perf added (`bench/parse/Dockerfile`). No
-figures from it are recorded here yet.
+`linux/Dockerfile`'s image with perf added (`bench/parse/Dockerfile`). Its
+figures and profiles are in
+[Where H1's parse spends lsrv-arena's CPU](reports/h1-parse-profile.md).
 
 The boundary tests open thousands of loopback connections, and each closed
 one stays in TIME_WAIT for 2*MSL (30 s on macOS) on the side that closed it
