@@ -7,3 +7,5 @@ What the work is: compare the model with the size of the blocks the runtime actu
 Open questions for the owner:
 - Measure through the allocator's own block size (mimalloc's usable size, as test/retained.c does) and accept that dependency, or through Lean's object header sizes alone?
 - Does item jexowc (the mimalloc-dependent `retainedBytes` checks) decide the same question first? If so, this item waits for it.
+
+Decided 2026-11-19 by the coordinating session with sol and hydrogen (consult round 20261119-131820-9a89; calls 2457b2df, db84fdb7) under the user's delegation to decide the next items with the models: stays Proposed until alblg3 decides the allocator dependency.
