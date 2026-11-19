@@ -8,7 +8,6 @@ lmbozk Make the container scripts' working-tree snapshot skip tracked files dele
 fbqrqb Run bench/arena/build.sh and local.sh end to end on the run-scoped image tags, and record amjip6's accepted limits
 fzddri Rerun ./linux-check.sh for the tests and pool changes added since its last recorded run
 yg56hu Stop a passing serve_test run from printing "failed command:" in every check run
-g62mok Decide whether to measure the pool's readiness probe (peek against NetPoll) on Linux
 zoswdj Explain why bench/boundary's 7-byte nearly-maximum-head row measures 82 to 89 KiB against the 76.2 to 77.4 KiB in docs/memory.md
 2mb4o4 Decide whether to propose cheaper head parsing to leanprover/lean4's Std.Http, or accept H1's parse cost
 k57kba Correct bench/parse/profile.sh's count of perf's "unwind: get_proc_name unsupported" messages
@@ -26,3 +25,4 @@ b3lisr Retire or record the local workarounds in the HttpArena build: the Rosett
 dhosug Decide whether bench/mdlinks keeps its own CommonMark subset parser or uses a CommonMark library
 alblg3 Decide what to do with the dependency assumptions that rest on upstream code only (Rule 6)
 4fued7 Stop discarding bpftrace's and perf's exit statuses in bench/arena/local-inner.sh, and end the go entries' readiness loop when the server exits
+g62mok Decide whether to measure the pool's readiness probe (peek against NetPoll) on Linux
