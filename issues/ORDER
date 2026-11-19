@@ -1,10 +1,11 @@
 ## Next, in order
 
+lmbozk Make the container scripts' working-tree snapshot skip tracked files deleted from the working tree
+
 ## Proposed
 
 q2g4am Act on leanprover/lean4's answers to the Std.Http questions 16522 and 16523
 5f54l4 Should H1Adapter decode chunked request bodies, so HttpArena's baseline and limited-conn run with their whole request mix?
-lmbozk Make the container scripts' working-tree snapshot skip tracked files deleted from the working tree
 fbqrqb Run bench/arena/build.sh and local.sh end to end on the run-scoped image tags, and record amjip6's accepted limits
 rvi53e Derive or check the memory bounds docs/memory.md repeats (163,880, 1,024, 81,920 bytes) once jexowc decides the allocator dependency
 gihgde Check zig/src/pg.c's model of a query result's Lean allocation cost against the runtime's real block sizes
