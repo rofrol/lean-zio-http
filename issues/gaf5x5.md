@@ -4,7 +4,7 @@ Item paarzq's approval (2026-11-19) says "into the out_cap-bounded out buffer". 
 
 Seen in: consult round 20261119-120420-c1d1, sol (call 5b71774c): "sound as one logical write bounded by maxResponseBytes, not as one out_cap-bounded transport send … needs explicit owner agreement if out_cap meant Zig's 8,192-byte buffer". hydrogen (call 9f681ce4) judged the reading sound.
 
-Options:
+Options considered:
 1. Keep maxResponseBytes (current). No new constant; memory bound unchanged (one 81,920-byte block at most, docs/memory.md).
 2. Bound a batch by 8,192: a Lean constant equal to serve.zig's out_cap, with a check (lsrv-test or the Zig build) that the two agree; each batch is then one system call when the kernel takes it whole, at the cost of one more loop turn per 8 KiB of pipelined responses and a second source of the transport's buffer size.
 
