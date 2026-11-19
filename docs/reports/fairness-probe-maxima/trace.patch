@@ -1,0 +1,164 @@
+diff --git a/zig/src/serve.zig b/zig/src/serve.zig
+index 41ea82a..125d23f 100644
+--- a/zig/src/serve.zig
++++ b/zig/src/serve.zig
+@@ -136,6 +136,59 @@ var recv_ok = std.atomic.Value(u32).init(0);
+ var send_ok = std.atomic.Value(u32).init(0);
+ var conn_ids = std.atomic.Value(u64).init(0);
+ 
++// INVESTIGATION ONLY (item srx6tz), not part of the server: one loop's events with
++// wall and thread-CPU clocks, written to $LSRV_TRACE when the loop ends.
++const TraceEv = extern struct { kind: u32, id: u32, n: u64, w0: i64, w1: i64, c0: i64, c1: i64, v0: i64, v1: i64, i0: i64, i1: i64 };
++var trace_v0: i64 = 0;
++var trace_i0: i64 = 0;
++fn csw(v: *i64, i: *i64) void {
++    var ru: std.c.rusage = undefined;
++    _ = std.c.getrusage(std.c.rusage.SELF, &ru);
++    v.* = ru.nvcsw;
++    i.* = ru.nivcsw;
++}
++var trace_buf: []TraceEv = &.{};
++var trace_len: usize = 0;
++fn clockNs(id: std.c.clockid_t) i64 {
++    var ts: std.c.timespec = undefined;
++    _ = std.c.clock_gettime(id, &ts);
++    return @as(i64, ts.sec) * 1_000_000_000 + ts.nsec;
++}
++pub export fn lsrv_trace_start(w0: *i64, c0: *i64) void {
++    if (trace_buf.len == 0) return;
++    csw(&trace_v0, &trace_i0);
++    w0.* = clockNs(.REALTIME);
++    c0.* = clockNs(.THREAD_CPUTIME_ID);
++}
++pub export fn lsrv_trace_end(kind: u32, id: u32, n: u64, w0: i64, c0: i64) void {
++    if (trace_buf.len == 0 or trace_len == trace_buf.len) return;
++    const w1 = clockNs(.REALTIME);
++    const c1 = clockNs(.THREAD_CPUTIME_ID);
++    var v1: i64 = 0;
++    var ic1: i64 = 0;
++    csw(&v1, &ic1);
++    trace_buf[trace_len] = .{ .kind = kind, .id = id, .n = n, .w0 = w0, .c0 = c0, .w1 = w1, .c1 = c1, .v0 = trace_v0, .v1 = v1, .i0 = trace_i0, .i1 = ic1 };
++    trace_len += 1;
++}
++fn traceInit() void {
++    if (std.c.getenv("LSRV_TRACE") == null) return;
++    trace_buf = alloc.alloc(TraceEv, 4 << 20) catch @panic("trace alloc");
++    @memset(std.mem.sliceAsBytes(trace_buf), 0);
++}
++fn traceDump() void {
++    const path = std.c.getenv("LSRV_TRACE") orelse return;
++    const fd = std.c.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(c_uint, 0o644));
++    if (fd < 0) @panic("trace open");
++    const bytes = std.mem.sliceAsBytes(trace_buf[0..trace_len]);
++    var off: usize = 0;
++    while (off < bytes.len) {
++        const r = std.c.write(fd, bytes[off..].ptr, bytes.len - off);
++        if (r <= 0) @panic("trace write");
++        off += @intCast(r);
++    }
++    _ = std.c.close(fd);
++}
++
+ /// Whether the receive or send that just completed, counted in `count`, is to
+ /// be reported as failed.
+ fn injectFailure(count: *std.atomic.Value(u32)) bool {
+@@ -238,6 +291,11 @@ pub const Arm = struct {
+         const self: *Arm = @ptrCast(@alignCast(c.userdata.?));
+         const conn = self.conn;
+         pg.ownLoop(loop, &conn.lp.loop);
++        var tw0: i64 = 0;
++        var tc0: i64 = 0;
++        lsrv_trace_start(&tw0, &tc0);
++        const tid: u32 = @truncate(conn.id);
++        defer lsrv_trace_end(5, tid, 0, tw0, tc0);
+         if (self.retired) {
+             self.release();
+             conn.retired_arms -= 1;
+@@ -493,6 +551,11 @@ pub const Conn = struct {
+     fn pollCb(loop: *ev.Loop, c: *ev.Completion) void {
+         const self: *Conn = @ptrCast(@alignCast(c.userdata.?));
+         pg.ownLoop(loop, &self.lp.loop);
++        var tw0: i64 = 0;
++        var tc0: i64 = 0;
++        lsrv_trace_start(&tw0, &tc0);
++        const tid: u32 = @truncate(self.id);
++        defer lsrv_trace_end(6, tid, 0, tw0, tc0);
+         if (self.freed or !self.polling) @panic("a poll completion with no poll in flight");
+         self.polling = false;
+         const stale = self.poll_stale;
+@@ -634,6 +697,11 @@ pub const Conn = struct {
+         const op: *Op = @ptrCast(@alignCast(c.userdata.?));
+         const self = op.conn;
+         pg.ownLoop(loop, &self.lp.loop);
++        var tw0: i64 = 0;
++        var tc0: i64 = 0;
++        lsrv_trace_start(&tw0, &tc0);
++        const tid: u32 = @truncate(self.id);
++        defer lsrv_trace_end(2, tid, 0, tw0, tc0);
+         self.finish(op, c, .recv);
+         if (self.closing) return self.close(); // Lean closed on an expiry; the result is not reported
+         const n = op.comp.recv.getResult() catch |err| switch (err) {
+@@ -681,6 +749,11 @@ pub const Conn = struct {
+         const op: *Op = @ptrCast(@alignCast(c.userdata.?));
+         const self = op.conn;
+         pg.ownLoop(loop, &self.lp.loop);
++        var tw0: i64 = 0;
++        var tc0: i64 = 0;
++        lsrv_trace_start(&tw0, &tc0);
++        const tid: u32 = @truncate(self.id);
++        defer lsrv_trace_end(3, tid, 0, tw0, tc0);
+         self.finish(op, c, .send);
+         self.sent(op.comp.send.getResult() catch null);
+     }
+@@ -847,6 +920,11 @@ pub const LoopCtx = struct {
+     fn readyCb(loop: *ev.Loop, c: *ev.Completion) void {
+         const self: *LoopCtx = @ptrCast(@alignCast(c.userdata.?));
+         pg.ownLoop(loop, &self.loop);
++        var tw0: i64 = 0;
++        var tc0: i64 = 0;
++        lsrv_trace_start(&tw0, &tc0);
++        const tid: u32 = 0;
++        defer lsrv_trace_end(4, tid, 0, tw0, tc0);
+         self.wake_armed = false;
+         var it = self.ready_head;
+         self.ready_head = null;
+@@ -1187,8 +1265,10 @@ fn runLoop(i: usize, lean_thread: bool, report: std.c.fd_t, done: std.c.fd_t) vo
+         return;
+     }
+     defer lp.loop.deinit();
++    traceInit();
+     sendReport(report, 0);
+     lp.loop.run() catch |err| fatal("loop failed: {}", .{err});
++    traceDump();
+     if (lp.head != null) @panic("a loop ended with connections open");
+     sendReport(done, 2);
+ }
+--- a/zig/zig-pkg/zio-0.20.1-xHbVVHJ5LwDFkA-H60i6talbpUANhbMq2ZrtL_FU8ygK/src/ev/backends/kqueue.zig
++++ b/zig/zig-pkg/zio-0.20.1-xHbVVHJ5LwDFkA-H60i6talbpUANhbMq2ZrtL_FU8ygK/src/ev/backends/kqueue.zig
+@@ -752,6 +752,8 @@
+     state.markCompletedFromBackend(target);
+ }
+ 
++extern fn lsrv_trace_start(w0: *i64, c0: *i64) void;
++extern fn lsrv_trace_end(kind: u32, id: u32, n: u64, w0: i64, c0: i64) void;
+ pub fn poll(self: *Self, state: *LoopState, timeout: Duration) !bool {
+     var timeout_spec: std.c.timespec = undefined;
+     const timeout_ptr: ?*const std.c.timespec = if (timeout.value < std.math.maxInt(time.TimeInt)) blk: {
+@@ -763,6 +765,9 @@
+         break :blk &timeout_spec;
+     } else null;
+ 
++    var tw0: i64 = 0;
++    var tc0: i64 = 0;
++    lsrv_trace_start(&tw0, &tc0);
+     const changes = self.change_buffer.items;
+     const rc = std.c.kevent(
+         self.kqueue_fd,
+@@ -777,6 +782,7 @@
+         .INTR => 0, // Interrupted by signal, no events
+         else => |err| return unexpectedError(err),
+     };
++    lsrv_trace_end(1, if (timeout_ptr != null and timeout.value == 0) 1 else 0, n, tw0, tc0);
+     self.change_buffer.clearRetainingCapacity();
+ 
+     if (n == 0) {

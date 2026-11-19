@@ -20,6 +20,16 @@
 // makes it exit 1.
 // It measures only: its figures are machine-dependent and draw no
 // conclusion.
+//
+// For tracing single slow round trips (item srx6tz,
+// docs/reports/fairness-probe-maxima.md): -trace FILE writes one line per
+// probe, `send written received gap gapAt` in nanoseconds: the wall clock
+// before its write and when the write returned, and the end of its read of
+// the response (the send's wall time plus the round trip's monotonic
+// length), to compare with a traced server's wall clock; -spin reads the
+// response by polling the socket without blocking on a thread locked to
+// the probe, so that the largest pause between two polls (`gap`, starting
+// at `gapAt`; 0 without -spin) shows the probe not running (spinRead).
 package main
 
 import (
@@ -31,11 +41,13 @@ import (
 	"io"
 	"net"
 	"os"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -104,6 +116,48 @@ func readResponse(r *bufio.Reader, status string, body []byte) error {
 	return nil
 }
 
+// spinRead reads one response into buf by polling the socket without
+// blocking until it holds a head and the 2-byte body the probe expects
+// (readResponse checks it afterwards), and returns its length and the
+// largest pause between two polls with the wall-clock time it began. A
+// pause covers the probe's thread not running for any reason: the OS's
+// scheduling, or Go's (syscall.Read gives up its P and takes one back).
+func spinRead(raw syscall.RawConn, buf []byte) (got int, gap, gapAt int64, err error) {
+	var rerr error
+	last := time.Now()
+	err = raw.Read(func(fd uintptr) bool {
+		for {
+			if got == len(buf) {
+				rerr = fmt.Errorf("response over %d bytes", len(buf))
+				return true
+			}
+			m, e := syscall.Read(int(fd), buf[got:])
+			now := time.Now()
+			if d := now.Sub(last).Nanoseconds(); d > gap {
+				gap, gapAt = d, last.UnixNano()
+			}
+			last = now
+			switch {
+			case m > 0:
+				got += m
+				if h := bytes.Index(buf[:got], []byte("\r\n\r\n")); h >= 0 && got >= h+4+2 {
+					return true
+				}
+			case e == nil:
+				rerr = fmt.Errorf("end of input after %d bytes", got)
+				return true
+			case e != syscall.EAGAIN && e != syscall.EINTR:
+				rerr = fmt.Errorf("read: %v", e)
+				return true
+			}
+		}
+	})
+	if err == nil {
+		err = rerr
+	}
+	return got, gap, gapAt, err
+}
+
 func fail(format string, a ...any) {
 	fmt.Printf("FAILED: "+format+"\n", a...)
 	os.Exit(1)
@@ -113,6 +167,8 @@ func main() {
 	addr := flag.String("addr", "", "host:port of a server with one loop")
 	load := flag.String("load", "none", "the loader's requests: none, 404 or pipeline")
 	n := flag.Int("n", 20000, "probe requests, at least 1")
+	trace := flag.String("trace", "", "write each probe's send, written and received wall-clock times (ns) and its spin's largest gap to this file")
+	spin := flag.Bool("spin", false, "read the probe's response by polling its socket without blocking, on a locked thread, so a gap between polls shows the probe not running")
 	flag.Parse()
 	if *n < 1 {
 		fail("-n %d: want at least 1", *n)
@@ -173,6 +229,21 @@ func main() {
 	}
 	r := bufio.NewReader(p)
 	lat := make([]time.Duration, 0, *n)
+	type sample struct{ send, written, recv, gap, gapAt int64 }
+	var samples []sample
+	if *trace != "" {
+		samples = make([]sample, 0, *n)
+	}
+	var raw syscall.RawConn
+	var spinBuf []byte
+	if *spin {
+		runtime.LockOSThread()
+		c, err := p.(*net.TCPConn).SyscallConn()
+		if err != nil {
+			fail("probe: %v", err)
+		}
+		raw, spinBuf = c, make([]byte, 4096)
+	}
 	before := served.Load()
 	start := time.Now()
 	for i := 0; i < *n; i++ {
@@ -180,10 +251,32 @@ func main() {
 		if _, err := p.Write([]byte(probeReq)); err != nil {
 			fail("probe write: %v", err)
 		}
-		if err := readResponse(r, "HTTP/1.1 200 ", []byte("ok")); err != nil {
+		var w time.Time
+		if *trace != "" {
+			w = time.Now()
+		}
+		var got int
+		var gap, gapAt int64
+		if *spin {
+			var err error
+			got, gap, gapAt, err = spinRead(raw, spinBuf)
+			if err != nil {
+				fail("probe: %v", err)
+			}
+		} else if err := readResponse(r, "HTTP/1.1 200 ", []byte("ok")); err != nil {
 			fail("probe: %v", err)
 		}
-		lat = append(lat, time.Since(t))
+		d := time.Since(t)
+		if *spin {
+			// Checked after the round trip's end, so the check is not timed.
+			if err := readResponse(bufio.NewReader(bytes.NewReader(spinBuf[:got])), "HTTP/1.1 200 ", []byte("ok")); err != nil {
+				fail("probe: %v", err)
+			}
+		}
+		lat = append(lat, d)
+		if *trace != "" {
+			samples = append(samples, sample{t.UnixNano(), w.UnixNano(), t.UnixNano() + d.Nanoseconds(), gap, gapAt})
+		}
 	}
 	elapsed := time.Since(start)
 	after := served.Load()
@@ -192,6 +285,16 @@ func main() {
 		loaders.Wait()
 	}
 	p.Close()
+
+	if *trace != "" {
+		var b strings.Builder
+		for _, s := range samples {
+			fmt.Fprintf(&b, "%d %d %d %d %d\n", s.send, s.written, s.recv, s.gap, s.gapAt)
+		}
+		if err := os.WriteFile(*trace, []byte(b.String()), 0o644); err != nil {
+			fail("trace: %v", err)
+		}
+	}
 
 	sort.Slice(lat, func(i, j int) bool { return lat[i] < lat[j] })
 	q := func(f float64) time.Duration { return lat[int(f*float64(len(lat)-1))] }

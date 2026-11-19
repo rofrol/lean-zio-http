@@ -118,6 +118,7 @@ naming its date and what it measured):
 - [`Std.Http.Protocol.H1` compared with the hand-written parser](docs/reports/h1-vs-hand-parser.md)
 - [Where H1's parse spends lsrv-arena's CPU](docs/reports/h1-parse-profile.md)
 - [One step on a full buffer of pipelined requests](docs/reports/full-buffer-step.md)
+- [Where bench/fairness's slowest probe round trips come from](docs/reports/fairness-probe-maxima.md)
 - [The dusty failure at 256 connections](docs/reports/dusty-256-connections.md)
 - [dusty on the real zio](docs/reports/dusty-real-zio.md)
 - [Why the 7-byte receive row of Memory grew](docs/reports/chunked-receive-memory.md)
