@@ -1,5 +1,5 @@
-//! Deterministic tests of pg.zig's pool (`zig build test`; README,
-//! "PostgreSQL"): a real zio.ev loop and real sockets, with pg.c replaced by
+//! Deterministic tests of pg.zig's pool (`zig build test`;
+//! docs/postgresql.md): a real zio.ev loop and real sockets, with pg.c replaced by
 //! the scripted fake below. This test is linked without pg.c, so its
 //! `export fn ekk_*` are the symbols pg.zig's `extern fn`s resolve to; they
 //! keep pg.c's C signatures, with `?*anyopaque` for the opaque session and

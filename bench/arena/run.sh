@@ -1,6 +1,6 @@
 #!/bin/sh
 # run.sh tests|bench|db: the VPS side of the HttpArena runs (items 53rwgc,
-# dtlin3; README, "HttpArena on the VPS") and of bench/dbpairs.sh there
+# dtlin3; docs/reports/httparena-vps.md) and of bench/dbpairs.sh there
 # (item akj76n). Run as root from the directory bench/arena/build.sh filled
 # and copied to the host; it writes only under that directory (out/, and
 # db/tmp for the db phase's private PostgreSQL cluster) and starts only

@@ -65,7 +65,7 @@ Effects precede their record: a receive or send has happened in the kernel
 before its event reaches `step`, and a close is chosen before it is performed.
 All of this state is volatile; nothing survives the process, so a crash
 between an effect and its record can leave a peer with a prefix of a response
-(possibly empty) and an unanswered request (README, "Production contract"). -/
+(possibly empty) and an unanswered request (docs/production-contract.md). -/
 
 namespace Server.Conn
 
@@ -344,7 +344,7 @@ variable (now : Nat)
 
 /-- The length bound: the buffer never exceeds `inCap`, and a response being
 sent never exceeds `maxResponseBytes`. Lengths, not capacities: what the
-connection allocates is derived from these in README "Memory". -/
+connection allocates is derived from these in docs/memory.md. -/
 def Inv (s : State σ) : Prop :=
   s.buf.size ≤ inCap ∧ ∀ out off next, s.phase = .writing out off next → out.size ≤ maxResponseBytes
 

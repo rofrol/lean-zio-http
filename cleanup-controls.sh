@@ -1,6 +1,6 @@
 #!/bin/sh
-# The negative controls of the transport tests' cleanup (item znorfg; README,
-# "Running"). `zig build cleanup-controls` in zig/ runs serve_test.zig's tests
+# The negative controls of the transport tests' cleanup (item znorfg;
+# docs/running.md). `zig build cleanup-controls` in zig/ runs serve_test.zig's tests
 # after two tests of zig/src/cleanup_controls_test.zig that misbehave on
 # purpose; it must fail, and in exactly this way:
 # - the test that fails with two connections open fails with its own error,

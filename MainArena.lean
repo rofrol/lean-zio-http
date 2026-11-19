@@ -3,7 +3,7 @@ import Server.H1Adapter
 import App.Arena
 
 /-! `lsrv-arena`: `lsrv` serving `App.Arena`, HttpArena's HTTP/1.1 endpoints,
-for the Linux runs of item 53rwgc (README, "HttpArena on the VPS"). -/
+for the Linux runs of item 53rwgc (docs/reports/httparena-vps.md). -/
 
 server_exports (Server.H1Adapter.adapter {} App.Arena.app)
 

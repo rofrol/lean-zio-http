@@ -3,7 +3,8 @@
 # (`zig build test` in zig/, whose zig/src/pg_glue_test.c runs pg.c against
 # the real libpq) against every libpq line the pool supports, not only the
 # one pg_config names: the lowest supported release and the newest release
-# of each line (README, "PostgreSQL"; zig/src/pg.c, libpq_supported).
+# of each line (docs/running.md; the supported lines in docs/modules.md,
+# `zig/`; zig/src/pg.c, libpq_supported).
 # Opt-in, not part of check.sh (decided 2026-11-17, item oruxe4); run it for
 # every change to the PostgreSQL glue and at libpq updates (AGENTS.project.md).
 #

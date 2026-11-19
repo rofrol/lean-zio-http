@@ -15,7 +15,7 @@
 # (linux/run-images.sh).
 #
 # Required at each update of zio (build.zig.zon), with its result recorded
-# in the commit (README, "Running"). It is development evidence on the host's
+# in the commit (docs/running.md). It is development evidence on the host's
 # architecture and the container runtime's kernel, not production
 # qualification: the deployed server's suite runs on its own host, on the
 # backend it is built with.

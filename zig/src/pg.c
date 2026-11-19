@@ -75,10 +75,10 @@ lean_object *ekk_pg_abandoned(const char *sqlstate, const char *message) { retur
 /* The rows of one chunk. libpq hands a chunk over only once it holds this
    many rows or the execution's rows have ended, so it copies at most
    EKK_CHUNK_ROWS - 1 rows after the one that crosses the bound before the
-   pool sees that row (README, "Bounded only in part"). The smallest size
+   pool sees that row (docs/postgresql.md, "Bounded only in part"). The smallest size
    measured that gets single-row mode's per-row cost back: chunks of 16
    and 64 cost the same within noise, so the smaller residual decides
-   (bench/rows.sh, README "PostgreSQL"). */
+   (bench/rows.sh, docs/reports/postgresql-throughput.md). */
 #define EKK_CHUNK_ROWS 16
 
 /* Where the query in flight is in its commands. */

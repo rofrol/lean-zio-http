@@ -1,6 +1,6 @@
 //! Controlled-interleaving tests of the zio contracts that serve.zig's graceful
-//! shutdown and admission rely on (`zig build test`; README, "Production
-//! contract"). serve.zig runs on real zio.ev loops and real sockets. glue.c
+//! shutdown and admission rely on (`zig build test`;
+//! docs/production-contract.md). serve.zig runs on real zio.ev loops and real sockets. glue.c
 //! (the Lean side) is replaced by the fake below, which always gives the same
 //! answers: after an open, and after a receive that returned bytes, it asks
 //! to receive again; at end of input, on a refusal, on a failure and on an
@@ -28,7 +28,7 @@
 //! made them.
 //!
 //! These tests and pg_test.zig's run on macOS (kqueue, `./check.sh`) and on
-//! Linux (epoll and io_uring, `./linux-check.sh`, README "Running"; rerun it
+//! Linux (epoll and io_uring, `./linux-check.sh`, docs/running.md; rerun it
 //! at each zio update and update this record). Last Linux run, 2026-11-18
 //! (item qgrnr3, after its ten tests of explicitly delivered orderings were
 //! added): OrbStack on the M1, aarch64, kernel
@@ -37,8 +37,8 @@
 //! exit 0, on epoll and on io_uring each: `zig build test` passed (it prints
 //! no count; serve_test.zig then held 40 tests, all 40 passing on macOS),
 //! pg_glue_test passed, and the rest of `./check.sh`, bench/dbcheck on the
-//! container's private cluster included. On the production host, 2026-11-17 (item 53rwgc, README
-//! "HttpArena on the VPS"): x86_64, 2 vCPU, kernel 6.12.74+deb13+1-amd64,
+//! container's private cluster included. On the production host, 2026-11-17 (item 53rwgc,
+//! 3ce9bdc; its rerun of 2026-11-18 is in docs/reports/httparena-vps.md): x86_64, 2 vCPU, kernel 6.12.74+deb13+1-amd64,
 //! Debian 13.4, the same versions, binaries cross-built by
 //! bench/arena/build.sh: serve_test's 25 tests and pg_test's 31 passed on
 //! epoll and on io_uring each, and pg_glue_test passed. In item wi7efy's run (zio 830564437b2c), with serve.zig's

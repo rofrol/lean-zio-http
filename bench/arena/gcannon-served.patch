@@ -1,5 +1,5 @@
 gcannon-served.patch: applied by gcannon.Dockerfile to gcannon at build.sh's
-pinned commit (item dtlin3; README, "HttpArena on the VPS"). It adds one
+pinned commit (item dtlin3; docs/reports/httparena-vps.md). It adds one
 line to gcannon's report, "Connections served: N": the connection slots
 that received at least one response after the warmup reset, that is in the
 measured window (a slot keeps its mark across reconnects, so with -r it

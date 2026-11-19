@@ -18,7 +18,7 @@ Not posted. The coordinating session posts it on leanprover/lean4 (item jqzv42).
   for "maxQueryParams", "maxPathSegments", "requestTargetConfig" found nothing.
 - The reproducer is `docs/upstream/TargetCount.lean` in this repository; the
   copy below is that file verbatim, and the outputs are its runs on 2026-11-17.
-- The memory figures are this repository's (README "Memory", "The adapter's
+- The memory figures are this repository's ([Memory](../memory.md), "The adapter's
   state"; item jqzv42): 557,224 bytes is the derived bound of the parsed
   target's live blocks, 484,960 bytes what `lsrv-test` finds for 8,176 empty
   query parameters, 500.7 to 501.0 KiB the resident growth `bench/boundary`

@@ -6,7 +6,7 @@
 // result it reports back). Around that the loop owns admission (at most `max_conns`
 // connections, the rest wait in the kernel's listen queue), the
 // classification of accept errors, and the graceful shutdown on SIGTERM or
-// SIGINT (README, "Production contract"), and the per-connection deadlines'
+// SIGINT (docs/production-contract.md), and the per-connection deadlines'
 // timers: it arms one for the deadline and generation Lean's state names
 // after each event, and one more for the head budget a pipelined request
 // runs while a response is written (Conn.Phase.ahead), and reports their
@@ -159,7 +159,7 @@ pub var max_conns: u32 = 0;
 /// src/ev/loop.zig, `processCompletions`: "Drain only what was queued at
 /// entry ... The rest runs next tick"), so one connection per callback
 /// admitted one per turn, and under HttpArena's 4,096 connections about half
-/// were not accepted during a 5 s load (README, "The over-5 s tail"). The
+/// were not accepted during a 5 s load (docs/reports/over-5s-tail.md). The
 /// bound keeps a callback's work finite, so the loop's established
 /// connections and the other loops sharing the listener get their turn
 /// while a backlog is taken. The tests (serve_test.zig) lower it.
@@ -536,8 +536,8 @@ pub const Conn = struct {
     /// and followed at once by the response's next send (which gets the
     /// poll if it waits) or by the receive that finds any byte that arrived
     /// meanwhile, so the poll would only cost a poll(2) probe and a
-    /// registration per response (README, "PostgreSQL", measured that
-    /// probe's cost).
+    /// registration per response (docs/reports/postgresql-throughput.md
+    /// measured that probe's cost).
     fn apply(self: *Conn, act: Action) void {
         self.track(act.deadline, act.gen, act.ahead, act.ahead_gen);
         const wants = act.watch != 0;
@@ -854,7 +854,7 @@ pub const LoopCtx = struct {
             error.WouldBlock, error.ConnectionAborted, error.ProtocolFailure, error.BlockedByFirewall, error.NetworkDown => {},
             // Out of descriptors or memory: --max-conns is checked against
             // RLIMIT_NOFILE at startup, so this is pressure from outside the
-            // server; nothing of ours waits for it to end (README).
+            // server; nothing of ours waits for it to end (docs/production-contract.md).
             error.ProcessFdQuotaExceeded, error.SystemFdQuotaExceeded, error.SystemResources => fatal("accept: {}", .{err}),
             // An error of the listening socket itself, or one zio does not
             // name (Unexpected), or a cancel, which only the shutdown makes
@@ -864,7 +864,7 @@ pub const LoopCtx = struct {
             // reach here too, as the pinned zio maps them to Unexpected or
             // OperationNotSupported (src/os/net.zig, errnoToAcceptError); the
             // Linux sources read do not return them from TCP's accept
-            // (README, "Production contract", "Accept errors").
+            // (docs/production-contract.md, "Accept errors").
             else => fatal("accept: {}", .{err}),
         }
     }

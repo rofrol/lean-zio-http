@@ -4,8 +4,9 @@
 # samples (item 7wvkwz). Linux only (it reads /proc); opt-in, not part of
 # check.sh or bench.sh. Run it from the repository root after `lake build`
 # and `go build -o load .` in bench/load and `go build -o server .` in
-# bench/pgserver. In the Linux container, build and run it as README
-# "Running" shows for bench.sh; README "PostgreSQL" has its findings.
+# bench/pgserver. In the Linux container, build and run it as
+# docs/running.md shows for bench.sh; docs/reports/postgresql-throughput.md
+# has its findings.
 #
 # It creates a private cluster (bench/lib.sh, pg_start), starts both servers
 # once with bench.sh's settings, warms each with REQUESTS requests (not

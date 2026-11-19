@@ -27,8 +27,9 @@ and that the queue items about the server move here:
 
 - What it is: a Lean 4 HTTP/1.1 server library on per-core zio.ev event loops
   (Zig, `zig/`), with non-blocking PostgreSQL access from the loops (libpq).
-  The modules, their contracts and what each may import are in `README.md`,
-  "Modules"; `Arch.lean` (`lsrv-arch`) enforces those import rules.
+  The modules, their contracts and what each may import are in
+  [docs/modules.md](docs/modules.md); `Arch.lean` (`lsrv-arch`) enforces
+  those import rules.
 - Architectural core: the contracts `Server.Query`, `Server.Wire` and
   `Server.Handler`. Changing them changes every consumer.
 - Consumers: ekklesiai.org pins this repository by commit
@@ -44,12 +45,41 @@ and that the queue items about the server move here:
 - Persistent data: none; the example applications use a `world` table that
   `bench.sh` creates in a private, disposable cluster.
 
+## Where findings go
+
+The owner asked on 2026-11-19 (item ejegth) that README.md stop collecting
+every item's findings:
+
+- `README.md` holds only what a reader needs to use the library: what it
+  is and for whom, its status and limits, how to depend on it, a short
+  module overview, how to build, check and run it, and its
+  "Documentation" list of the documents below.
+- Contracts and other reference material go to `docs/` (`docs/modules.md`,
+  `docs/production-contract.md`, `docs/postgresql.md`, `docs/memory.md`,
+  `docs/fragmented-requests.md`, `docs/running.md`) and are kept accurate
+  as the code changes; they name an item only where it is needed to find a
+  decision.
+- Measurements and investigations go to `docs/reports/`, one file per
+  topic, each stating its date, the commit or setup measured, and that it
+  is a historical record. A later run of the same topic is added to that
+  file as a dated section saying what it replaces; earlier results stay as
+  written. A reference document may keep, dated, the measurement that
+  supports its contract (the memory growth `bench/boundary` measures, the
+  fragmentation costs `lsrv-bench` measures).
+- Decisions go to decision records (`docs/decisions/`) or `DECISIONS.md`
+  as `AGENTS.md`, Rule 5, says.
+- An item that produces findings names the file it updates among these,
+  never `README.md` by default; a new document is added to README.md's
+  "Documentation" list.
+
 ## Verification
 
-`./bench.sh` (README, "Running"): builds everything, runs `lsrv-test`,
-`lsrv-arch`, `lsrv-compare`, the PostgreSQL pool's and the
-transport's tests (`zig build test` in `zig/`, README "PostgreSQL" and
-"Production contract"), the Zig/Lean boundary tests, the
+`./bench.sh` ([docs/running.md](docs/running.md)): builds everything,
+runs `lsrv-test`, `lsrv-arch`, `lsrv-compare`, the PostgreSQL pool's and
+the transport's tests (`zig build test` in `zig/`,
+[docs/postgresql.md](docs/postgresql.md) and
+[docs/production-contract.md](docs/production-contract.md)), the Zig/Lean
+boundary tests, the
 end-to-end checks against both parsers, the database checks on a private
 PostgreSQL cluster, and the measurements (`lsrv-bench`, then the load
 runs). Any failure stops it with a
@@ -63,7 +93,7 @@ correctness of what it measures is checked in `lsrv-test` (item 6zs4mr). Use `./
 the whole `./bench.sh` stays every item's gate before it ends (decided
 2026-11-17, item cxhvkb).
 
-`./libpq-lines.sh PGSRC` (README, "Running") runs `zig build test` against
+`./libpq-lines.sh PGSRC` ([docs/running.md](docs/running.md)) runs `zig build test` against
 the lowest supported and the newest release of every supported libpq line,
 not only the one `pg_config` names. Run it for every change to the
 PostgreSQL glue (`zig/src/pg.c`, `zig/src/pg_glue_test.c`) and at each
@@ -75,7 +105,7 @@ The PostgreSQL checkout it takes as PGSRC lives at
 libpq cache; `git -C` it `fetch --tags` before a run, and clone
 `https://git.postgresql.org/git/postgresql.git` there only when it is missing.
 
-`./linux-check.sh` (README, "Running") runs the whole `./check.sh` in a
+`./linux-check.sh` ([docs/running.md](docs/running.md)) runs the whole `./check.sh` in a
 Debian container (`linux/Dockerfile`; on the M1, OrbStack's arm64 VM),
 twice, so the transport's and the pool's tests run on epoll and on io_uring
 (item wi7efy). Run it at each update of
@@ -83,7 +113,7 @@ zio and update the record of its last run in `zig/src/serve_test.zig`'s
 header; `./check.sh` does not depend on it (decided 2026-11-17, item
 ogcdwm). It is development evidence, not production qualification.
 
-`./cleanup-controls.sh` (README, "Running") runs the negative controls of
+`./cleanup-controls.sh` ([docs/running.md](docs/running.md)) runs the negative controls of
 the transport tests' cleanup (`Single.deinit`, `zig/src/serve_test.zig`).
 Run it at each update of Zig and for every change to `Single.deinit`; it is
 not part of `./check.sh` (decided 2026-11-17, item znorfg).

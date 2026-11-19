@@ -356,7 +356,7 @@ func testRestart() {
 	// It was sent: the lost connection leaves its outcome unknown.
 	expect("restart: the query in flight", <-inflight, 503, "database error 08006, outcome unknown\n")
 	// The idle slot ends its session when the loop handles its EOF, which
-	// may come after the next request (best effort, README): wait for both.
+	// may come after the next request (best effort, docs/postgresql.md): wait for both.
 	s.await("restart: old sessions closed", 2, func(l string) bool { return l == "pg closed" })
 	h = connect()
 	run(h, "COMMIT PREPARED 'dbcheck'")

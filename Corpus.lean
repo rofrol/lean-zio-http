@@ -104,7 +104,7 @@ r4q3yu, for owgate): the bytes of one receive as lsrv-arena gets it in the
 pipelined sends the request gcannon (fb63bf613873, `src/http.c`,
 `http_build_pipeline`) writes for `http://127.0.0.1:8080/pipeline`, 16 times
 in one write, read in one receive (the runs counted 0.066 `recvfrom` per
-request; README, "What a pipelined response costs"). -/
+request; docs/reports/over-5s-tail.md, "What a pipelined response costs"). -/
 
 /-- One receive of each shape, with the body App.Arena answers each request
 of it with. -/

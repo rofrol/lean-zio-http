@@ -5,7 +5,7 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const lean_include = b.option([]const u8, "lean-include", "Lean include directory") orelse @panic("-Dlean-include required");
     // On Linux zio's event loop runs on the backend named here, epoll (the
-    // default) or io_uring (`-Dlinux-backend`; README, "Modules", `zig/`;
+    // default) or io_uring (`-Dlinux-backend`; docs/modules.md, `zig/`;
     // item wi7efy). Never zio's own default there, `.linux` (Backend(.auto),
     // src/ev/backends/linux.zig), which picks one at run time: the build and
     // the tests must know which one runs. The choice is a build option, not a
@@ -35,9 +35,9 @@ pub fn build(b: *std.Build) void {
     lib.bundle_compiler_rt = true;
     b.installArtifact(lib);
 
-    // `zig build test`: the deterministic tests of the PostgreSQL pool (README,
-    // "PostgreSQL") and of the transport's shutdown and admission (README,
-    // "Production contract"). pg_test.zig runs pg.zig on a real loop with a
+    // `zig build test`: the deterministic tests of the PostgreSQL pool (docs/postgresql.md)
+    // and of the transport's shutdown and admission
+    // (docs/production-contract.md). pg_test.zig runs pg.zig on a real loop with a
     // scripted fake in place of pg.c; pg_glue_test.c runs pg.c and the real
     // libpq against a fake PostgreSQL server, so it links libpq and the Lean
     // runtime.
@@ -52,7 +52,7 @@ pub fn build(b: *std.Build) void {
     const pool_tests = b.addTest(.{ .root_module = pool_mod });
     test_step.dependOn(&b.addRunArtifact(pool_tests).step);
     // serve_test.zig runs serve.zig's shutdown and admission on real loops,
-    // with a fake of glue.c (README, "Production contract").
+    // with a fake of glue.c (docs/production-contract.md).
     const serve_mod = b.createModule(.{
         .root_source_file = b.path("src/serve_test.zig"),
         .target = target,

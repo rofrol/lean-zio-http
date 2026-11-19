@@ -130,7 +130,7 @@ def writeHead (now : Nat) (r : Response) (close : Bool) : ByteArray := Id.run do
 
 /-- The response's bytes: the head (`writeHead`) and the body unless
 `headOnly`, in an array whose capacity is exactly its size, so a response kept
-while it is sent holds no unused capacity (README "Memory"). The capacity is a
+while it is sent holds no unused capacity (docs/memory.md). The capacity is a
 `Nat` sum, which cannot wrap; both appends fit it, so neither grows the array. -/
 def write (now : Nat) (r : Response) (close headOnly : Bool) : ByteArray :=
   let head := writeHead now r close

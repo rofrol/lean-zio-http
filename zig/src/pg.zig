@@ -4,7 +4,7 @@
 // (Server/Query.lean); pg.c makes the libpq calls and builds the
 // results. The pool knows nothing of HTTP: a query comes with a `Waiter`
 // (embedded in the connection that asked) and its result goes to the
-// waiter's `deliver` (README, "PostgreSQL").
+// waiter's `deliver` (docs/postgresql.md).
 //
 // Rules the code below keeps:
 // - Every query gets exactly one result: rows, PostgreSQL's error, or a
@@ -20,7 +20,7 @@
 //   Query.maxResultBytes; each closes its session, so its outcome is
 //   unknown). A query is never retried: once it may have reached the
 //   server, losing the connection or closing its session fails it.
-// - Deadlines (README, "PostgreSQL"): each query has a completion deadline
+// - Deadlines (docs/postgresql.md): each query has a completion deadline
 //   from its submission (queueing included) and the connect in flight one
 //   from its start; all are external database budgets. One timer per pool
 //   is armed for the earliest of them (`rearm`); its callback expires what
@@ -106,7 +106,7 @@ pub const Waiter = struct {
 };
 
 /// The budgets of the pool's deadlines in milliseconds, each an external
-/// database budget (README, "PostgreSQL", "Deadlines"; Server.Transport
+/// database budget (docs/postgresql.md, "Deadlines"; Server.Transport
 /// options `--pg-query-ms`, `--pg-query-max-ms`, `--pg-connect-ms`).
 pub const Budgets = struct {
     /// A query's completion budget when it names none (Query.timeoutMs).

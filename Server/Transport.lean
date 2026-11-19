@@ -150,7 +150,7 @@ structure Options where
   /-- A response: 30 s from when it is ready to its last byte handed to the
   socket. -/
   writeMs : Nat := 30000
-  /-- The PostgreSQL pool's deadlines in milliseconds (README, "PostgreSQL",
+  /-- The PostgreSQL pool's deadlines in milliseconds (docs/postgresql.md,
   "Deadlines"), each an external database budget (policy rule 10), each at
   least 1 (decided 2026-11-17, item 3jnkx5). A query's completion budget when
   it names none (`Server.Query.timeoutMs`): 5 s from its submission to the
@@ -218,7 +218,7 @@ def parseArgs : List String → Options → Except String Options
 [--fail-every N] [--trace] [--crash-after-recv N] [--crash-after-send N]`;
 the last five are the loop's test settings. Serves on 127.0.0.1:PORT (default
 8083) until SIGTERM or SIGINT, then shuts down gracefully and returns 0
-(README, "Production contract"). Once listening it prints `listening on
+(docs/production-contract.md). Once listening it prints `listening on
 127.0.0.1:PORT ...` to stderr; when the port cannot be had it prints why,
 with the errno, and returns 1. -/
 def main (args : List String) : IO UInt32 := do

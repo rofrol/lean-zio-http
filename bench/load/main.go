@@ -16,8 +16,7 @@
 // response at a time; the clock starts once every connection has answered.
 // The window keeps the burst of new connections within the listen queue of
 // the machine the load runs on: macOS holds at most 128 unaccepted connections
-// (kern.ipc.somaxconn) and resets the rest (README, "The dusty failure at 256
-// connections").
+// (kern.ipc.somaxconn) and resets the rest (docs/reports/dusty-256-connections.md).
 package main
 
 import (

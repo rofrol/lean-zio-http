@@ -1,6 +1,6 @@
 import Lean.Elab.ParseImportsFast
 
-/-! `lsrv-arch`: the module boundaries of the server (README, "Modules"),
+/-! `lsrv-arch`: the module boundaries of the server (docs/modules.md),
 checked on the imports every Lean file of this package declares. Each module
 may import only what its rule below allows; a file no rule names fails, so a
 new module must be placed in the map before it builds into a passing check.

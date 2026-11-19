@@ -155,7 +155,7 @@ lean_lib TestSupport where
   root := `MainHand
   moreLinkArgs := #["-lpq"]
 
--- HttpArena's HTTP/1.1 entry (item 53rwgc; README, "HttpArena on the VPS").
+-- HttpArena's HTTP/1.1 entry (item 53rwgc; docs/reports/httparena-vps.md).
 @[default_target] lean_exe «lsrv-arena» where
   root := `MainArena
   moreLinkArgs := #["-lpq"]
@@ -169,8 +169,7 @@ lean_lib TestSupport where
   moreLinkArgs := #["-lpq"]
 
 /-- The test support in C that `lsrv-test` links: `lsrv_retained_bytes`, the
-allocator blocks a Lean value holds, and `lsrv_byte_array_capacity` (README,
-"Memory"). -/
+allocator blocks a Lean value holds, and `lsrv_byte_array_capacity` (docs/memory.md). -/
 target retained.o pkg : FilePath := do
   let src ← inputTextFile <| pkg.dir / "test" / "retained.c"
   buildLeanO (pkg.buildDir / "test" / "retained.o") src

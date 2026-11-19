@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """bench/arena/summarize.py OUT: the table of the HttpArena runs (item 53rwgc;
-README, "HttpArena on the VPS") from the out/ directory bench/arena/run.sh
+docs/reports/httparena-vps.md) from the out/ directory bench/arena/run.sh
 bench wrote, copied off the host.
 
 Per profile and server, over rounds 1-5 (round 0 is the warm-up): the median

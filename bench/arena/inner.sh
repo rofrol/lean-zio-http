@@ -1,6 +1,6 @@
 #!/bin/sh
 # inner.sh tests|bench|db DIR: run.sh runs this in the run's own network and PID
-# namespaces (item 53rwgc; README, "HttpArena on the VPS"). Results go to
+# namespaces (item 53rwgc; docs/reports/httparena-vps.md). Results go to
 # DIR/out.
 #
 # tests: the transport's and the pool's test binaries (zig build test:
@@ -124,7 +124,7 @@ for s in $servers; do
   stop
 done
 # Every check must pass, except the chunked body on lsrv-arena, which answers
-# it 501 (README, "HttpArena on the VPS"); a run with another failure is void.
+# it 501 (docs/reports/httparena-vps.md); a run with another failure is void.
 if grep FAIL "$out/validate.log" | grep -v '^FAIL lsrv-[a-z_]* POST /baseline11?a=13&b=42 chunked body=20:' >&2; then
   echo "a response check failed: no measurement" >&2
   exit 1

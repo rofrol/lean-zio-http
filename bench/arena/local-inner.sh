@@ -1,7 +1,6 @@
 #!/bin/sh
 # local-inner.sh OUT ROUNDS PERF SERVER...: bench/arena/local.sh runs this in
-# its privileged container (item 6p6tu6; README, "The over-5 s tail:
-# connections accepted late"). A labelled stress diagnostic, not a test:
+# its privileged container (item 6p6tu6; docs/reports/over-5s-tail.md). A labelled stress diagnostic, not a test:
 # HttpArena's baseline and pipelined profiles (gcannon, 4096 connections, 5 s)
 # against each SERVER (a binary in /b), with the server and the generator
 # pinned to the same two CPUs (0 and 1), as on the VPS (inner.sh), and

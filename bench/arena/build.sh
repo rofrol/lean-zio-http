@@ -2,7 +2,7 @@
 # bench/arena/build.sh OUT ARENA: builds, on this machine, everything the
 # HttpArena runs on the VPS need, for x86_64 Linux, into OUT (a new, empty
 # directory), from ARENA, a checkout of https://github.com/MDA2AV/HttpArena at
-# the commit below (item 53rwgc; README, "HttpArena on the VPS"). Nothing is
+# the commit below (item 53rwgc; docs/reports/httparena-vps.md). Nothing is
 # built on the VPS: its disk is shared and nearly full.
 #
 # - lsrv-arena (MainArena.lean) and the transport's and the pool's test

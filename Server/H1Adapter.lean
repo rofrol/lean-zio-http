@@ -20,7 +20,7 @@ its input where it was on a line that has not ended, H1.lean:653), so the
 cost of a request in 1-byte receives still grows with the square of its
 longest line. Each request starts from a fresh machine (`Parser.init`). The
 machine's own writer is not used: `Server.Response` writes the bytes.
-`lsrv-bench`'s fragmentation table measures what a split costs (README).
+`lsrv-bench`'s fragmentation table measures what a split costs (docs/fragmented-requests.md).
 
 What H1 checks and this adapter relies on: request-line syntax, a registered
 method (else 501), HTTP/1.0 or 1.1 (1.x above 1 read as 1.1, else 505), the
@@ -83,7 +83,7 @@ the H1 machine, the bytes of the connection's buffer already fed to it, the
 body pulled so far, and whether the `100-continue` the head asked for was
 granted. Its input holds the buffer's unread suffix, so `buf.size -
 remainingBytes` is what the machine has consumed of the buffer. What it holds is
-bounded from `config`'s limits in README "Memory" ("The adapter's state"),
+bounded from `config`'s limits in docs/memory.md ("The adapter's state"),
 which `lsrv-test` checks against the blocks a state holds. -/
 structure Parser where
   machine : H1.Machine .receiving := { config }

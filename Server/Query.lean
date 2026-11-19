@@ -3,7 +3,7 @@ gets back, and `Await`, a handler's answer that may wait for queries before it
 is complete. It imports nothing; `Server.Handler` (the application's side) and
 `Server.Wire` (the connection's side) both build on it, and the loop's
 PostgreSQL pool (zig/src/pg.zig, through zig/src/pg.c) performs the queries
-(README, "PostgreSQL").
+(docs/postgresql.md).
 
 Each query is its own implicit transaction, and successive queries of one
 request may run on different PostgreSQL sessions. A query must leave its
@@ -20,7 +20,7 @@ deadline passed, its result too large) is answered `abandoned`
 
 Each query has a completion deadline (`Query.timeoutMs`), from its
 submission to the pool to its complete result, queueing and connecting
-included (README, "PostgreSQL", "Deadlines"). -/
+included (docs/postgresql.md, "Deadlines"). -/
 
 namespace Server
 

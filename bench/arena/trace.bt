@@ -1,5 +1,5 @@
 // bench/arena/local-inner.sh runs this beside each sample (item 6p6tu6;
-// README, "The over-5 s tail: connections accepted late"). $1: the server's
+// docs/reports/over-5s-tail.md). $1: the server's
 // process name, of which the first 6 characters are compared; $2: the inode
 // of the sample's network namespace (the kernel probes see every namespace).
 //

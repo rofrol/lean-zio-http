@@ -585,7 +585,7 @@ def adapterCases (ad : Adapter) : Check Unit := do
 `pipeline.raw` at da3ded60952b) and its validation's other values, through
 H1: each answers 200 with go-stdlib's body and `text/plain`. Its chunked
 template (`post_chunked.raw`) gets 501, the server's contract while chunked
-request bodies are not decoded (README, "Not yet"); the runs leave it out. -/
+request bodies are not decoded (docs/production-contract.md, "Not yet"); the runs leave it out. -/
 def arenaScenario : Check Unit := do
   let h := "Host: localhost:8080\r\n"
   let ok : List (String × String × String) := [
@@ -698,7 +698,7 @@ example : Response.ownFieldsValid #[("Content-Type", "text/html")] = false := by
 
 /-! ## The H1 adapter's retained state
 
-The bound README "Memory" derives for what `H1Adapter.Parser` holds while a
+The bound docs/memory.md derives for what `H1Adapter.Parser` holds while a
 request is incomplete, by part, in bytes of allocator blocks (toolchain
 nightly-2026-11-17, mimalloc 3.4.5 `mi_good_size`), and the check that the
 blocks the state actually holds stay within each part on requests that drive
@@ -798,7 +798,7 @@ def expectedWrite (now : Nat) (r : Response) (close headOnly : Bool) : ByteArray
 /-- `Response.write` gives an array whose capacity is its size, with heads
 shorter and longer than the scratch 192 bytes and responses of exactly
 `maxResponseBytes`, bytes as `expectedWrite` spells them; a response at the
-limit is one 81,920-byte block (README "Memory"). -/
+limit is one 81,920-byte block (docs/memory.md). -/
 def responseCapacityScenario : Check Unit := do
   let now := 253402300799
   for (what, fs) in [("a short head", #[Response.contentType]),

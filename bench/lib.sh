@@ -46,7 +46,7 @@ start() {
 }
 
 # stop [graceful]: SIGTERM; with `graceful`, the server must exit with status
-# 0 (the Lean servers' shutdown, README "Production contract").
+# 0 (the Lean servers' shutdown, docs/production-contract.md).
 stop() {
   kill -TERM "$pid"
   status=0

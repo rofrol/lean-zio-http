@@ -1,5 +1,5 @@
 /* Deterministic tests of pg.c against the real libpq (`zig build test`;
-   README, "PostgreSQL"): a fake PostgreSQL server on a Unix socket in a
+   docs/postgresql.md): a fake PostgreSQL server on a Unix socket in a
    temporary directory, driven step by step from this one thread, answers
    each query with a fixed sequence of backend messages, delivered whole, one
    message at a time, or one byte at a time. After every piece the test does

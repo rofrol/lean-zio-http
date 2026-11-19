@@ -17,7 +17,7 @@ loop does. The hand-written parser parses the whole buffer again after every
 receive; H1 keeps its machine between receives and parses again only the line
 it is in the middle of (`Server.H1Adapter`). It reports the CPU time and
 allocations for the whole request. The
-transport's memory per connection does not depend on `k` (README, "Memory"):
+transport's memory per connection does not depend on `k` (docs/memory.md):
 the buffer is bounded by `inCap` whatever the split; what the split costs is
 CPU and transient allocation, which this table measures.
 

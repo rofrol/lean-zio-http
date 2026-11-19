@@ -11,7 +11,7 @@ A handler runs on the event loop thread that owns the connection, so a slow
 handler delays every connection of that loop; purity bounds neither its time
 nor its allocations. A query does not run on that thread's time: the
 connection waits for its result while the loop serves its other connections
-(README, "PostgreSQL"). -/
+(docs/postgresql.md). -/
 
 namespace Server
 

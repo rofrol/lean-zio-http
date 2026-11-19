@@ -469,7 +469,7 @@ func shutdown(path string) (string, error) {
 // 408, an idle connection is closed silently. Every connection is freed
 // once, and each server stops gracefully.
 func deadlines(path string) (string, error) {
-	// The budgets: external peer deadlines (README, "Deadlines"); the short
+	// The budgets: external peer deadlines (docs/production-contract.md, "Deadlines"); the short
 	// ones end the scenario soon, the long ones exceed the test's deadline
 	// below, so they cannot be what closed a connection. The closes are
 	// awaited, not timed.
@@ -607,7 +607,7 @@ func admit(path, maxConns string) (string, bool, error) {
 // after its `n`-th successful receive or send (crashArg), before Lean
 // records it, and checks what the client saw: at most `most` bytes, a prefix
 // of the response. A fresh server must then serve normally: nothing of the
-// crashed process survives (README, "Production contract").
+// crashed process survives (docs/production-contract.md).
 func crashPoint(path, crashArg string, n, most int, args ...string) (string, error) {
 	s, err := start(path, append([]string{"1", crashArg, strconv.Itoa(n)}, args...)...)
 	if err != nil {
@@ -658,7 +658,7 @@ func rssKiB(pid int) (int, error) {
 	return strconv.Atoi(strings.TrimSpace(string(out)))
 }
 
-// sendingBound, in KiB: the blocks README "Memory" derives for a connection
+// sendingBound, in KiB: the blocks docs/memory.md derives for a connection
 // sending a final response, the loop's connection (a 20,480-byte malloc
 // block), the buffer (an exact copy of under 8,192 bytes, at most a
 // 10,240-byte mimalloc block) and the response (capacity at most 65,536, an
@@ -675,7 +675,7 @@ const sendingBound = (20480 + 10240 + 81920 + 2048) / 1024
 // the growth of the resident set per connection and checks no bound: the
 // bound of the adapter's state, which such a connection holds, is on live
 // blocks and checked in lsrv-test; how many of the freed ones stay resident
-// is not derived (README, "Memory").
+// is not derived (docs/memory.md).
 func memory(path string) (string, error) {
 	const n = 1000
 	s, err := start(path, "1", "--max-conns", "1100")
@@ -1138,7 +1138,7 @@ func awaitBytes(c *net.TCPConn, k int) error {
 
 // memSnapDir, when set (-memsnap), is where memoryFull writes the server's
 // allocator statistics at each of its two measurements, for attributing the
-// growth between them (README, "Memory"): vmmap -summary (resident size per
+// growth between them (docs/memory.md): vmmap -summary (resident size per
 // region type, and the malloc zones' allocated bytes) and heap -s (the
 // malloc blocks by size). Lean's objects come from the toolchain's mimalloc,
 // whose mappings carry VM tag 100 (mimalloc.h, mi_option_os_tag), which
@@ -1172,7 +1172,7 @@ func memSnapshot(pid, conns int) error {
 
 // memoryFull measures the retained memory of connections each holding a
 // whole response being sent and a buffered tail of pipelined bytes, the most
-// Lean holds per connection at once when it sends (README, "Memory"). A
+// Lean holds per connection at once when it sends (docs/memory.md). A
 // connection takes its input only while it is not sending, and the loop
 // receives at most 8,192 bytes (recv_cap, zig/src/serve.zig) at a time, so
 // while it sends a response its buffer holds at most the rest of the receive
@@ -1478,7 +1478,7 @@ func held(path string, args []string, n int, queueSettle bool, hold func(c *net.
 // arguments, the connections, whether awaitRead settles it, and hold. It
 // fails only when a connection does not reach that state; the memory it
 // reports is checked against no bound, since the adapter's is on live blocks,
-// checked in lsrv-test, not on the resident set (README, "Memory": these
+// checked in lsrv-test, not on the resident set (docs/memory.md: these
 // measurements falsified the earlier 98 KiB).
 func adapterScenario(args []string, n int, queueSettle bool, hold func(c *net.TCPConn) error) func(path string) (string, error) {
 	return func(path string) (string, error) {

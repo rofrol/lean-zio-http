@@ -16,7 +16,7 @@ A query field is split at its first `=`, as Go's `url.ParseQuery` does.
 Go also decodes the value first: `+` becomes a space, which `strconv.Atoi`
 refuses, so a query value counts only as `-` and digits, or digits alone;
 a percent-encoded value (`%31`), which Go would decode to an integer, counts
-nothing here, since this server decodes no query (README, "Not yet").
+nothing here, since this server decodes no query (docs/production-contract.md, "Not yet").
 HttpArena sends plain decimal values. It sees only `Server.Handler`. -/
 
 namespace App.Arena
