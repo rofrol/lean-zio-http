@@ -10,7 +10,6 @@ fzddri Rerun ./linux-check.sh for the tests and pool changes added since its las
 yg56hu Stop a passing serve_test run from printing "failed command:" in every check run
 zoswdj Explain why bench/boundary's 7-byte nearly-maximum-head row measures 82 to 89 KiB against the 76.2 to 77.4 KiB in docs/memory.md
 k57kba Correct bench/parse/profile.sh's count of perf's "unwind: get_proc_name unsupported" messages
-gaf5x5 Decide whether a pipelined batch is bounded by maxResponseBytes (65,536) or by the transport's out_cap (8,192)
 vxcuze Add the remaining edge-case tests of pipelined batching
 vhvejg Measure the step cost of a large pipelined batch and the quadratic copying of the receive buffer's suffix
 rvi53e Derive or check the memory bounds docs/memory.md repeats (163,880, 1,024, 81,920 bytes) once jexowc decides the allocator dependency
@@ -26,3 +25,4 @@ alblg3 Decide what to do with the dependency assumptions that rest on upstream c
 4fued7 Stop discarding bpftrace's and perf's exit statuses in bench/arena/local-inner.sh, and end the go entries' readiness loop when the server exits
 g62mok Decide whether to measure the pool's readiness probe (peek against NetPoll) on Linux
 2mb4o4 Decide whether to propose cheaper head parsing to leanprover/lean4's Std.Http, or accept H1's parse cost
+gaf5x5 Decide whether a pipelined batch is bounded by maxResponseBytes (65,536) or by the transport's out_cap (8,192)
