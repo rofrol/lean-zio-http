@@ -1,7 +1,5 @@
 ## Next, in order
 
-5ffu5o Derive or mechanically check the values copied by hand between languages, files and upstream
-
 ## Proposed
 
 q2g4am Act on leanprover/lean4's answers to the Std.Http questions 16522 and 16523
@@ -18,6 +16,8 @@ k57kba Correct bench/parse/profile.sh's count of perf's "unwind: get_proc_name u
 gaf5x5 Decide whether a pipelined batch is bounded by maxResponseBytes (65,536) or by the transport's out_cap (8,192)
 vxcuze Add the remaining edge-case tests of pipelined batching
 vhvejg Measure the step cost of a large pipelined batch and the quadratic copying of the receive buffer's suffix
+rvi53e Derive or check the memory bounds docs/memory.md repeats (163,880, 1,024, 81,920 bytes) once jexowc decides the allocator dependency
+gihgde Check zig/src/pg.c's model of a query result's Lean allocation cost against the runtime's real block sizes
 
 ## Needs a decision
 
