@@ -1,6 +1,5 @@
 ## Next, in order
 
-jexowc Settle the dependency assumptions that rest on upstream code rather than upstream documentation (Rule 6)
 4bngph Move the toolchain to the first nightly with lean4 PR 16562 and set maxPathSegments and maxQueryParams in the H1 adapter
 owgate Find where H1's parse spends 40 % of lsrv-arena's CPU (about 4-6 µs per request), or accept that cost
 paarzq Write a connection's pipelined responses with one send, as go-fasthttp does, instead of one send and one loop turn per response
@@ -15,6 +14,9 @@ fbqrqb Run bench/arena/build.sh and local.sh end to end on the run-scoped image 
 fzddri Rerun ./linux-check.sh for the tests and pool changes added since its last recorded run
 4fued7 Stop discarding bpftrace's and perf's exit statuses in bench/arena/local-inner.sh, and end the go entries' readiness loop when the server exits
 yg56hu Stop a passing serve_test run from printing "failed command:" in every check run
+alblg3 Decide what to do with the dependency assumptions that rest on upstream code only (Rule 6)
+g62mok Decide whether to measure the pool's readiness probe (peek against NetPoll) on Linux
+hyztfj Trace why `zig build test` prints "failed command:" for the passing serve_test step
 
 ## Needs a decision
 
