@@ -1,0 +1,8 @@
+Stop a passing serve_test run from printing "failed command:" in every check run
+
+Seen in item gjbmli (2026-11-19): every `zig build test` in `./check.sh`, on the host (macOS, `./bench.sh` log line 88) and in both `./linux-check.sh` runs (epoll and io_uring), prints the stderr of serve_test's accept back-off test (`accept: error.SystemResources; backing off until an accept succeeds`, `zig/src/serve.zig:940`) under a "run test serve_test stderr" header, followed by `failed command: .../serve_test --cache-dir=... --seed=... --listen=-`, although the step passes: `zig build test` exits 0 (check.sh continues under `set -e`, and the suite ends with "dbcheck: 0 failures"). Zig 0.17.1 prints a step's stderr whatever its result (`lib/zig/compiler/Maker.zig:2893`, "No matter the result, we want to display error/warning messages"), with the step's `result_failed_command` when one is set (`Maker.zig:3393`). Why the test runner path (`--listen=-`) leaves it set on success was not traced to its line. A reader of a log, human or agent, sees "failed command" in a passing run and must check that it is no failure, and a real failure of serve_test looks the same at a glance.
+
+Options:
+1. Have the back-off message go somewhere the test can capture or silence (a log function the tests replace), so a passing serve_test prints nothing on stderr.
+2. Trace the Zig behavior first. If labeling a passing test's stderr "failed command" breaks Zig's documented contract, it is an upstream bug (AGENTS.md Rule 6: fork and PR, no local workaround). Otherwise record it as Zig's documented behavior beside the test.
+3. Leave it, and note in docs/running.md that this line appears in a passing run.
