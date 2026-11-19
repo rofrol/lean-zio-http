@@ -16,6 +16,7 @@ jexowc Settle the dependency assumptions that rest on upstream code rather than 
 uo5qcn Bring the pool's libpq calls in line with libpq's documented call order, or cite the passage that allows them
 5ffu5o Derive or mechanically check the values copied by hand between languages, files and upstream
 p7nicw Stop discarding statuses and errors that can hide a failure, and replace waits on our own processes with their events (Rule 10)
+b3lisr Retire or record the local workarounds in the HttpArena build: the Rosetta zig wrapper and the gcannon patch
 
 ## Needs a decision
 
