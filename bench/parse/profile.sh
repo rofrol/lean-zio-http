@@ -24,9 +24,14 @@
 # (OUT/linux-run.txt), and the binary (OUT/b/lsrv-parsebench) to read the
 # data again in an image built as this one (the run's own images are untagged
 # when it ends: linux/run-images.sh). perf report's own messages go to
-# OUT/linux-report.log: on the M1 (Debian trixie's perf, arm64, 2026-11-19)
-# one "unwind: get_proc_name unsupported" per few samples, while 99.6 % of
-# the samples still had their whole chain up to `_lean_main`. Needs docker and, for a first build of the
+# OUT/linux-report.log. On the M1 (Debian trixie's perf, arm64), item
+# owgate's run of 2026-11-19 (pipelined parse, 1,000,000 receives, 42 K
+# samples) wrote 168,206 lines of "unwind: get_proc_name unsupported" there
+# for its two reports, about two per sample in each, while 99.99 % of the
+# samples in OUT/linux-children.txt still had their whole chain up to
+# `_lean_main` (99.6 % in the harness's first runs, item r4q3yu, whose count
+# of these lines was not recorded): docs/reports/h1-parse-profile.md,
+# "Anomalies met". Needs docker and, for a first build of the
 # images, network access. Written for the M1's OrbStack, as
 # bench/arena/local.sh: on a Linux host's docker, the container's users may
 # not be able to write to OUT.
