@@ -15,6 +15,7 @@ fbqrqb Run bench/arena/build.sh and local.sh end to end on the run-scoped image 
 jexowc Settle the dependency assumptions that rest on upstream code rather than upstream documentation (Rule 6)
 uo5qcn Bring the pool's libpq calls in line with libpq's documented call order, or cite the passage that allows them
 5ffu5o Derive or mechanically check the values copied by hand between languages, files and upstream
+p7nicw Stop discarding statuses and errors that can hide a failure, and replace waits on our own processes with their events (Rule 10)
 
 ## Needs a decision
 
