@@ -9,8 +9,12 @@ also provides libpq (Homebrew `postgresql@18`), and `bc`, without which
 ./bench.sh
 ```
 
-It builds all parts, runs the Lean tests (`lsrv-test`: both adapters on the
-same requests, limits at their exact boundaries, Host and target
+It first checks that every relative link of the git-tracked Markdown files
+names a tracked file or directory and that each anchor on a Markdown target
+is the GitHub slug of one of its headings (`bench/mdlinks`, which prints
+each broken link with its file, line and whether the path or the anchor
+failed; no network). Then it builds all parts, runs the Lean tests
+(`lsrv-test`: both adapters on the same requests, limits at their exact boundaries, Host and target
 validation, `100-continue`, the response checks, and connections through
 `Conn.step`, and that `zig/src/pg.c`'s result bound equals
 `Query.maxResultBytes`), the module boundary check (`lsrv-arch`), a check that `zig/`

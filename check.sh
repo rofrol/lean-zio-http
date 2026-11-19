@@ -1,7 +1,9 @@
 #!/bin/sh
 # The correctness checks, without the load measurements; ./bench.sh runs this
-# first, and its whole run is the gate for integrating a change. Builds the
-# servers and the checks; runs the Lean unit tests (lsrv-test), the
+# first, and its whole run is the gate for integrating a change. First checks
+# the relative links and anchors of the tracked Markdown files
+# (bench/mdlinks). Builds the servers and the checks; runs the Lean unit
+# tests (lsrv-test), the
 # PostgreSQL pool's and the transport's tests (zig build test, which need no
 # database), a check that zig/ built for Linux at the Lean toolchain's glibc
 # calls nothing that glibc lacks, the module boundary check (lsrv-arch), the
@@ -27,6 +29,10 @@ case $backend in
   *) echo "LSRV_LINUX_BACKEND is $backend: it must be epoll or io_uring"; exit 1 ;;
 esac
 . bench/lib.sh
+# The relative links and anchors between the tracked Markdown files (item
+# g4vate): its unit tests, then the check itself; it needs only Go and git.
+(cd bench/mdlinks && go test ./... && go build -o mdlinks .)
+bench/mdlinks/mdlinks
 # lake builds the Zig library (extern_lib zsrv in lakefile.lean, ZIG_OPTIMIZE
 # picks its optimization) and links it into the servers.
 lake build

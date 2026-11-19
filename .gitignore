@@ -11,3 +11,4 @@ bench/boundary/boundary
 bench/goserver/server
 bench/dbcheck/dbcheck
 bench/pgserver/server
+bench/mdlinks/mdlinks

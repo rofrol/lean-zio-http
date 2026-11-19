@@ -121,6 +121,7 @@ only `Server.Query` values.
 - `bench/`: Go's `net/http` with the same route (`goserver`) and with
   `App.Db`'s `/db` route over a pgx pool (`pgserver`), end-to-end checks over
   real sockets (`check`), the boundary tests (`boundary`, [Running](running.md)), the
-  PostgreSQL tests (`dbcheck`, [Running](running.md)), and a closed-loop keep-alive load
+  PostgreSQL tests (`dbcheck`, [Running](running.md)), a closed-loop keep-alive load
   generator (`load`) that counts only responses with status 200 and the
-  expected body and fails on anything else.
+  expected body and fails on anything else, and the check of the Markdown
+  files' relative links and anchors (`mdlinks`).

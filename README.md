@@ -82,7 +82,7 @@ with `pg_config` and libpq 17 or later, and `bc`.
 
 | command | what it checks |
 |---|---|
-| `./check.sh` | the builds the tests need (not the benchmarks'), the Lean tests, the module boundaries, the transport's and the pool's tests, the boundary and end-to-end checks against both parsers, and the database checks on a private PostgreSQL cluster |
+| `./check.sh` | the relative links and anchors between the Markdown files, the builds the tests need (not the benchmarks'), the Lean tests, the module boundaries, the transport's and the pool's tests, the boundary and end-to-end checks against both parsers, and the database checks on a private PostgreSQL cluster |
 | `./bench.sh` | `./check.sh`, then the measurements against Go and dusty; the gate for integrating a change |
 | `./libpq-lines.sh PGSRC` | the pool's tests against every supported libpq line |
 | `./cleanup-controls.sh` | the negative controls of the transport tests' cleanup |
