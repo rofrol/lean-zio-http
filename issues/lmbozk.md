@@ -9,3 +9,5 @@ Options considered:
 2. Leave it: a deleted tracked file is staged or restored before such a run.
 
 Decided 2026-11-19 by the coordinating session with sol, argon and hydrogen (calls 964aa59f, a7443db6, 932242ab) under the user's delegation: option 1, kept proposed (sol and hydrogen; argon would approve now): low priority while rr2 runs items in fresh worktrees. When taken: reproduce the tar failure with an unstaged deletion first and keep it as the regression test; keep dangling tracked symlinks (test -e || test -L) and NUL-delimited names. The shared image tags are split into their own item, approved.
+
+Decided 2026-11-19 by the coordinating session with sol and hydrogen (consult round 20261119-160527-668d; calls ee644153, 2b769faf) under the user's delegation to decide the next items with the models: approved into Next (both; independent of pending owner decisions), first.
