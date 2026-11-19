@@ -7,3 +7,8 @@ Risk: a difference can let a broken link pass (the check fails open), or reject 
 Question for the owner. Options:
 1. Keep the hand-written parser. Fix differences as documents hit them, each with a test. No new dependency.
 2. Parse with a maintained CommonMark library (for example github.com/yuin/goldmark, MIT, no transitive dependencies). It closes the parsing differences, and only the GitHub slug rule and path resolution stay ours. It adds a module download to check.sh (bench/pgserver already downloads pgx) and a dependency to update.
+
+Sol and hydrogen (consult round 20261119-075953-d7f4, 2026-11-19) both left this to the owner: it trades a parser-coverage risk against a new dependency.
+Question: Should bench/mdlinks keep its own CommonMark subset parser or use a CommonMark library?
+Options: keep the subset parser, fixing a difference when a document meets it | use goldmark (a Go dependency fetched by check.sh)
+Checked: bench/mdlinks/main.go header lists the known differences; none occurs in today's documents.
