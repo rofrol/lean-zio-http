@@ -1,6 +1,5 @@
 ## Next, in order
 
-lmbozk Make the container scripts' working-tree snapshot skip tracked files deleted from the working tree
 srx6tz Trace the single-sample round trips of 0.2 to 76 ms that bench/fairness's probe sees in every configuration
 
 ## Proposed
