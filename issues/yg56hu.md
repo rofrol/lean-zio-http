@@ -6,3 +6,5 @@ Options:
 1. Have the back-off message go somewhere the test can capture or silence (a log function the tests replace), so a passing serve_test prints nothing on stderr.
 2. Trace the Zig behavior first. If labeling a passing test's stderr "failed command" breaks Zig's documented contract, it is an upstream bug (AGENTS.md Rule 6: fork and PR, no local workaround). Otherwise record it as Zig's documented behavior beside the test.
 3. Leave it, and note in docs/running.md that this line appears in a passing run.
+
+Decided 2026-11-19 by the coordinating session with sol and hydrogen (consult round 20261119-131820-9a89; calls 2457b2df, db84fdb7) under the user's delegation to decide the next items with the models: approved into Next as an investigation only (sol; hydrogen left it to the owner): trace why Zig 0.17.1 prints "failed command:" for a passing step; if it is Zig's documented behaviour, note it in docs/running.md; if it is an upstream bug, stop and record a Needs-a-decision item (Rule 6: no local stderr workaround, an upstream report needs the owner's go).
