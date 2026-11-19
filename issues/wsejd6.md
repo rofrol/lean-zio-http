@@ -1,0 +1,6 @@
+Correct batchOverOutCap's claim that one write under the loopback MTU arrives as one receive
+
+Follow-up of item vxcuze (commit fd96f53). `bench/boundary/main.go`, `batchOverOutCap`'s comment says "a single write under the loopback interface's MTU goes out as one segment", implying one receive. Consult round 20261119-141658-bd78 (sol 3872dd2e, hydrogen 61111f8f): TCP gives no such guarantee on macOS or Linux; the MTU bounds packet size, not how a write is split (a partial copy into a tight send buffer makes Go's write loop over several syscalls while the server receives the first part). The models diverged on the remedy (sol: a Zig-side driver that injects one receive; hydrogen: keep the checked premise). Decided by the coordinating session under the user's delegation: keep the checked premise (it exercises the real recv/send path and fails loudly, never passes falsely), and fix its wording and diagnosis:
+- state the premise as an observed loopback behavior, not an MTU guarantee;
+- when the first receive does not hold all requests, report it as a split receive (premise not met, with the receives' sizes), distinct from a batching failure.
+Check: ./bench.sh passes; a forced split (e.g. writing the requests in two writes, locally, not committed) yields the premise message, not a batching failure.
