@@ -29,18 +29,20 @@
 //!
 //! These tests and pg_test.zig's run on macOS (kqueue, `./check.sh`) and on
 //! Linux (epoll and io_uring, `./linux-check.sh`, docs/running.md; rerun it
-//! at each zio update and update this record). Last Linux run, 2026-11-18
-//! (item qgrnr3, after its ten tests of explicitly delivered orderings were
-//! added): OrbStack on the M1, aarch64, kernel
+//! at each zio update and update this record). Each run below names the
+//! commit it ran and counts the tests that commit held; a test added after
+//! the last run here has not run on Linux. Last Linux run, 2026-11-18
+//! (item qgrnr3, commit 7b4e08f): OrbStack on the M1, aarch64, kernel
 //! 7.2.12-orbstack-00394-gbecdd6130068, Debian 13.7, Zig 0.17.1, Lean
 //! nightly-2026-11-17, libpq 17.12, zio 53ed3c377317. `./linux-check.sh`
 //! exit 0, on epoll and on io_uring each: `zig build test` passed (it prints
-//! no count; serve_test.zig then held 40 tests, all 40 passing on macOS),
+//! no count; at 7b4e08f serve_test.zig held 40 tests and pg_test.zig 32),
 //! pg_glue_test passed, and the rest of `./check.sh`, bench/dbcheck on the
 //! container's private cluster included. On the production host, 2026-11-17 (item 53rwgc,
-//! 3ce9bdc; its rerun of 2026-11-18 is in docs/reports/httparena-vps.md): x86_64, 2 vCPU, kernel 6.12.74+deb13+1-amd64,
+//! commit 3ce9bdc; its rerun of 2026-11-18 is in docs/reports/httparena-vps.md): x86_64, 2 vCPU, kernel 6.12.74+deb13+1-amd64,
 //! Debian 13.4, the same versions, binaries cross-built by
-//! bench/arena/build.sh: serve_test's 25 tests and pg_test's 31 passed on
+//! bench/arena/build.sh: serve_test's 25 tests and pg_test's 31 (all that
+//! 3ce9bdc held) passed on
 //! epoll and on io_uring each, and pg_glue_test passed. In item wi7efy's run (zio 830564437b2c), with serve.zig's
 //! `startSend` not trying the send itself (a mutation), 3 tests failed on io_uring, among
 //! them "a response sent at once starts no poll ...". A diagnostic loop of

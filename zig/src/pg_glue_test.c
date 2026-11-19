@@ -25,9 +25,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-/* PQgetResult calls left to the running ekk_pg_collect; reply() sets it
-   before each. A reply here has at most twelve results, the NULLs between
-   commands included. */
+/* PQgetResult calls left to the running ekk_pg_collect; reply_until() and
+   the test of a session that ends with rows held set it to 32 before each
+   call, more than any reply here has results, the NULLs between commands
+   included. */
 static int results_left;
 
 static PGresult *bounded_get_result(PGconn *c) {
@@ -786,7 +787,7 @@ static void startup_options(void) {
     unsetenv("PGSERVICE");
 }
 
-/* ---- what a result costs (pg.c, result_fits) ----
+/* ---- what a result costs (pg.c: rows_take, charge, object_cost) ----
    Results made with libpq's own PGresult builders, no server needed. */
 
 /* A PGresult of `nf` (at most 4) text columns named `cols` and `nt` rows whose field (t, f) is value(t, f, &len): NULL for
@@ -835,7 +836,7 @@ static lean_object *rows_in_chunks(int nf, const char *const *cols, int nt, int 
 }
 
 /* What the Lean value rows_of built costs by the same measure as
-   result_fits, from the sizes its objects have (capacities included). */
+   rows_take charges, from the sizes its objects have (capacities included). */
 static size_t built_cost(lean_object *res) {
     size_t total = object_cost(sizeof(lean_ctor_object), 2);
     lean_object *cols = lean_ctor_get(res, 0), *rows = lean_ctor_get(res, 1);

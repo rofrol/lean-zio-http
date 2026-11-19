@@ -1,5 +1,6 @@
 // Baseline for lsrv-db: Go net/http with a pgx pool, serving GET /db?id=N with
-// the same query and the same JSON as App.Db, on 127.0.0.1:8082. pgx prepares
+// the same query and the same JSON as App.Db, on 127.0.0.1 at a port the
+// kernel picks (main prints it). pgx prepares
 // the statement once per connection and executes it by name after that, as
 // lsrv-db's pool does (zig/src/pg.c, ekk_pg).
 package main
