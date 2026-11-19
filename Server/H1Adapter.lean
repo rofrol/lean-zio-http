@@ -74,8 +74,9 @@ def config : H1.Config :=
     maxHeaderValueLength := inCap
     maxBodySize := maxBodyBytes }
 
-/-- The status H1's own server answers each error with: a copy of the private
-`errorResponseStatus` (H1.lean:1572). -/
+/-- The status H1's own server answers each error with, which H1 keeps in
+the private `errorResponseStatus`; `lsrv-test` (`errorStatusAgrees`)
+compares it with what H1's machine writes for every `H1.Error`. -/
 def errorStatus : H1.Error → Nat
   | .unsupportedVersion => 505
   | .unsupportedTransferCoding => 501
@@ -170,12 +171,13 @@ def Parser.parse (p : Parser) (buf : ByteArray) : Parser × Parsed :=
 /-- Parses the request at the start of `buf` in one call. -/
 def parse (buf : ByteArray) : Parsed := (Parser.parse {} buf).2
 
-/-- The request-target exactly as sent: the bytes between the request line's
-first and second SP. H1 has validated the line, so both exist. -/
+/-- The request-target exactly as sent: the bytes between the buffer's first
+and second SP. H1 has validated the request line, so both exist there, and
+what it accepts before that line, empty lines (RFC 9112 2.2), holds no SP;
+so this does not depend on which empty lines H1 skips. `lsrv-test` checks it
+after several. -/
 def rawTarget (buf : ByteArray) : String := Id.run do
   let mut i := 0
-  -- H1 skips empty lines before the request line (Parser.lean:127).
-  while i < buf.size && (buf[i]! == 13 || buf[i]! == 10) do i := i + 1
   while i < buf.size && buf[i]! != 32 do i := i + 1
   let s := i + 1
   let mut e := s

@@ -1,4 +1,5 @@
 import Server.Conn
+import Server.Transport
 import Server.H1Adapter
 import Server.HandParser
 import App.Hello
@@ -44,12 +45,7 @@ def statusOf (r : Reply) : String := ((responseOf r).splitOn "\r\n").head!
 
 def bytes (s : String) : ByteArray := s.toUTF8
 
-def big (n : Nat) : String := String.ofList (List.replicate n 'a')
-
-def maxHeadRequest : String :=
-  -- A head of exactly maxHeadBytes (8192) bytes before CRLFCRLF.
-  let fixed := "GET / HTTP/1.1\r\nHost: a\r\nX: "
-  fixed ++ big (maxHeadBytes - fixed.length) ++ "\r\n\r\n"
+open Corpus (big maxHeadRequest maxRequest)
 
 /-- A GET of `target`. -/
 def getOf (target : String) : String := s!"GET {target} HTTP/1.1\r\nHost: a\r\n\r\n"
@@ -57,15 +53,11 @@ def getOf (target : String) : String := s!"GET {target} HTTP/1.1\r\nHost: a\r\n\
 /-- `n` copies of `s` separated by `sep`. -/
 def sepBy (sep s : String) (n : Nat) : String := sep.intercalate (List.replicate n s)
 
-def maxRequest : String :=
-  let fixed := "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 8192\r\nX: "
-  fixed ++ big (maxHeadBytes - fixed.length) ++ "\r\n\r\n" ++ big maxBodyBytes
-
 /-- A head of 10,000 bytes: a start line and a field block of 5,000 bytes
 each, under H1's separate limits but over `maxHeadBytes` in all; with the
 largest body it would exceed `inCap`. -/
 def splitHead : String :=
-  "POST /" ++ big 5000 ++ " HTTP/1.1\r\nHost: a\r\nContent-Length: 8192\r\nX: " ++ big 5000 ++ "\r\n\r\n"
+  "POST /" ++ big 5000 ++ s!" HTTP/1.1\r\nHost: a\r\nContent-Length: {maxBodyBytes}\r\nX: " ++ big 5000 ++ "\r\n\r\n"
 
 /-- An adapter under test, with `App.Hello` unless a case names another application. -/
 structure Adapter where
@@ -114,7 +106,7 @@ def cases : List Case := [
   { name := "conflicting Content-Length", request := "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\nab", kind := 2, status := "HTTP/1.1 400 Bad Request" },
   { name := "Content-Length list", request := "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 1, 1\r\n\r\na", kind := 2, status := "HTTP/1.1 400 Bad Request" },
   { name := "chunked", request := "POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n", kind := 2, status := "HTTP/1.1 501 Not Implemented" },
-  { name := "body over the limit", request := "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 8193\r\n\r\n", kind := 2, status := "HTTP/1.1 413 Content Too Large" },
+  { name := "body over the limit", request := s!"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: {maxBodyBytes + 1}\r\n\r\n", kind := 2, status := "HTTP/1.1 413 Content Too Large" },
   { name := "head of exactly the limit", request := maxHeadRequest, kind := 1, status := "HTTP/1.1 200 OK" },
   { name := "largest request", request := maxRequest, kind := 1, status := "HTTP/1.1 404 Not Found" },
   { name := "head over the limit", request := "GET / HTTP/1.1\r\nHost: a\r\nX: " ++ big 9000 ++ "\r\n\r\n", kind := 2, status := "HTTP/1.1 431 Request Header Fields Too Large" },
@@ -796,21 +788,28 @@ the most elements the limits allow, is followed by nothing; fields and a body
 follow a short line. -/
 def retainedRequests : List (String × String) :=
   let line (target : String) := s!"GET {target} HTTP/1.1\r\n"
+  -- The longest target the line allows: the rest of `maxHeadBytes` after
+  -- "GET ", SP, "HTTP/1.1" and CRLF.
+  let room := maxHeadBytes - (line "").length
+  -- `pre`, then what the line leaves to one element, in `c`s.
+  let fill (pre c : String) := pre ++ rep c (room - pre.length)
+  let (ns, np) := (H1Adapter.maxPathSegments, H1Adapter.maxQueryParams)
+  let segs := rep "/" ns
+  let params := rep "=&" (np - 1)
   let longValue := rep "v" 64
   let longFields := String.join ((List.range 96).map fun i => s!"x{i}: {longValue}\r\n")
-  -- Each target is 8,177 bytes, the rest of the line after "GET ", SP,
-  -- "HTTP/1.1" and CRLF; what the counts leave goes to one element.
-  [("255 empty segments and 1,000 parameters, 999 with empty values, the rest in the last value",
-     line s!"{rep "/" 255}?{rep "=&" 999}={rep "v" 5922}"),
-   ("1,000 query parameters, 999 empty, the rest in the last key", line s!"/?{rep "&" 999}{rep "k" 7176}"),
-   ("255 path segments, 254 empty, the rest in the last", line s!"{rep "/" 255}{rep "s" 7922}"),
-   ("an absolute-form target with 255 segments and 1,000 parameters",
-     line s!"http://a{rep "/" 255}?{rep "=&" 999}={rep "v" 5914}"),
-   ("an absolute-form target with user info, a port, 255 segments and 1,000 parameters",
-     line s!"http://u:p@a:80{rep "/" 255}?{rep "=&" 999}={rep "v" 5907}"),
-   ("100 fields", s!"POST / HTTP/1.1\r\nHost: a\r\nExpect: 100-continue\r\nContent-Length: 10\r\n{String.join ((List.range 97).map fun i => s!"x{i}:\r\n")}\r\n"),
+  [(s!"{ns} empty segments and {np} parameters, {np - 1} with empty values, the rest in the last value",
+     line (fill s!"{segs}?{params}=" "v")),
+   (s!"{np} query parameters, {np - 1} empty, the rest in the last key",
+     line (fill s!"/?{rep "&" (np - 1)}" "k")),
+   (s!"{ns} path segments, {ns - 1} empty, the rest in the last", line (fill segs "s")),
+   (s!"an absolute-form target with {ns} segments and {np} parameters",
+     line (fill s!"http://a{segs}?{params}=" "v")),
+   (s!"an absolute-form target with user info, a port, {ns} segments and {np} parameters",
+     line (fill s!"http://u:p@a:80{segs}?{params}=" "v")),
+   (s!"{maxHeaders} fields", s!"POST / HTTP/1.1\r\nHost: a\r\nExpect: 100-continue\r\nContent-Length: 10\r\n{String.join ((List.range (maxHeaders - 3)).map fun i => s!"x{i}:\r\n")}\r\n"),
    ("all but one byte of a maximum body after 96 long fields",
-     s!"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 8192\r\n{longFields}\r\n{rep "b" 8191}")]
+     s!"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: {maxBodyBytes}\r\n{longFields}\r\n{rep "b" (maxBodyBytes - 1)}")]
 
 /-- Feeds each request whole and in pieces of 7 and 1,460 bytes, keeping the
 state as the connection does, and checks every state kept while the request
@@ -1045,42 +1044,195 @@ def batchScenario : Check Unit := do
   expectRecv "batch: after a full buffer" fa2 inCap
   if f2.buf.size != 0 then fail "batch: a full buffer was not consumed"
 
-/-! ## The pool's result bound
+/-! ## Values the Zig and C sources state again
 
-`zig/src/pg.c` cannot read a Lean definition, so it states
-`Query.maxResultBytes` again as `EKK_MAX_RESULT_BYTES`, the bound the pool
-enforces. This reads it from the source, relative to the repository's root
-(`check.sh` runs `lsrv-test` there). Every line that mentions both `define`
-and `EKK_MAX_RESULT_BYTES` counts as a definition, so one in another spelling
-(`# define`, a trailing comment, parentheses) or in a comment is not passed
-over; the check fails unless there is exactly one, written
-`#define EKK_MAX_RESULT_BYTES <decimal>`, its value `Query.maxResultBytes`.
-That one line inside a block comment would pass here, but then pg.c, which
-uses the name, does not compile. -/
+`zig/` cannot read a Lean definition, so it states some again; these checks
+read them from the sources, relative to the repository's root (`check.sh`
+runs `lsrv-test` there). `definedOnce` takes every line of `file` that
+mentions both `keyword` and `name` as a definition of `name`, so one in
+another spelling (`# define`, a trailing comment, parentheses) or in a
+comment is not passed over; it fails unless there is exactly one, and it
+reads, with runs of whitespace as one space, `want`. It checks the source's
+spelling, not the compiled value: that one line hidden from the compiler (in
+a comment, an inactive `#if`) would pass here, and these sources keep each
+definition a plain top-level line. -/
 
-def pgSource : System.FilePath := "zig/src/pg.c"
-
-def resultBoundAgrees : Check Unit := do
-  let src ← try IO.FS.readFile pgSource
-    catch e => fail s!"result bound: cannot read {pgSource}: {e}"; return
+/-- The one line of `file` defining `name`, with runs of whitespace as one
+space; `none`, reported, when there is not exactly one. -/
+def definition (what : String) (file : System.FilePath) (keyword name : String) : Check (Option String) := do
+  let src ← try IO.FS.readFile file
+    catch e => fail s!"{what}: cannot read {file}: {e}"; return none
   let mentions (line word : String) := (line.splitOn word).length > 1
-  let defines := (src.splitOn "\n").filter fun line =>
-    mentions line "define" && mentions line "EKK_MAX_RESULT_BYTES"
+  let defines := (src.splitOn "\n").filter fun line => mentions line keyword && mentions line name
   match defines with
-  | [line] =>
-    match (line.splitToList Char.isWhitespace).filter (· ≠ "") with
-    | ["#define", "EKK_MAX_RESULT_BYTES", v] =>
-      match v.toNat? with
-      | some n =>
-        if n != Query.maxResultBytes then
-          fail s!"result bound: {pgSource} defines EKK_MAX_RESULT_BYTES {n}, Query.maxResultBytes is {Query.maxResultBytes}"
-      | none => fail s!"result bound: {pgSource} defines EKK_MAX_RESULT_BYTES as {v}, not a decimal number"
-    | _ => fail s!"result bound: {pgSource} has `{line.trimAsciiEnd}`, not `#define EKK_MAX_RESULT_BYTES <decimal>`"
-  | ls => fail s!"result bound: {pgSource} has {ls.length} lines defining EKK_MAX_RESULT_BYTES, want 1"
+  | [line] => return some (" ".intercalate ((line.splitToList Char.isWhitespace).filter (· ≠ "")))
+  | ls => fail s!"{what}: {file} has {ls.length} lines defining {name}, want 1"; return none
+
+def definedOnce (what : String) (file : System.FilePath) (keyword name want : String) : Check Unit := do
+  if let some line ← definition what file keyword name then
+    if line != want then fail s!"{what}: {file} has `{line}`, want `{want}`"
+
+/-- The decimal value of the one line of `file` defining `name`, which reads
+`pre`, the value, `post`. -/
+def definedNat (what : String) (file : System.FilePath) (keyword name pre post : String) : Check (Option Nat) := do
+  let some line ← definition what file keyword name | return none
+  let v := ((line.dropPrefix? pre).bind (·.dropSuffix? post)).bind (·.toString.toNat?)
+  if v.isNone then fail s!"{what}: {file} has `{line}`, want `{pre}<decimal>{post}`"
+  return v
+
+/-- The pool's result bound: `zig/src/pg.c` enforces `EKK_MAX_RESULT_BYTES`,
+`Query.maxResultBytes`. -/
+def resultBoundAgrees : Check Unit :=
+  definedOnce "result bound" "zig/src/pg.c" "define" "EKK_MAX_RESULT_BYTES"
+    s!"#define EKK_MAX_RESULT_BYTES {Query.maxResultBytes}"
+
+/-- Each constructor of `Conn.Action` by the name the loop gives it, and one
+value of each in `actions`; the match and `actions_cover` do not compile
+until a new constructor is in both. -/
+def actionName : Conn.Action → String
+  | .recv _ => "recv"
+  | .send _ _ => "send"
+  | .close => "close"
+  | .none => "none"
+  | .query _ => "query"
+
+def actions : List Conn.Action :=
+  [.recv 0, .send .empty 0, .close, .none, .query { sql := "" }]
+
+theorem actions_cover (a : Conn.Action) : a.ctorIdx ∈ actions.map (·.ctorIdx) := by
+  cases a <;> simp [actions, Conn.Action.ctorIdx]
+
+def deadlineName : Conn.Deadline → String
+  | .idle => "idle"
+  | .head => "head"
+  | .body => "body"
+  | .write => "write"
+
+def deadlines : List Conn.Deadline := [.idle, .head, .body, .write]
+
+theorem deadlines_cover (d : Conn.Deadline) : d ∈ deadlines := by
+  cases d <;> decide
+
+/-- The transport's codes: `glue.c` decodes `Conn.Action` by its runtime tag,
+the constructor's index (`ctorIdx`), and the loop names the deadlines by
+`Transport.deadlineCode`. `serve.zig` states every one (`action_*`,
+`deadline_*`), and `glue.c` the action codes it decodes (`EKK_ACTION_*`);
+`serve_test.zig` uses `serve.zig`'s. `serve.zig` keeps a deadline's budget
+at its code less 1 in `budget_ms`, so the codes are 1 to the number of
+deadlines, each once, and `budget_ms` has that many. -/
+def transportCodesAgree : Check Unit := do
+  let serve : System.FilePath := "zig/src/serve.zig"
+  let glue : System.FilePath := "zig/src/glue.c"
+  if (actions.map (·.ctorIdx)) != List.range actions.length then
+    fail s!"transport codes: `actions` lists the constructors at indices {actions.map (·.ctorIdx)}, not each once in order"
+  for a in actions do
+    definedOnce "transport codes" serve "const" s!"action_{actionName a}"
+      s!"pub const action_{actionName a}: u8 = {a.ctorIdx};"
+  for a in actions.filter (actionName · ∈ ["recv", "send", "query"]) do
+    definedOnce "transport codes" glue "define" s!"EKK_ACTION_{(actionName a).toUpper}"
+      s!"#define EKK_ACTION_{(actionName a).toUpper} {a.ctorIdx}"
+  match ← (try (some <$> IO.FS.readFile glue) catch _ => pure none) with
+  | some src =>
+    let n := ((src.splitOn "\n").filter fun l => (l.splitOn "define").length > 1 && (l.splitOn "EKK_ACTION_").length > 1).length
+    if n != 3 then fail s!"transport codes: {glue} has {n} lines defining EKK_ACTION_*, want the 3 checked here"
+  | none => pure () -- definedOnce reported it
+  if (deadlines.map (·.ctorIdx)) != List.range deadlines.length then
+    fail s!"transport codes: `deadlines` lists the constructors at indices {deadlines.map (·.ctorIdx)}, not each once in order"
+  let codes := deadlines.map fun d => (Transport.deadlineCode d).toNat
+  if codes.mergeSort != (List.range codes.length).map (· + 1) then
+    fail s!"transport codes: Transport.deadlineCode gives {codes}, not 1 to {codes.length}, each once"
+  definedOnce "transport codes" serve "var" "budget_ms" s!"pub var budget_ms: [{codes.length}]u32 = .\{ {", ".intercalate (List.replicate codes.length "1")} };"
+  definedOnce "transport codes" serve "const" "deadline_none" "pub const deadline_none: u8 = 0;"
+  for d in deadlines do
+    definedOnce "transport codes" serve "const" s!"deadline_{deadlineName d}"
+      s!"pub const deadline_{deadlineName d}: u8 = {Transport.deadlineCode d};"
+
+/-- The Go programs `check.sh` runs state values of the server again, each a
+`const NAME = VALUE` line: the request limits (`Server.Wire`,
+`H1Adapter`), the transport's receive buffer (`recv_cap` of `serve.zig`,
+read from it) and the size of `App.Fixture.body`.
+That body takes several sends and ends with a short one (App/Fixture.lean)
+only while it is longer than `out_cap` and no multiple of it. -/
+def benchValuesAgree : Check Unit := do
+  let serve : System.FilePath := "zig/src/serve.zig"
+  let recvCap ← definedNat "bench values" serve "const" "recv_cap" "const recv_cap = " ";"
+  let outCap ← definedNat "bench values" serve "const" "out_cap" "const out_cap = " ";"
+  let goConst (file : System.FilePath) (name : String) (v : Nat) :=
+    definedOnce "bench values" file "const" name s!"const {name} = {v}"
+  let limits := [("maxHeadBytes", maxHeadBytes), ("maxBodyBytes", maxBodyBytes)]
+  for (n, v) in limits do goConst "bench/check/main.go" n v
+  let boundary : System.FilePath := "bench/boundary/main.go"
+  for (n, v) in limits ++ [("maxHeaders", maxHeaders), ("maxPathSegments", H1Adapter.maxPathSegments),
+      ("maxQueryParams", H1Adapter.maxQueryParams), ("bodySize", App.Fixture.body.size)] do
+    goConst boundary n v
+  if let some c := recvCap then goConst boundary "recvCap" c
+  if let some c := outCap then
+    if App.Fixture.body.size ≤ c || App.Fixture.body.size % c == 0 then
+      fail s!"bench values: App.Fixture.body has {App.Fixture.body.size} bytes, not over out_cap ({c}) and no multiple of it"
+
+/-! ## A value stated again from upstream
+
+`H1Adapter.errorStatus` states again the status H1's own server answers each
+`H1.Error` with (the private `errorResponseStatus`). H1's machine writes that
+answer itself when its `step` finds an error, so this asks it for every
+error and compares the status line it writes. -/
+
+/-- Each `H1.Error` by name, and one value of each in `h1Errors`; the match
+and `h1Errors_cover` do not compile until a new constructor of a toolchain
+update is in both. -/
+def h1ErrorName : Std.Http.Protocol.H1.Error → String
+  | .invalidStatusLine => "invalidStatusLine"
+  | .invalidHeader => "invalidHeader"
+  | .timeout => "timeout"
+  | .entityTooLarge => "entityTooLarge"
+  | .uriTooLong => "uriTooLong"
+  | .unsupportedVersion => "unsupportedVersion"
+  | .unsupportedTransferCoding => "unsupportedTransferCoding"
+  | .unsupportedMethod => "unsupportedMethod"
+  | .invalidChunk => "invalidChunk"
+  | .connectionClosed => "connectionClosed"
+  | .badMessage => "badMessage"
+  | .tooManyHeaders => "tooManyHeaders"
+  | .headersTooLarge => "headersTooLarge"
+  | .other _ => "other"
+
+def h1Errors : List Std.Http.Protocol.H1.Error :=
+  [.invalidStatusLine, .invalidHeader, .timeout, .entityTooLarge, .uriTooLong, .unsupportedVersion,
+   .unsupportedTransferCoding, .unsupportedMethod, .invalidChunk, .connectionClosed, .badMessage,
+   .tooManyHeaders, .headersTooLarge, .other ""]
+
+theorem h1Errors_cover (e : Std.Http.Protocol.H1.Error) : e.ctorIdx ∈ h1Errors.map (·.ctorIdx) := by
+  cases e <;> simp [h1Errors, Std.Http.Protocol.H1.Error.ctorIdx]
+
+def errorStatusAgrees : Check Unit := do
+  if (h1Errors.map (·.ctorIdx)) != List.range h1Errors.length then
+    fail s!"error status: `h1Errors` lists the constructors at indices {h1Errors.map (·.ctorIdx)}, not each once in order"
+  for e in h1Errors do
+    let m : Std.Http.Protocol.H1.Machine .receiving := { config := H1Adapter.config, error := some e }
+    let line := ((String.fromUTF8! m.step.2.output.toByteArray).splitOn "\r\n").head!
+    let want := s!"HTTP/1.1 {H1Adapter.errorStatus e} "
+    unless line.startsWith want do
+      fail s!"error status: H1 answers {h1ErrorName e} with `{line}`, H1Adapter.errorStatus with {H1Adapter.errorStatus e}"
+
+/-- The application sees the request-target as sent, also after the empty
+lines H1 accepts before the request line (`H1Adapter.rawTarget`). -/
+def rawTargetCases : Check Unit := do
+  for pre in ["", "\r\n", "\r\n\r\n"] do
+    for (method, target) in [("GET", "/"), ("GET", "/a%20b/c?d=e&f"), ("OPTIONS", "*"), ("GET", "http://a/b?c")] do
+      let buf := bytes s!"{pre}{method} {target} HTTP/1.1\r\nHost: a\r\n\r\n"
+      match H1Adapter.parse buf with
+      | .ok .. =>
+        let got := H1Adapter.rawTarget buf
+        if got != target then fail s!"raw target: {pre.length} bytes of empty lines, {method} {target}: {got}"
+      | _ => fail s!"raw target: {pre.length} bytes of empty lines, {method} {target}: H1 did not accept it"
 
 def main : IO UInt32 := do
   let ((), failures) ← (do
     resultBoundAgrees
+    transportCodesAgree
+    errorStatusAgrees
+    benchValuesAgree
+    rawTargetCases
     retainedScenario
     responseCapacityScenario
     ownFieldRule

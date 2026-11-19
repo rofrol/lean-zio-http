@@ -28,13 +28,18 @@ type check struct {
 	closes  bool // the server closes the connection after the last answer
 }
 
+// The request limits of Server/Wire.lean, stated again; lsrv-test (Test.lean,
+// benchValuesAgree) checks each line.
+const maxHeadBytes = 8192
+const maxBodyBytes = 8192
+
 func main() {
 	addr := flag.String("addr", "127.0.0.1:8083", "server address")
 	flag.Parse()
 	maxHead := "GET / HTTP/1.1\r\nHost: a\r\nX: "
-	maxHead += strings.Repeat("a", 8192-len(maxHead)) + "\r\n\r\n"
-	maxReq := "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 8192\r\nX: "
-	maxReq += strings.Repeat("a", 8192-len(maxReq)) + "\r\n\r\n" + strings.Repeat("a", 8192)
+	maxHead += strings.Repeat("a", maxHeadBytes-len(maxHead)) + "\r\n\r\n"
+	maxReq := fmt.Sprintf("POST / HTTP/1.1\r\nHost: a\r\nContent-Length: %d\r\nX: ", maxBodyBytes)
+	maxReq += strings.Repeat("a", maxHeadBytes-len(maxReq)) + "\r\n\r\n" + strings.Repeat("a", maxBodyBytes)
 	// 150 pipelined requests in one write, GET (200) and POST (404) in turn:
 	// their responses (over 10,000 bytes) must come in request order. When one
 	// receive holds them (one write of 5,400 bytes does not guarantee it), they

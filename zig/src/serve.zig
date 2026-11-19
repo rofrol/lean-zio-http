@@ -31,15 +31,32 @@ comptime {
         @compileError("serve.zig needs the Linux backend named (build.zig: -Dlinux-backend=epoll|io_uring), not zio's run-time choice ." ++ @tagName(ev.backend));
 }
 
+/// Conn.Action's constructors as glue.c reports them (`lean_obj_tag`): each
+/// one's index in Server/Conn.lean. glue.c states those it decodes again
+/// (EKK_ACTION_*); lsrv-test (Test.lean, `transportCodesAgree`) checks both
+/// against `Conn.Action.ctorIdx`.
+pub const action_recv: u8 = 0;
+pub const action_send: u8 = 1;
+pub const action_close: u8 = 2;
+pub const action_none: u8 = 3;
+pub const action_query: u8 = 4;
+/// The deadlines as Lean's state names them (Transport.deadlineCode), 0 for
+/// none; checked against it by lsrv-test as the action codes are.
+pub const deadline_none: u8 = 0;
+pub const deadline_idle: u8 = 1;
+pub const deadline_head: u8 = 2;
+pub const deadline_body: u8 = 3;
+pub const deadline_write: u8 = 4;
+
 /// Conn.Action as decoded by glue.c.
 pub const Action = extern struct {
-    kind: u8, // 0 recv, 1 send, 2 close, 3 none, 4 query
+    kind: u8, // action_*
     room: usize, // recv: most bytes to receive
     len: usize, // send: bytes glue.c copied into out
     query: ?*anyopaque, // query: the Server.Query, owned
-    deadline: u8, // the deadline of Lean's new state: 0 none, 1 idle, 2 head, 3 body, 4 write
+    deadline: u8, // the deadline of Lean's new state: deadline_*
     gen: Gen, // with a deadline: its generation, owned; null without
-    ahead: u8, // the head budget beside a send (Conn.Phase.ahead): 0 none, 2 head
+    ahead: u8, // the head budget beside a send (Conn.Phase.ahead): deadline_none or deadline_head
     ahead_gen: Gen, // with ahead: its generation, owned; null without
     watch: u8, // 1: watch the socket for readability (Conn.State.watches)
 };
@@ -233,11 +250,11 @@ pub const Arm = struct {
         ekk_expired(&conn.state, self.kind, self.gen, &conn.out, out_cap, &act);
         self.release();
         switch (act.kind) {
-            2 => {
-                if (act.deadline != 0 or act.ahead != 0) @panic("Lean closed with a deadline left");
+            action_close => {
+                if (act.deadline != deadline_none or act.ahead != deadline_none) @panic("Lean closed with a deadline left");
                 conn.expire();
             },
-            3 => {
+            action_none => {
                 if (main) @panic("Lean did not answer the current deadline's expiry with close");
                 conn.apply(act);
             },
@@ -250,7 +267,7 @@ const Comp = union { recv: ev.NetRecv, send: ev.NetSend, close: ev.NetClose };
 
 /// Whether the pair `kind`, `gen` is the one `a` was armed for.
 fn same(a: *const Arm, kind: u8, gen: Gen) bool {
-    return kind != 0 and kind == a.kind and ekk_gen_eq(a.gen, gen) != 0;
+    return kind != deadline_none and kind == a.kind and ekk_gen_eq(a.gen, gen) != 0;
 }
 /// A query has no completion of its own: it is the connection's operation in
 /// flight until the pool delivers its result. `wrote` is a send the loop
@@ -410,8 +427,8 @@ pub const Conn = struct {
                 ahead = a;
             } else self.retire(a);
         }
-        if (main != null) ekk_gen_free(gen) else if (kind != 0) main = self.newArm(kind, gen);
-        if (ahead != null) ekk_gen_free(agen) else if (akind != 0) ahead = self.newArm(akind, agen);
+        if (main != null) ekk_gen_free(gen) else if (kind != deadline_none) main = self.newArm(kind, gen);
+        if (ahead != null) ekk_gen_free(agen) else if (akind != deadline_none) ahead = self.newArm(akind, agen);
         self.arm = main;
         self.ahead_arm = ahead;
     }
@@ -555,12 +572,12 @@ pub const Conn = struct {
         const wants = act.watch != 0;
         if (!wants) self.watch(false);
         switch (act.kind) {
-            0 => {
+            action_recv => {
                 if (act.room == 0) return self.fail(); // excluded by Conn.step_recv
                 if (self.lp.stopping) return self.refuse();
                 self.startRecv(capChunk(@min(act.room, recv_cap)));
             },
-            1 => {
+            action_send => {
                 if (act.len == 0) return self.fail(); // excluded by Conn.step_send
                 if (self.lp.drained) {
                     // The drain ended: nothing more is sent (`Conn.cut`).
@@ -571,8 +588,8 @@ pub const Conn = struct {
                 self.out_len = capChunk(act.len);
                 self.startSend();
             },
-            2 => self.close(),
-            4 => {
+            action_close => self.close(),
+            action_query => {
                 _ = self.begin(.query);
                 // Printed before the pool sees the query, so a test that has
                 // read it knows the query is queued or running.
@@ -582,7 +599,7 @@ pub const Conn = struct {
             // `none`: nothing new, the operation in flight goes on (an
             // arrival, or a head budget beside a send that ended on a
             // complete head). No event after close is reported (Conn.step_close).
-            3 => if (self.cur == null) @panic("Lean answered none with no operation in flight"),
+            action_none => if (self.cur == null) @panic("Lean answered none with no operation in flight"),
             else => @panic("Lean answered an unknown action"),
         }
         if (wants) self.watch(self.sendParked());
@@ -592,7 +609,7 @@ pub const Conn = struct {
     fn fail(self: *Conn) void {
         var act: Action = undefined;
         ekk_fail(&self.state, &self.out, out_cap, &act);
-        if (act.kind != 2) @panic("Lean did not answer a failure with close");
+        if (act.kind != action_close) @panic("Lean did not answer a failure with close");
         self.apply(act);
     }
 
@@ -600,7 +617,7 @@ pub const Conn = struct {
     fn refuse(self: *Conn) void {
         var act: Action = undefined;
         ekk_refused(&self.state, &self.out, out_cap, &act);
-        if (act.kind != 2) @panic("Lean did not answer a refused receive with close");
+        if (act.kind != action_close) @panic("Lean did not answer a refused receive with close");
         self.apply(act);
     }
 
@@ -1120,7 +1137,7 @@ var pg_budgets: pg.Budgets = .{};
 extern fn ekk_pg_options(conninfo: [*:0]const u8, statement_ms: c_uint, out: *?[*:0]u8) c_int;
 /// Each per-connection deadline's budget in milliseconds, at least 1
 /// (Transport.Options: idleMs, headMs, bodyMs, writeMs), indexed by the
-/// deadline's code (Transport.deadlineCode) less 1: idle, head, body, write.
+/// deadline's code (deadline_*) less 1.
 /// The tests (serve_test.zig) set it themselves; 0 there makes a timer due
 /// at once.
 pub var budget_ms: [4]u32 = .{ 1, 1, 1, 1 };
@@ -1273,7 +1290,10 @@ pub fn openListener(port: u16) ?Listening {
 /// (1) and `report_recv` (2). Returns 1 on setup failure.
 export fn ekk_serve(port: u16, threads: u32, maxc: u32, conninfo: *anyopaque, conns: u32, idle_ms: u32, head_ms: u32, body_ms: u32, write_ms: u32, query_ms: u32, query_max_ms: u32, connect_ms: u32, statement_ms: u32, drain: u32, chunk: usize, fail_every: u32, flags: u8, crash_recv: u32, crash_send: u32) callconv(.c) u8 {
     if (threads == 0 or maxc == 0) return 1;
-    budget_ms = .{ idle_ms, head_ms, body_ms, write_ms };
+    budget_ms[deadline_idle - 1] = idle_ms;
+    budget_ms[deadline_head - 1] = head_ms;
+    budget_ms[deadline_body - 1] = body_ms;
+    budget_ms[deadline_write - 1] = write_ms;
     for (budget_ms) |ms| if (ms == 0) return 1;
     if (query_ms == 0 or query_max_ms < query_ms or connect_ms == 0 or statement_ms == 0 or drain == 0) return 1;
     drain_ms = drain;

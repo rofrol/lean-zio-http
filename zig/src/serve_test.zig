@@ -99,10 +99,10 @@ const Event = extern struct {
 };
 
 /// Deadline codes as glue.c reports them (Transport.deadlineCode).
-const none_code: u8 = 0;
-const idle_code: u8 = 1;
-const head_code: u8 = 2;
-const write_code: u8 = 4;
+const none_code = serve.deadline_none;
+const idle_code = serve.deadline_idle;
+const head_code = serve.deadline_head;
+const write_code = serve.deadline_write;
 
 /// The Lean state of one fake connection: the deadline it runs under and
 /// its generation; while it writes a response, the bytes still to send and
@@ -174,7 +174,7 @@ fn genPtr(g: u32) serve.Gen {
 
 /// Asks to receive `n` bytes, under the connection's deadline.
 fn answerRecv(act: *serve.Action, fc: *const FakeConn, n: usize) void {
-    answer(act, 0, n);
+    answer(act, serve.action_recv, n);
     act.deadline = fc.dl;
     if (fc.dl != none_code) act.gen = genPtr(fc.gen);
 }
@@ -184,7 +184,7 @@ fn answerRecv(act: *serve.Action, fc: *const FakeConn, n: usize) void {
 /// until then (Conn.State.watches).
 fn answerWriting(act: *serve.Action, fc: *FakeConn, kind: u8, out: [*]u8, cap: usize) void {
     answer(act, kind, 0);
-    if (kind == 1) {
+    if (kind == serve.action_send) {
         act.len = @min(cap, fc.left);
         fc.asked = act.len;
         @memset(out[0..act.len], 'x');
@@ -206,7 +206,7 @@ export fn ekk_open(state: *serve.State, out: [*]u8, cap: usize, act: *serve.Acti
     if (respond_on_open != 0) {
         fc.dl = write_code;
         fc.left = respond_on_open;
-        return answerWriting(act, fc, 1, out, cap);
+        return answerWriting(act, fc, serve.action_send, out, cap);
     }
     answerRecv(act, fc, room);
 }
@@ -217,7 +217,7 @@ export fn ekk_recv(state: *serve.State, data: [*]const u8, n: usize, out: [*]u8,
     emit(.{ .kind = .recv, .loop = fc.loop, .conn = fc.id, .n = @intCast(n), .byte = if (n > 0) data[0] else 0 });
     if (n == 0) {
         fc.dl = none_code;
-        return answer(act, 2, 0);
+        return answer(act, serve.action_close, 0);
     }
     if (respond != 0 and data[0] == 'R') {
         fc.dl = write_code;
@@ -225,7 +225,7 @@ export fn ekk_recv(state: *serve.State, data: [*]const u8, n: usize, out: [*]u8,
         fc.left = respond;
         fc.ahead = false;
         fc.held = false;
-        return answerWriting(act, fc, 1, out, cap);
+        return answerWriting(act, fc, serve.action_send, out, cap);
     }
     if (!recv_keeps) {
         fc.dl = recv_dl;
@@ -239,7 +239,7 @@ export fn ekk_refused(state: *serve.State, _: [*]u8, _: usize, act: *serve.Actio
     const fc = connOf(state.*);
     emit(.{ .kind = .refused, .loop = fc.loop, .conn = fc.id });
     fc.dl = none_code;
-    answer(act, 2, 0);
+    answer(act, serve.action_close, 0);
 }
 
 export fn ekk_fail(state: *serve.State, _: [*]u8, _: usize, act: *serve.Action) void {
@@ -247,7 +247,7 @@ export fn ekk_fail(state: *serve.State, _: [*]u8, _: usize, act: *serve.Action) 
     const fc = connOf(state.*);
     emit(.{ .kind = .fail, .loop = fc.loop, .conn = fc.id });
     fc.dl = none_code;
-    answer(act, 2, 0);
+    answer(act, serve.action_close, 0);
 }
 
 /// The loop reports only its live arms (a retired one's callback calls
@@ -264,11 +264,11 @@ export fn ekk_expired(state: *serve.State, kind: u8, gen: serve.Gen, out: [*]u8,
     if (ahead and ahead_complete) {
         fc.ahead = false;
         fc.held = true;
-        return answerWriting(act, fc, 3, out, cap);
+        return answerWriting(act, fc, serve.action_none, out, cap);
     }
     fc.dl = none_code;
     fc.ahead = false;
-    answer(act, 2, 0);
+    answer(act, serve.action_close, 0);
 }
 
 /// The loop reports readability only while the fake watches: while it
@@ -279,7 +279,7 @@ export fn ekk_arrived(state: *serve.State, out: [*]u8, cap: usize, act: *serve.A
     if (fc.dl != write_code or fc.ahead or fc.held) @panic("the loop reported readability the fake did not watch for");
     emit(.{ .kind = .arrived, .loop = fc.loop, .conn = fc.id, .n = fc.gen + 1 });
     fc.ahead = true;
-    answerWriting(act, fc, 3, out, cap);
+    answerWriting(act, fc, serve.action_none, out, cap);
 }
 
 /// The send of `n` bytes of the response completed. At its end the
@@ -297,7 +297,7 @@ export fn ekk_sent(state: *serve.State, n: usize, out: [*]u8, cap: usize, act: *
     }
     fc.left -= n;
     if (report_sent) emit(.{ .kind = .sent, .loop = fc.loop, .conn = fc.id, .n = @intCast(n), .asked = @intCast(fc.asked), .left = @intCast(fc.left) });
-    if (fc.left > 0) return answerWriting(act, fc, 1, out, cap);
+    if (fc.left > 0) return answerWriting(act, fc, serve.action_send, out, cap);
     emit(.{ .kind = .written, .loop = fc.loop, .conn = fc.id, .n = fc.gen });
     if (fc.ahead) {
         fc.dl = head_code;

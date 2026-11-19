@@ -205,8 +205,9 @@ def headOf (n : Nat) : String :=
   let fixed := "GET / HTTP/1.1\r\nHost: a\r\nX: "
   fixed ++ Corpus.big (n - fixed.length) ++ "\r\n\r\n"
 
-/-- A request whose field lines count `n` bytes as H1 counts them (H1.lean:1947:
-the bytes of each line, CRLF included). -/
+/-- A request whose field lines count `n` bytes as H1 counts them against
+`maxHeaderBytes` (`processParsedHeader` in the toolchain `lean-toolchain`
+names: the bytes of each line, CRLF included). -/
 def fieldBytesOf (n : Nat) : String :=
   -- "Host: a\r\n" is 9 bytes, "X: " and CRLF 5 more.
   "GET / HTTP/1.1\r\nHost: a\r\nX: " ++ Corpus.big (n - 14) ++ "\r\n\r\n"
@@ -215,26 +216,31 @@ def bodyOf (n : Nat) : String :=
   s!"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: {n}\r\n\r\n" ++ Corpus.big n
 
 /-- A request whose request line is `n` bytes, CRLF included, as H1 counts it
-against `maxStartLineLength` (H1.lean:1862). -/
+against `maxStartLineLength` (`processReceivingStartLine` in the toolchain
+`lean-toolchain` names). -/
 def requestLineOf (n : Nat) : String :=
   "GET /" ++ Corpus.big (n - 16) ++ " HTTP/1.1\r\nHost: a\r\n\r\n"
 
 /-- Boundary cases with the verdict kind recorded for each parser. H1 alone
 bounds the request line and the field lines separately; `H1Adapter.parse`
 adds the bound on the whole head (`maxHeadBytes`), so both parsers refuse a
-head over 8,192 bytes, H1 with its own 414 where its line limit comes first. -/
-def boundaries : List (String × String × String × String) := [
-  ("head of 8192 bytes", headOf 8192, "ok", "ok"),
-  ("head of 8193 bytes", headOf 8193, "431", "431"),
-  ("field lines of 8192 bytes (H1's count)", fieldBytesOf 8192, "431", "431"),
-  ("field lines of 8193 bytes (H1's count)", fieldBytesOf 8193, "431", "431"),
-  ("100 fields", Corpus.manyHeaders 100, "ok", "ok"),
-  ("101 fields", Corpus.manyHeaders 101, "431", "431"),
-  ("body of 8192 bytes", bodyOf 8192, "ok", "ok"),
-  ("body of 8193 bytes", bodyOf 8193, "413", "413"),
-  ("request line of 8192 bytes", requestLineOf 8192, "431", "431"),
-  ("request line of 8193 bytes", requestLineOf 8193, "431", "414")
-]
+head over `maxHeadBytes`, H1 with its own 414 where its line limit comes
+first. H1's bound on the field lines (`maxHeaderBytes`, `maxHeadBytes` too) is
+never reached through the adapter: field lines of that many bytes make the
+head longer than `maxHeadBytes` with the request line, so the two rows on
+them are refused by the whole-head bound, as their labels say. -/
+def boundaries : List (String × String × String × String) :=
+  let (h, b, f) := (Server.maxHeadBytes, Server.maxBodyBytes, Server.maxHeaders)
+  [(s!"head of {h} bytes", headOf h, "ok", "ok"),
+   (s!"head of {h + 1} bytes", headOf (h + 1), "431", "431"),
+   (s!"field lines of {h} bytes (H1's count): over the whole-head bound", fieldBytesOf h, "431", "431"),
+   (s!"field lines of {h + 1} bytes (H1's count): over the whole-head bound", fieldBytesOf (h + 1), "431", "431"),
+   (s!"{f} fields", Corpus.manyHeaders f, "ok", "ok"),
+   (s!"{f + 1} fields", Corpus.manyHeaders (f + 1), "431", "431"),
+   (s!"body of {b} bytes", bodyOf b, "ok", "ok"),
+   (s!"body of {b + 1} bytes", bodyOf (b + 1), "413", "413"),
+   (s!"request line of {h} bytes", requestLineOf h, "431", "431"),
+   (s!"request line of {h + 1} bytes", requestLineOf (h + 1), "431", "414")]
 
 /-! ## Part 3: fuzzing malformed framing -/
 

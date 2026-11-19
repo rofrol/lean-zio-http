@@ -10,7 +10,9 @@ answers the request's body. -/
 
 namespace App.Fixture
 
-/-- 60,001 bytes: byte `i` is `a` + (i mod 26). bench/boundary expects exactly this. -/
+/-- 60,001 bytes: byte `i` is `a` + (i mod 26). bench/boundary expects exactly
+this (its `bodySize`, which `lsrv-test` checks, also against the loop's
+send buffer). -/
 def body : ByteArray := Id.run do
   let mut b := ByteArray.emptyWithCapacity 60001
   for i in [0:60001] do

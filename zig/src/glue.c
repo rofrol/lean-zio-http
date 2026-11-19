@@ -37,20 +37,25 @@ extern uint8_t ekk_conn_watch(lean_object *state);
 void ekk_thread_init(void) { lean_initialize_thread(); }
 void ekk_thread_fini(void) { lean_finalize_thread(); }
 
-/* Conn.Action decoded for the loop. Constructor order in Conn.lean:
-   recv (room) = 0, send (data, off) = 1, close = 2, none = 3, query (q) = 4.
-   With it, the deadline the new state runs under (Transport.stateDeadline)
+/* Conn.Action's constructors as lean_obj_tag reports them: each one's index
+   in Server/Conn.lean. serve.zig states them again (action_*); lsrv-test
+   (Test.lean, transportCodesAgree) checks both against Conn.Action.ctorIdx. */
+#define EKK_ACTION_RECV 0
+#define EKK_ACTION_SEND 1
+#define EKK_ACTION_QUERY 4
+
+/* Conn.Action decoded for the loop. With it, the deadline the new state runs under (Transport.stateDeadline)
    and its generation, the head budget running beside a send
    (Transport.stateAhead) and its generation, and whether the loop watches
    the socket for a next request's first byte (Conn.State.watches). */
 typedef struct {
-    uint8_t kind;  /* 0 recv, 1 send, 2 close, 3 none, 4 query */
+    uint8_t kind;  /* the constructor's index (EKK_ACTION_*, serve.zig's action_*) */
     size_t room;   /* recv: most bytes to receive */
     size_t len;    /* send: bytes copied into out */
     lean_object *query; /* query: the Server.Query, owned by the receiver */
-    uint8_t deadline; /* 0 none, 1 idle, 2 head, 3 body, 4 write */
+    uint8_t deadline; /* Transport.deadlineCode, 0 for none (serve.zig's deadline_*) */
     lean_object *gen; /* with a deadline: its generation (a Nat), owned by the receiver; else NULL */
-    uint8_t ahead; /* 0 none, 2 head */
+    uint8_t ahead; /* as deadline: none or head */
     lean_object *ahead_gen; /* with ahead: its generation, owned by the receiver; else NULL */
     uint8_t watch; /* 1: watch for readability while the send goes on */
 } ekk_action;
@@ -70,12 +75,12 @@ static void take(lean_object *pair, lean_object **state, uint8_t *out, size_t ca
     act->room = 0;
     act->len = 0;
     act->query = NULL;
-    if (act->kind == 4) {
+    if (act->kind == EKK_ACTION_QUERY) {
         act->query = lean_ctor_get(a, 0);
         lean_inc(act->query);
-    } else if (act->kind == 0) {
+    } else if (act->kind == EKK_ACTION_RECV) {
         act->room = lean_usize_of_nat(lean_ctor_get(a, 0));
-    } else if (act->kind == 1) {
+    } else if (act->kind == EKK_ACTION_SEND) {
         lean_object *data = lean_ctor_get(a, 0);
         size_t off = lean_usize_of_nat(lean_ctor_get(a, 1));
         size_t n = lean_sarray_size(data) - off; /* Conn.step_send: off < size */

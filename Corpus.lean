@@ -15,14 +15,15 @@ open Server
 
 def big (n : Nat) : String := String.ofList (List.replicate n 'a')
 
-/-- A head of exactly `maxHeadBytes` (8192) bytes before CRLFCRLF. -/
+/-- A head of exactly `maxHeadBytes` bytes before CRLFCRLF. -/
 def maxHeadRequest : String :=
   let fixed := "GET / HTTP/1.1\r\nHost: a\r\nX: "
   fixed ++ big (maxHeadBytes - fixed.length) ++ "\r\n\r\n"
 
-/-- The largest request the parsers accept: an 8192-byte head and an 8192-byte body. -/
+/-- The largest request the parsers accept: a head of `maxHeadBytes` and a
+body of `maxBodyBytes`. -/
 def maxRequest : String :=
-  let fixed := "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 8192\r\nX: "
+  let fixed := s!"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: {maxBodyBytes}\r\nX: "
   fixed ++ big (maxHeadBytes - fixed.length) ++ "\r\n\r\n" ++ big maxBodyBytes
 
 /-- `n` header fields: Host and `n - 1` short ones. -/
@@ -53,20 +54,25 @@ def browserGet : String :=
   "Cookie: session=4f2c9a7e1b3d5f60a8c2e4b6d8f0a1c3\r\n" ++
   "\r\n"
 
+/-- The rows of the isolated measurement and the fragmentation table that
+`fragmentCorpus` selects; their labels state their sizes, derived from them. -/
+def browserGetRow : String × String := ("browser GET, 16 headers", browserGet)
+def maxHeadRow : String × String := (s!"largest head ({maxHeadBytes} B)", maxHeadRequest)
+def maxRequestRow : String × String := (s!"largest request ({maxRequest.utf8ByteSize} B)", maxRequest)
+
 /-- The named byte sequences of the isolated measurement. -/
 def requests : List (String × String) := [
   ("GET", "GET / HTTP/1.1\r\nHost: a\r\n\r\n"),
   ("HEAD", "HEAD / HTTP/1.1\r\nHost: a\r\n\r\n"),
   ("POST then pipelined GET", "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n\r\nhelloGET / HTTP/1.1\r\nHost: a\r\n\r\n"),
-  ("browser GET, 16 headers", browserGet),
-  ("100 headers (the limit)", manyHeaders maxHeaders),
-  ("largest head (8192 B)", maxHeadRequest),
-  ("largest request (16388 B)", maxRequest)
+  browserGetRow,
+  (s!"{maxHeaders} headers (the limit)", manyHeaders maxHeaders),
+  maxHeadRow,
+  maxRequestRow
 ]
 
 /-- The sequences of the fragmentation table: a typical request and the largest ones. -/
-def fragmentCorpus : List (String × String) :=
-  requests.filter fun (n, _) => n == "browser GET, 16 headers" || n == "largest head (8192 B)" || n == "largest request (16388 B)"
+def fragmentCorpus : List (String × String) := [browserGetRow, maxHeadRow, maxRequestRow]
 
 /-- Bytes the hand-written parser consumes, its status on a rejection, or 0 when it needs more. -/
 def handParse (b : ByteArray) : Nat :=

@@ -39,7 +39,20 @@ import (
 	"time"
 )
 
-const bodySize = 60001 // App/Fixture.lean's body
+// Values this suite states again from the server: the limits of
+// Server/Wire.lean and Server/H1Adapter.lean, the receive buffer of
+// zig/src/serve.zig (recv_cap), and the size of App/Fixture.lean's body
+// (longer than serve.zig's out_cap and no multiple of it). lsrv-test
+// (Test.lean, benchValuesAgree) checks each line, and that property of the
+// body; it reads the file's lines, so a local declaration shadowing one of
+// these names would escape it.
+const maxHeadBytes = 8192
+const maxBodyBytes = 8192
+const maxHeaders = 100
+const maxPathSegments = 255
+const maxQueryParams = 1000
+const recvCap = 8192
+const bodySize = 60001
 
 var body = func() []byte {
 	b := make([]byte, bodySize)
@@ -703,7 +716,7 @@ func memory(path string) (string, error) {
 			return err
 		}
 		conns[i] = c
-		io.WriteString(c, "POST /echo HTTP/1.1\r\nHost: a\r\nExpect: 100-continue\r\nContent-Length: 8192\r\nX: "+fill+"\r\n\r\n")
+		io.WriteString(c, "POST /echo HTTP/1.1\r\nHost: a\r\nExpect: 100-continue\r\nContent-Length: "+strconv.Itoa(maxBodyBytes)+"\r\nX: "+fill+"\r\n\r\n")
 		interim := make([]byte, len(continueBytes))
 		if _, err := io.ReadFull(c, interim); err != nil || string(interim) != continueBytes {
 			return fmt.Errorf("interim response %q, %v", interim, err)
@@ -1243,9 +1256,8 @@ func memoryFull(path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	const write = 8192 // recv_cap
 	payload := strings.Repeat(get, gets) + "GET / HTTP/1.1\r\nHost: a\r\nX: "
-	payload += strings.Repeat("a", write-len(payload))
+	payload += strings.Repeat("a", recvCap-len(payload))
 	conns := make([]*net.TCPConn, n)
 	defer func() {
 		for _, c := range conns {
@@ -1292,7 +1304,7 @@ func memoryFull(path string) (string, error) {
 					return 0, fmt.Errorf("connection %d: %d bytes of the client's unacknowledged", i, cq[1])
 				}
 				if side == 1 && sq[0] != 0 {
-					return 0, fmt.Errorf("connection %d: %d bytes unread by the server; it has not read all %d bytes", i, sq[0], write)
+					return 0, fmt.Errorf("connection %d: %d bytes unread by the server; it has not read all %d bytes", i, sq[0], recvCap)
 				}
 			}
 		}
@@ -1327,7 +1339,7 @@ func memoryFull(path string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("socket queues: %w", err)
 	}
-	least := write // the fewest bytes any connection held buffered
+	least := recvCap // the fewest bytes any connection held buffered
 	for i, c := range conns {
 		cl, sv := c.LocalAddr().String(), c.RemoteAddr().String()
 		_, sq, err := after.pair(cl, sv)
@@ -1342,7 +1354,7 @@ func memoryFull(path string) (string, error) {
 		if sent >= (gets-1)*respSize {
 			return "", fmt.Errorf("connection %d: up to %d response bytes sent, of %d responses; the sends did not stall", i, sent, gets)
 		}
-		least = min(least, write-(sent/respSize+1)*len(get))
+		least = min(least, recvCap-(sent/respSize+1)*len(get))
 	}
 	per := float64(held-half) / (n - n/2)
 	summary := fmt.Sprintf("resident set %d KiB idle, %d KiB with %d and %d KiB with %d connections, each with all its bytes read and not all responses sent (so sending a %d-byte response with at least %d bytes buffered, unless a receive had not reached Lean): %.1f KiB per added connection (bound %d KiB)",
@@ -1357,7 +1369,7 @@ func memoryFull(path string) (string, error) {
 // `maxBodyBytes` (Server/Wire.lean), with `target` and the fields `extra`
 // ("Name: value\r\n" each) besides Host, Expect and Content-Length.
 func expectHead(target, extra string) string {
-	return "POST " + target + " HTTP/1.1\r\nHost: a\r\nExpect: 100-continue\r\nContent-Length: 8192\r\n" + extra + "\r\n"
+	return "POST " + target + " HTTP/1.1\r\nHost: a\r\nExpect: 100-continue\r\nContent-Length: " + strconv.Itoa(maxBodyBytes) + "\r\n" + extra + "\r\n"
 }
 
 // readInterim reads the interim response from r: the event that shows the
@@ -1486,10 +1498,23 @@ func adapterScenario(args []string, n int, awaitRecv bool, hold func(c net.Conn)
 	}
 }
 
-// fieldsHead: the most fields H1 accepts (`maxHeaders`, 100), short ones.
+// mostElementsLine is a request line whose origin-form target has the most
+// elements H1Adapter's limits allow (`maxPathSegments` empty segments,
+// `maxQueryParams` parameters, all but one with empty values), as long as the
+// request line allows (`maxHeadBytes` with CRLF), the rest of the line in the
+// last parameter's value: lsrv-test's largest origin-form case
+// (retainedRequests). H1 keeps it from the end of the line.
+func mostElementsLine() string {
+	pre := "GET " + strings.Repeat("/", maxPathSegments) + "?" + strings.Repeat("=&", maxQueryParams-1) + "="
+	post := " HTTP/1.1\r\n"
+	return pre + strings.Repeat("v", maxHeadBytes-len(pre)-len(post)) + post
+}
+
+// fieldsHead: the most fields H1 accepts (`maxHeaders`), short ones: three
+// are expectHead's.
 func fieldsHead() string {
 	var b strings.Builder
-	for i := range 97 {
+	for i := range maxHeaders - 3 {
 		fmt.Fprintf(&b, "a%d: b\r\n", i)
 	}
 	return expectHead("/echo", b.String())
@@ -1715,14 +1740,10 @@ func main() {
 		{"memory of 400 connections holding all but one byte of a maximum body", nil, false, nil, adapterScenario([]string{"1"}, 400, true, holdBody(expectHead("/echo", ""))), true},
 		{"memory of 100 connections holding a nearly maximum head and all but one body byte, received 7 bytes at a time", nil, false, nil, adapterScenario([]string{"1", "--chunk", "7"}, 100, true, holdBody(longFieldsHead())), true},
 		{"memory of 400 connections holding an incomplete request after 50 pipelined ones", nil, false, nil, adapterScenario([]string{"1"}, 400, false, holdAfterPipelined(50)), true},
-		{"memory of 400 connections holding a head whose target has 255 path segments", nil, false, nil, adapterScenario([]string{"1"}, 400, false, holdHead(expectHead("/"+strings.Repeat("a/", 254)+"a", ""))), true},
-		{"memory of 400 connections holding a head whose target has 1,000 query parameters", nil, false, nil, adapterScenario([]string{"1"}, 400, false, holdHead(expectHead("/echo?"+strings.Repeat("a&", 999)+"a", ""))), true},
-		// An origin-form target with the most elements H1Adapter's limits
-		// allow (255 empty segments, 1,000 parameters, 999 of them with empty
-		// values), as long as the request line allows (8,192 bytes), the
-		// rest of the line in the last parameter's value: lsrv-test's
-		// largest origin-form case. H1 keeps it from the end of the line.
-		{"memory of 400 connections holding a request line whose target has 255 empty segments and 1,000 parameters, the most the limits allow", nil, false, nil, adapterScenario([]string{"1"}, 400, true, holdLine("GET "+strings.Repeat("/", 255)+"?"+strings.Repeat("=&", 999)+"="+strings.Repeat("v", 5922)+" HTTP/1.1\r\n")), false},
+		{fmt.Sprintf("memory of 400 connections holding a head whose target has %d path segments", maxPathSegments), nil, false, nil, adapterScenario([]string{"1"}, 400, false, holdHead(expectHead("/"+strings.Repeat("a/", maxPathSegments-1)+"a", ""))), true},
+		{fmt.Sprintf("memory of 400 connections holding a head whose target has %d query parameters", maxQueryParams), nil, false, nil, adapterScenario([]string{"1"}, 400, false, holdHead(expectHead("/echo?"+strings.Repeat("a&", maxQueryParams-1)+"a", ""))), true},
+		// mostElementsLine: lsrv-test's largest origin-form case.
+		{fmt.Sprintf("memory of 400 connections holding a request line whose target has %d empty segments and %d parameters, the most the limits allow", maxPathSegments, maxQueryParams), nil, false, nil, adapterScenario([]string{"1"}, 400, true, holdLine(mostElementsLine())), false},
 	}
 	failed, ran := 0, 0
 	for _, sc := range scenarios {
