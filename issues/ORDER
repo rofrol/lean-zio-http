@@ -2,6 +2,7 @@
 
 c6yngw Fix stale and contradictory comments found by the comment audit
 uo5qcn Bring the pool's libpq calls in line with libpq's documented call order, or cite the passage that allows them
+p7nicw Stop discarding statuses and errors that can hide a failure, and replace waits on our own processes with their events (Rule 10)
 4bngph Move the toolchain to the first nightly with lean4 PR 16562 and set maxPathSegments and maxQueryParams in the H1 adapter
 owgate Find where H1's parse spends 40 % of lsrv-arena's CPU (about 4-6 µs per request), or accept that cost
 paarzq Write a connection's pipelined responses with one send, as go-fasthttp does, instead of one send and one loop turn per response
@@ -15,7 +16,6 @@ lmbozk Make the container scripts' working-tree snapshot skip tracked files dele
 fbqrqb Run bench/arena/build.sh and local.sh end to end on the run-scoped image tags, and record amjip6's accepted limits
 jexowc Settle the dependency assumptions that rest on upstream code rather than upstream documentation (Rule 6)
 5ffu5o Derive or mechanically check the values copied by hand between languages, files and upstream
-p7nicw Stop discarding statuses and errors that can hide a failure, and replace waits on our own processes with their events (Rule 10)
 b3lisr Retire or record the local workarounds in the HttpArena build: the Rosetta zig wrapper and the gcannon patch
 dhosug Decide whether bench/mdlinks keeps its own CommonMark subset parser or uses a CommonMark library
 
