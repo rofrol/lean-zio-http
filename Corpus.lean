@@ -192,4 +192,57 @@ def arenaShapesCheck : Option String := Id.run do
       s := s'
   return none
 
+/-! The full receive buffer (item vhvejg): `inCap` bytes, as near as whole
+requests fill it, of one small request pipelined, which `lsrv-parsebench`'s
+`full` section measures. `Conn.gather` answers them in one `Conn.step` up to
+`maxResponseBytes` of responses, copying the rest of the buffer once per
+request answered (`buf.extract consumed buf.size`), so these are the cases
+where one step does the most work. `full-404` is the smallest request the H1
+adapter completes (25 bytes, `Host` empty; App.Arena answers it 404),
+`full-pipeline` gcannon's request of the `pipelined` shape (48 bytes,
+`200 ok`). -/
+
+/-- Each full-buffer case: its name, its request, and the status line and
+body App.Arena answers it with. -/
+def fullCases : List (String × String × String × String) :=
+  [("full-404", "GET / HTTP/1.1\r\nHost:\r\n\r\n", "HTTP/1.1 404 ", "404 page not found\n"),
+   ("full-pipeline", "GET /pipeline HTTP/1.1\r\nHost: 127.0.0.1:8080\r\n\r\n", "HTTP/1.1 200 ", "ok")]
+
+/-- The receive of a full-buffer case: as many copies of `req` as fit in
+`inCap`. -/
+def fullReceive (req : String) : ByteArray :=
+  let b := req.toUTF8
+  String.join (List.replicate (inCap / b.size) req) |>.toUTF8
+
+/-- Whether each full-buffer case is what `lsrv-parsebench` takes it for:
+its receive is within `inCap` and less than one request short of it, every
+parse of it completes a request, and lsrv-arena's Lean side answers it, twice
+on one connection, with one response per request, each starting with the
+case's status line and ending with its head's empty line and the case's
+body, in sends of which the first holds more than one response. The first
+failure, or `none`. -/
+def fullCasesCheck : Option String := Id.run do
+  for (name, req, status, body) in fullCases do
+    let b := fullReceive req
+    let want := inCap / req.utf8ByteSize
+    unless b.size ≤ inCap && inCap < b.size + req.utf8ByteSize do
+      return some s!"{name}: {b.size} bytes do not fill a buffer of {inCap}"
+    let n := h1Receive b
+    if n != want then return some s!"{name}: the adapter parsed {n} complete requests, want {want}"
+    let mut s := arenaInitial
+    for round in [0:2] do
+      let some (s', out) := arenaReceive s b
+        | return some s!"{name}, receive {round}: the connection did not ask to receive again after answering"
+      let first := (String.fromUTF8! (out[0]?.getD ByteArray.empty)).splitOn status
+      if first.length ≤ 2 then return some s!"{name}, receive {round}: the first send holds {first.length - 1} responses, want more than 1"
+      let parts := (String.fromUTF8! (out.foldl (· ++ ·) ByteArray.empty)).splitOn status
+      if parts.head? != some "" then return some s!"{name}, receive {round}: the sends do not start with {status.quote}"
+      if parts.length - 1 != want then return some s!"{name}, receive {round}: {parts.length - 1} responses, want {want}"
+      -- No head or body holds the status line, so each part is one response.
+      for r in parts.drop 1 do
+        unless r.endsWith ("\r\n\r\n" ++ body) do
+          return some s!"{name}, receive {round}: response {(status ++ r).quote}, want the body {body.quote}"
+      s := s'
+  return none
+
 end Corpus

@@ -12,3 +12,4 @@ bench/goserver/server
 bench/dbcheck/dbcheck
 bench/pgserver/server
 bench/mdlinks/mdlinks
+bench/fairness/fairness

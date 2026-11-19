@@ -58,6 +58,17 @@ Profiler (`xctrace`) on the M1, or with `perf record -g` in
 figures and profiles are in
 [Where H1's parse spends lsrv-arena's CPU](reports/h1-parse-profile.md).
 
+With no arguments `lsrv-parsebench` then prints its `full` section: one
+receive that fills a connection's buffer with a small request pipelined
+(`Corpus.fullCases`, checked by `Corpus.fullCasesCheck` in `lsrv-test`),
+timing the one `Conn.step` on it, the whole receive, and the suffix copies
+that step makes. `bench/fairness/run.sh` measures the same case on the loop:
+it starts `lsrv-arena` with one loop and times a probe connection's round
+trips alone and beside a connection that keeps its buffer full (`ARENA`
+names another build to measure, `PROBES` the round trips per run). Both
+measure only, outside `check.sh` and `bench.sh`; their figures are in
+[One step on a full buffer of pipelined requests](reports/full-buffer-step.md).
+
 The boundary tests open thousands of loopback connections, and each closed
 one stays in TIME_WAIT for 2*MSL (30 s on macOS) on the side that closed it
 first. On the M1 the suite's two runs in one `check.sh` raised

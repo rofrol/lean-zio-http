@@ -553,8 +553,8 @@ def lawFor (ad : Adapter) (app : Handler) (what : String) (b : ByteArray) (k : N
 of each sequence, and each request of its fragmentation table, fed to a new
 connection through `Conn.step` in receives of 1, 7, 64 and 1460 bytes, is
 answered after its last receive with the nonempty response it gets in one
-receive. The HttpArena shapes `lsrv-parsebench` measures pass
-`Corpus.arenaShapesCheck`. -/
+receive. The HttpArena shapes and the full-buffer cases `lsrv-parsebench`
+measures pass `Corpus.arenaShapesCheck` and `Corpus.fullCasesCheck`. -/
 def corpusScenario : Check Unit := do
   for (name, req) in Corpus.requests do
     let b := bytes req
@@ -573,6 +573,7 @@ def corpusScenario : Check Unit := do
         | some d => if d != whole then fail s!"corpus {ad.name} {name} in receives of {k} B: another response than in one receive"
   -- The shapes `lsrv-parsebench` measures.
   if let some e := Corpus.arenaShapesCheck then fail s!"arena shapes: {e}"
+  if let some e := Corpus.fullCasesCheck then fail s!"full-buffer cases: {e}"
 
 def lawCases (ad : Adapter) : Check Unit := do
   for c in cases do
