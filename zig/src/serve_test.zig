@@ -357,6 +357,9 @@ export fn ekk_pg_options(_: [*:0]const u8, _: c_uint, _: *?[*:0]u8) c_int {
 export fn ekk_pg_start(_: [*:0]const u8, _: [*:0]const u8) ?*anyopaque {
     @panic("ekk_pg_start");
 }
+export fn ekk_pg_connect_first(_: *anyopaque) c_int {
+    @panic("ekk_pg_connect_first");
+}
 export fn ekk_pg_connect_poll(_: *anyopaque) c_int {
     @panic("ekk_pg_connect_poll");
 }

@@ -62,7 +62,8 @@
 //   closes and may replace its own socket (PQfinish, PQconnectPoll). So the
 //   pool never registers libpq's descriptor: it polls a duplicate it owns
 //   and removes it with `NetClose` once no poll on it is outstanding; during
-//   the connect a fresh duplicate is taken for every PQconnectPoll step.
+//   the connect a fresh duplicate is taken for the wait before each
+//   PQconnectPoll step, the first one's included (a wait to write).
 const std = @import("std");
 const zio = @import("zio");
 const ev = zio.ev;
@@ -78,6 +79,7 @@ extern fn ekk_pg_lost(c: ?*Session) Lean;
 extern fn ekk_pg_lost_sent(c: ?*Session) Lean;
 extern fn ekk_query_timeout_ms(q: Lean, dflt: c_uint, ceiling: c_uint) c_uint;
 extern fn ekk_pg_start(conninfo: [*:0]const u8, options: [*:0]const u8) ?*Session;
+extern fn ekk_pg_connect_first(c: *Session) c_int;
 extern fn ekk_pg_connect_poll(c: *Session) c_int;
 extern fn ekk_pg_socket(c: *Session) c_int;
 extern fn ekk_pg_finish(c: *Session) void;
@@ -272,13 +274,21 @@ pub const Slot = struct {
         self.connect_deadline = after(self.pool.budgets.connect_ms, now());
         self.connect_expired = false;
         self.pg = ekk_pg_start(self.pool.conninfo, self.pool.options);
-        self.connectStep();
+        const pg = self.pg orelse return self.connectFailed();
+        // The first PQconnectPoll waits for writability (pg.c,
+        // `ekk_pg_connect_first`, quoting libpq's documentation).
+        self.connectNext(ekk_pg_connect_first(pg));
     }
 
     /// One PQconnectPoll step, with no duplicate registered.
     fn connectStep(self: *Slot) void {
-        const pg = self.pg orelse return self.connectFailed();
-        switch (ekk_pg_connect_poll(pg)) {
+        self.connectNext(ekk_pg_connect_poll(self.pg.?));
+    }
+
+    /// Goes on as a connect step asks (pg.c's codes): waits on the socket,
+    /// becomes idle, or fails.
+    fn connectNext(self: *Slot, rc: c_int) void {
+        switch (rc) {
             1, 2 => |dir| {
                 if (!self.takeSocket()) return self.connectFailed();
                 if (dir == 1) self.arm(.recv) else self.arm(.send);

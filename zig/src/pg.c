@@ -65,11 +65,18 @@ lean_object *ekk_pg_abandoned(const char *sqlstate, const char *message) { retur
    Every execution runs in libpq's chunked-rows mode, so its rows arrive
    in PGresults of EKK_CHUNK_ROWS rows (the last one of fewer) and are
    charged against Query.maxResultBytes as they arrive (ekk_rows); a result
-   that crosses the bound closes the session before the rest arrives. libpq
-   lets the mode be set only while its command is the head of libpq's queue
-   and none of its results has been parsed: for a cached or unnamed
-   execution right after sending it, on a first use once the Prepare's
-   results have ended (`stage`). */
+   that crosses the bound closes the session before the rest arrives. The
+   mode is set for a cached or unnamed execution right after sending it,
+   and on a first use once the Prepare's results have ended (`stage`),
+   before the execution's first PQgetResult. libpq 17's documentation
+   ("Retrieving Query Results in Chunks") allows the second in pipeline
+   mode, which every session is in: "When using pipeline mode,
+   single-row or chunked mode needs to be activated for each query in the
+   pipeline before retrieving results for that query with PQgetResult."
+   Its general rule, "immediately after PQsendQuery or one of its sibling
+   functions, before any other operation on the connection such as
+   PQconsumeInput or PQgetResult" (PQsetChunkedRowsMode), is kept by the
+   first. */
 #define EKK_STATEMENTS 64
 
 /* The rows of one chunk. libpq hands a chunk over only once it holds this
@@ -117,12 +124,13 @@ typedef struct {
     int chunk;     /* EKK_CHUNK_ROWS; the tests set others */
 } ekk_pg;
 
-/* libpq's chunked-rows mode for the command at the head of libpq's queue.
-   The callers set it only where libpq allows it (above), so a refusal is a
-   programming error, never a reason to buffer the whole result. */
 /* The name statement `n` is prepared under. */
 static void stmt_name(char out[32], unsigned long long n) { snprintf(out, 32, "ekk%llu", n); }
 
+/* libpq's chunked-rows mode for the command at the head of libpq's queue.
+   The callers set it only where libpq's documentation allows it (above),
+   so a refusal is a programming error, never a reason to buffer the whole
+   result. */
 static void chunked(ekk_pg *p) {
     if (!PQsetChunkedRowsMode(p->c, p->chunk)) {
         fprintf(stderr, "pg.c: libpq refused chunked-rows mode for the execution\n");
@@ -218,8 +226,19 @@ ekk_pg *ekk_pg_start(const char *conninfo, const char *options) {
     return p;
 }
 
-/* One PQconnectPoll step: 0 failed, 1 wait to read, 2 wait to write,
-   3 connected (now in non-blocking pipeline mode). */
+/* The step before the first PQconnectPoll: 0 failed (PQstatus is
+   CONNECTION_BAD, the attempt failed at its start), 2 wait to write.
+   libpq 17's documentation (PQconnectStartParams): "Next call
+   PQstatus(conn). If the result is CONNECTION_BAD, the connection attempt
+   has already failed", and of the PQconnectPoll loop: "On the first
+   iteration, i.e., if you have yet to call PQconnectPoll, behave as if it
+   last returned PGRES_POLLING_WRITING." */
+int ekk_pg_connect_first(ekk_pg *p) { return PQstatus(p->c) == CONNECTION_BAD ? 0 : 2; }
+
+/* One PQconnectPoll step, once the socket is ready the way the step
+   before asked (ekk_pg_connect_first, then this): 0 failed, 1 wait to
+   read, 2 wait to write, 3 connected (now in non-blocking pipeline
+   mode). */
 int ekk_pg_connect_poll(ekk_pg *p) {
     if (PQstatus(p->c) == CONNECTION_BAD) return 0;
     switch (PQconnectPoll(p->c)) {
@@ -568,7 +587,9 @@ int ekk_pg_collect(ekk_pg *p, lean_object **acc) {
             p->last_null = 1;
             if (p->stage == EKK_PREPARED) {
                 /* The execution is libpq's queue head now, and the next
-                   PQisBusy would parse its first result. */
+                   PQisBusy would parse its first result: its mode is set
+                   before its results are retrieved, as libpq documents
+                   for pipeline mode (above, EKK_STATEMENTS). */
                 chunked(p);
                 p->stage = EKK_EXECUTING;
             }

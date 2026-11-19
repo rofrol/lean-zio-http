@@ -189,6 +189,8 @@ static ekk_pg *connect_fake(fake *f) {
     snprintf(conninfo, sizeof conninfo, "host=%s port=5432 user=fake dbname=fake sslmode=disable gssencmode=disable", f->dir);
     ekk_pg *p = ekk_pg_start(conninfo, start_options);
     CHECK(p != NULL, "ekk_pg_start");
+    /* The Unix socket's connect has completed, so it is writable at once. */
+    CHECK(ekk_pg_connect_first(p) == 2, "the step before the first PQconnectPoll does not wait to write: %s", PQerrorMessage(p->c));
     uint8_t in[1024];
     size_t got = 0;
     int answered = 0;
@@ -1298,6 +1300,16 @@ static void libpq_versions(void) {
     printf("pg_glue_test: libpq %d loaded from %s\n", PQlibVersion(), d.dli_fname);
 }
 
+/* An attempt that fails at its start (an unknown conninfo keyword:
+   PQstatus is CONNECTION_BAD) is failed before any PQconnectPoll. */
+static void connect_refused(void) {
+    ekk_pg *p = ekk_pg_start("nosuchkeyword=1", start_options);
+    CHECK(p != NULL, "ekk_pg_start");
+    CHECK(ekk_pg_connect_first(p) == 0, "an attempt that failed at its start goes on");
+    CHECK(*PQerrorMessage(p->c) != '\0', "no error message");
+    ekk_pg_finish(p);
+}
+
 int main(void) {
     lean_initialize_runtime_module();
     libpq_versions();
@@ -1308,6 +1320,8 @@ int main(void) {
     startup_options();
     CHECK(ekk_pg_options("", 4321, &start_options) == 0, "ekk_pg_options");
     printf("pg_glue_test: startup options: ok\n");
+    connect_refused();
+    printf("pg_glue_test: a connect failed at its start: ok\n");
     unsendable();
     CHECK(strcmp(sent_options, start_options) == 0, "the startup packet carried options \"%s\", not \"%s\"", sent_options, start_options);
     printf("pg_glue_test: unsendable queries: ok\n");
