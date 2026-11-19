@@ -36,3 +36,6 @@ I copied 0.17.1's lib directory, added `step.clearFailedCommand(gpa);` before th
 4. Leave it as it is.
 
 Recommendation: 1 and 3. Also report the fix as a PR if the owner wants it upstream sooner. Do not switch the toolchain to a fork.
+
+Question: How should Zig's "failed command:" line for a passing test step be handled?
+Options: report it upstream on Codeberg and add a note to docs/running.md (recommended) | report upstream only | fork Zig, offer a PR and build with the fork | leave it as it is
