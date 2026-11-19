@@ -10,6 +10,7 @@ q2g4am Act on leanprover/lean4's answers to the Std.Http questions 16522 and 165
 5f54l4 Should H1Adapter decode chunked request bodies, so HttpArena's baseline and limited-conn run with their whole request mix?
 3pund6 Decide what follows from the classification of Linux pending-connection accept errnos (xihdtw)
 lmbozk Make the container scripts' working-tree snapshot skip tracked files deleted from the working tree
+fbqrqb Run bench/arena/build.sh and local.sh end to end on the run-scoped image tags, and record amjip6's accepted limits
 
 ## Needs a decision
 

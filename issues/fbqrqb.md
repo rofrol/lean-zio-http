@@ -1,0 +1,7 @@
+Run bench/arena/build.sh and local.sh end to end on the run-scoped image tags, and record amjip6's accepted limits
+
+From item amjip6 (commit 0612bed). Its run did not execute bench/arena/local.sh or bench/arena/build.sh end to end (they need an HttpArena checkout); their image steps call the same linux/run-images.sh helper that linux/run-images-test.sh exercises.
+
+Decided 2026-11-19 by the coordinating session with sol, argon and hydrogen (calls ba206804, 392eb26e, 6cdab6da) under the user's delegation, majority argon and hydrogen (sol wanted points 2 and 3 fixed now): accepted, and to be written next to the helper and in README "Running": (1) an interrupt during docker build's export can leave a `:run-*` tag set by the daemon after cleanup (already in README, `docker image ls '*:run-*'` shows it; never another run's image); (2) if mktemp fails in one of linux/run-images-test.sh's two runs, the other waits until interrupted (test-only, needs a broken TMPDIR); (3) when `docker image inspect` fails (daemon unreachable), cleanup treats the tag as absent and does not remove it. Whether run-images-test.sh joins a gate was not decided; README asks to run it at each change to image building or naming.
+
+Work when taken: run build.sh (and local.sh if an HttpArena checkout is at hand) once end to end, the next time 2ltibq or another arena run needs them anyway; check no `:run-*` tag is left; add the notes for (2) and (3).
