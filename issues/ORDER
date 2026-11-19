@@ -7,7 +7,6 @@ q2g4am Act on leanprover/lean4's answers to the Std.Http questions 16522 and 165
 lmbozk Make the container scripts' working-tree snapshot skip tracked files deleted from the working tree
 fbqrqb Run bench/arena/build.sh and local.sh end to end on the run-scoped image tags, and record amjip6's accepted limits
 fzddri Rerun ./linux-check.sh for the tests and pool changes added since its last recorded run
-4fued7 Stop discarding bpftrace's and perf's exit statuses in bench/arena/local-inner.sh, and end the go entries' readiness loop when the server exits
 yg56hu Stop a passing serve_test run from printing "failed command:" in every check run
 g62mok Decide whether to measure the pool's readiness probe (peek against NetPoll) on Linux
 zoswdj Explain why bench/boundary's 7-byte nearly-maximum-head row measures 82 to 89 KiB against the 76.2 to 77.4 KiB in docs/memory.md
@@ -26,3 +25,4 @@ yvladm Decide whether per-loop PostgreSQL pools should share connections across 
 b3lisr Retire or record the local workarounds in the HttpArena build: the Rosetta zig wrapper and the gcannon patch
 dhosug Decide whether bench/mdlinks keeps its own CommonMark subset parser or uses a CommonMark library
 alblg3 Decide what to do with the dependency assumptions that rest on upstream code only (Rule 6)
+4fued7 Stop discarding bpftrace's and perf's exit statuses in bench/arena/local-inner.sh, and end the go entries' readiness loop when the server exits
