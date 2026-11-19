@@ -32,6 +32,13 @@
 //! at each zio update and update this record). Each run below names the
 //! commit it ran and counts the tests that commit held; a test added after
 //! the last run here has not run on Linux. Last Linux run, 2026-11-19
+//! (item 4bngph, on the tree of the commit that moved lean-toolchain to
+//! nightly-2026-11-19): OrbStack on the M1, aarch64, kernel
+//! 7.2.12-orbstack-00394-gbecdd6130068, Debian 13.7, Zig 0.17.1, Lean
+//! nightly-2026-11-19, libpq 17.12, zio f8ca47367765; `./linux-check.sh` as
+//! committed, exit 0, on epoll and on io_uring each: `zig build test`
+//! passed (serve_test.zig held 45 tests and pg_test.zig 40), pg_glue_test
+//! passed, and the rest of `./check.sh`. The run before, 2026-11-19
 //! (item 3pund6, on the tree of the commit that moved zio's pin to
 //! f8ca47367765): OrbStack on the M1, aarch64, kernel
 //! 7.2.12-orbstack-00394-gbecdd6130068, Debian 13.7, Zig 0.17.1, Lean

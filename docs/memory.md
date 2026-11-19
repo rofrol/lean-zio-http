@@ -4,11 +4,13 @@ Three kinds of statement, kept apart: lengths that `Conn.step_inv` proves,
 allocations derived from the code of the runtime and its allocators (for the
 adapter's state also checked against the blocks a state actually holds), and
 resident set growth that `bench/boundary` measures. A connection holds at
-most 715,228 bytes (698.5 KiB) of live blocks besides its small Lean
-objects, most of them H1's parsed request-target while a request is
-incomplete (below): 2.73 GiB at the default 4,096 connections. This replaces
-the statement of about 98 KiB per connection, withdrawn when the adapter's
-state was measured.
+most 317,610 bytes (310.2 KiB) of live blocks besides its small Lean
+objects, half of them H1's parsed request-target while a request is
+incomplete (below): 1.21 GiB at the default 4,096 connections. This replaces
+the 715,228 bytes (698.5 KiB) derived before the adapter limited the
+target's path segments and query parameters (2026-11-19), which replaced the
+statement of about 98 KiB per connection, withdrawn when the adapter's state
+was measured.
 
 **Lengths** (proved, `Conn.step_inv`): the Lean buffer of unconsumed bytes
 holds at most `inCap` = 16,388 bytes and a response being sent at most
@@ -19,7 +21,12 @@ lean4 commit 62e0cf0, mimalloc 3.4.5; a block size is what the toolchain's
 `mi_good_size` returns for the object, on the M1). Rechecked for
 nightly-2026-11-17 (lean4 commit 55069db): `src/runtime/object.cpp`,
 `object.h`, `alloc.cpp` and `lean.h` are unchanged, mimalloc is still 3.4.5,
-and `lsrv-test` measures the same bytes for every retained-state case:
+and `lsrv-test` measures the same bytes for every retained-state case.
+Rechecked for nightly-2026-11-19 (lean4 commit 8009d0a): `object.cpp` and
+`lean.h` change only `Nat` shifts and the panic of an out-of-bounds borrowed
+array read, `object.h` and `alloc.cpp` are unchanged, mimalloc is still
+3.4.5, and `lsrv-test` measured the same bytes for every retained-state case
+of nightly-2026-11-17 before the cases changed with the limits below:
 
 - The loop's connection: a 16,712-byte `Conn` (`@sizeOf`, Zig 0.17.1) from
   `std.heap.c_allocator` (`zig/src/serve.zig`), a 20,480-byte malloc block
@@ -53,8 +60,8 @@ So a connection holds, besides its small Lean objects (the state, phase and
 action constructors, tens of bytes each):
 
 - while reading, and while sending the interim response: at most 20,480 +
-  40,960 = 61,440 bytes, plus the adapter's state, with H1 at most 653,788
-  (below): 715,228 bytes (698.5 KiB) in all, the most of any state;
+  40,960 = 61,440 bytes, plus the adapter's state, with H1 at most 256,170
+  (below): 317,610 bytes (310.2 KiB) in all, the most of any state;
 - while sending a final response: at most 20,480 + 10,240 + 81,920 =
   112,640 bytes (110 KiB), the adapter at `init`;
 - while waiting for a query: the connection and an exact buffer of under
@@ -90,37 +97,50 @@ part is a definition in `Test.lean`, "The H1 adapter's retained state"):
 - the body pulled so far, appended chunk by chunk: under `maxBodyBytes`, a
   block of at most 20,480;
 - the request-target, parsed into path segments and query parameters and
-  kept in the message head until the request completes: at most 557,224.
-  H1 maps every count limit of the target, `maxPathSegments` and
-  `maxQueryParams` included, to `maxUriLength`, here 8,192
-  (`requestTargetConfig` in `Std/Http/Protocol/H1/Parser.lean`, whose
-  comment gives the reason: a component limit lower than the whole target's
-  would reject with 400 a target that RFC 9112 would answer with 414), so a
-  target may hold an element per byte. Every element (a path segment, a
-  query parameter, a part of an absolute-form target) takes at least one
-  byte of the target and at most 48 bytes of blocks per byte it takes; the
-  costliest is the empty query parameter `&`, a 24-byte pair and a 24-byte
-  empty `ByteArray` (an empty segment `/` takes 24). The arrays of segments
-  and parameters, with at most 8,192 elements together and capacity at most
-  twice their size (`lean_copy_expand_array`), take at most 163,880, and the
-  target's own constructors 128: 48 × 8,192 + 163,880 + 128;
+  kept in the message head until the request completes: at most 159,606.
+  `H1Adapter.config` allows at most `maxPathSegments` = 255 path segments
+  and `maxQueryParams` = 1,000 query parameters, empty ones counted (the
+  sources of both values are next to them in `Server/H1Adapter.lean`); H1
+  answers a target with more with 414, as one over `maxUriLength`
+  (`exceedsElementLimits` in `Std/Http/Protocol/H1/Parser.lean`, lean4 PR
+  16562, since nightly-2026-11-19). Without them a `maxUriLength` target
+  could hold an element per byte, 557,224 bytes of blocks. A block holding
+  an object of `x` bytes is at most `x + x/4 + 7`. A segment is a
+  `ByteArray` of its bytes: at most 37 bytes plus 5/4 of its bytes. A
+  parameter is a 24-byte pair of its key and, after `=`, a 16-byte `some`
+  of its value, each such a `ByteArray`: at most 114 plus 5/4 of its bytes
+  (the pair and the `some` take blocks of exactly their size: `mi_good_size`
+  of 16 and 24 is 16 and 24, as of every multiple of 8 up to 64, measured
+  against the toolchain's `libleanshared`).
+  The other parts of an absolute-form target are at most five strings, 49
+  each plus 5/4 of their bytes, and the bytes of all parts together at most
+  `maxUriLength` = 8,192. The arrays of segments and parameters have
+  capacity at most twice their size (`lean_copy_expand_array`), 8 bytes a
+  slot after a 24-byte header, and the target's own constructors take 512:
+  37 × 255 + 114 × 1,000 + 5 × 49 + 10,240 + 5,137 + 20,037 + 512;
 - the header fields: at most `maxHeaders` = 100 pairs of a name and a value
   string, whose bytes total at most `maxHeadBytes`: at most 34,076;
 - the constructors of the parser, machine, reader, writer and head: at most
   1,024.
 
-In all at most 653,788 bytes (638.5 KiB). What a parse allocates and drops
-within a step (the target's split into strings, a field line) is per loop,
-not per connection (above). `lsrv-test` checks each part against the blocks
+In all at most 256,170 bytes (250.2 KiB). What a parse allocates and drops
+within a step (the target's split into strings, a field line, and a target
+over the limits, which H1 parses whole before it counts its elements) is per
+loop, not per connection (above). `lsrv-test` checks each part against the blocks
 the state actually holds (`test/retained.c` walks the state's objects and
 adds `mi_usable_size` of each block, a shared one once, the persistent
 initial state not at all) in every incomplete state of requests that drive
-each part to its largest, fed whole and in pieces of 7 and 1,460 bytes; the
-largest is 484,960 bytes, with a request line whose target is 8,176 empty
-query parameters, the most the line allows (H1 keeps the target from the
-end of the line, before any field). The arithmetic depends on the runtime (object
-layouts, array growth, mimalloc's block sizes): that check is what keeps it
-true across toolchain updates. It bounds live blocks; how much is resident,
+each part toward its bound, fed whole and in pieces of 7 and 1,460 bytes; the
+largest is 126,488 bytes, with a request line of 8,192 bytes whose
+absolute-form target has user info, a port, 255 empty segments and 1,000 parameters, the most
+the limits allow, 999 of them with empty values and the rest of the line in
+the last one's value (H1 keeps the target from the end of the line, before
+any field); in origin-form, 126,168. These cases stress the bound, they do
+not attain it. `lsrv-test` also checks that a target with 255
+segments or 1,000 parameters is served and one with 256 or 1,001 gets 414. The arithmetic depends on the runtime (object
+layouts, array growth, mimalloc's block sizes): that check, run at each
+toolchain update, shows whether these cases still fit it, which is evidence
+for the arithmetic, not a proof of it. It bounds live blocks; how much is resident,
 and how much more freed blocks keep resident, `bench/boundary` measures.
 
 **Measured** (`bench/boundary`, resident set growth per connection with
@@ -138,25 +158,32 @@ metadata, which is not derived (`sendingBound`):
 | all but one byte of an 8,192-byte body | 400 | 73.0 to 73.2 |
 | a head of 97 fields of 72-byte values and all but one body byte, received 7 bytes at a time (`--chunk 7`) | 100 | 76.2 to 77.4 |
 | an incomplete request after 50 pipelined ones | 400 | 31.4 to 32.1 |
-| a head whose request-target has 4,000 path segments | 400 | 207.8 to 208.0 |
-| a head whose request-target has 4,000 query parameters | 400 | 301.8 to 301.9 |
-| a request line whose target has 8,176 empty query parameters, the most it allows, after a complete request | 400 | 500.7 to 501.0 |
+| a head whose request-target has 255 path segments | 400 | 51.9 |
+| a head whose request-target has 1,000 query parameters | 400 | 104.6 to 105.1 |
+| a request line whose origin-form target has 255 empty segments and 1,000 parameters, the most the limits allow, 999 with empty values and the rest of the line in the last, after a complete request | 400 | 167.0 to 167.2 |
 | a 60,121-byte response being sent, with a pipelined tail buffered | 100 | 90.6 |
 
 (Four runs each, 2026-11-17; earlier runs of the first and last rows gave
-52.0 and 90.6 to 90.9.) For the 8,176 parameters, the adapter's state
-holds 484,960 bytes (473.6 KiB) of live blocks (`lsrv-test`), besides the
-connection's 20 KiB and its buffer; with the hand-written parser, which
-keeps no state, the same connections grew the resident set by 41.6 KiB each.
+52.0 and 90.6 to 90.9. The three rows of the request-target: four runs each,
+2026-11-19, toolchain nightly-2026-11-19, with the limits; before them, a
+head of 4,000 path segments grew it by 207.8 to 208.0 KiB, one of 4,000
+query parameters by 301.8 to 301.9, and a request line of 8,176 empty query
+parameters by 500.7 to 501.0.) For the line with the most elements the
+limits allow, the adapter's state holds 126,168 bytes (123.2 KiB) of live
+blocks (`lsrv-test`), besides the connection's 20 KiB and its buffer; with
+the hand-written parser, which keeps no state, the same connections grew the
+resident set by 41.7 KiB each.
 The interim response shows that a connection
 holds its head; for a body or a request line, the server, started with
 `--report-recv`, prints `received <bytes>` once Lean's state has taken each
 receive, and the scenario waits until those add up to every byte its
-clients wrote (`awaitRead`, since 2026-11-19, item p7nicw). The runs above
-waited instead until the socket queues (lsof on macOS, `/proc` on Linux)
-showed every byte taken from the sockets, which did not exclude a receive
-not yet handed to Lean. At 4,096 connections, connections holding the request line with
-8,176 query parameters would take about 2.0 GiB resident.
+clients wrote (`awaitRead`, since 2026-11-19, item p7nicw): the row of the
+request line, 2026-11-19. The two rows of a body, run 2026-11-17, waited
+instead until the socket queues (lsof on macOS, `/proc` on
+Linux) showed every byte taken from the sockets, which did not exclude a
+receive not yet handed to Lean. At
+4,096 connections, connections holding the request line with the most
+elements would take about 668 MiB resident (2.0 GiB before the limits).
 
 The last scenario: connections whose client writes 8,192 bytes at once (100
 pipelined GETs of the fixture's largest response, then an unfinished
@@ -219,3 +246,8 @@ connection with H1 on epoll and io_uring: 51.9 and 51.8 KiB holding all but
 one byte of a maximum body, 60.9 and 70.2 KiB for the nearly maximum head
 received 7 bytes at a time, 495.6 and 483.2 KiB for the request line with
 8,176 query parameters (28.9 and 28.8 KiB with the hand-written parser).
+With the target's limits (the same container, one run per backend,
+2026-11-19, nightly-2026-11-19), on epoll and io_uring: 152.4 and 152.3 KiB
+for the request line with the most elements the limits allow (29.0 and
+28.8 KiB with the hand-written parser), 34.7 and 34.6 KiB for a head of 255
+path segments, 87.5 and 87.3 KiB for one of 1,000 query parameters.

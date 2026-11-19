@@ -154,6 +154,30 @@ same results under both:
 - A header name over 256 bytes (40 cases): H1 answered 400; it now answers
   431, as for a value over `maxHeaderValueLength`.
 
+### 2026-11-19: nightly-2026-11-19 (item 4bngph)
+
+What nightly-2026-11-19 (lean4 commit 8009d0a64d28) changed, from
+`lsrv-compare` on commit dd9b28e of this repository under nightly-2026-11-17
+and nightly-2026-11-19; this adds to the lists above and replaces none of
+them. It is the first nightly with https://github.com/leanprover/lean4/pull/16562
+(`maxPathSegments` and `maxQueryParams` in `H1.Config`, not yet set in that
+comparison) and also has https://github.com/leanprover/lean4/pull/16568. The
+valid requests, the limits at their boundaries and the 30,000 single-byte
+edits (2,701 differ) give the same results under both; the templates differ
+in one group:
+
+- `CONNECT a:443` with a matching Host, which both parsers accept (7 cases):
+  H1 now reports that the connection closes after the response (PR 16568,
+  RFC 9110 §9.3.6: bytes after a CONNECT head may be tunnel data, not another
+  request), where the hand-written parser keeps it alive. Templates that
+  differ: 732 -> 739, in 27 groups. The server's answer does not change: the
+  adapter answers CONNECT with 501 and closes under either toolchain
+  (`lsrv-test`'s CONNECT case).
+
+With the limits set (`H1Adapter.config`), a target of more than 255 path
+segments or 1,000 query parameters gets 414 from H1; the hand-written parser
+has no such limit. No case of `lsrv-compare` reaches either count.
+
 ## Proposal for D1 (decided: D1 in the decision record)
 
 Options:

@@ -51,7 +51,7 @@ lean_prefix=$(lean --print-prefix)
 # zig/ for that glibc, and the archive must reference no libc symbol it lacks.
 # This machine's toolchain may ship no glibc, so the version is stated: 2.26,
 # the highest GLIBC_2.* version lib/glibc/libc.so of Lean's x86_64 Linux
-# release nightly-2026-11-17 defines (checked 2026-11-17); recheck it at each
+# release nightly-2026-11-19 defines (checked 2026-11-19); recheck it at each
 # update of lean-toolchain.
 lean_glibc=2.26
 # The newest glibc Zig knows: its stubs define every libc symbol Zig's std may call.

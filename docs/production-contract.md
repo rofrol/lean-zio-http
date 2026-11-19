@@ -13,8 +13,10 @@
 - **Requests.** HTTP/1.0 and 1.1 through `Std.Http.Protocol.H1`: a head of at
   most 8,192 bytes in all (H1 bounds the request line and the header block
   separately; the adapter answers a longer head, complete or not, with 431),
-  at most 100 fields, a Content-Length body of at most 8,192 bytes,
-  pipelining. So every request the adapter waits for fits in the connection's
+  at most 100 fields, a Content-Length body of at most 8,192 bytes, a
+  request-target of at most 255 path segments and 1,000 query parameters,
+  empty ones counted (more: 414; `H1Adapter.maxPathSegments`,
+  `maxQueryParams`), pipelining. So every request the adapter waits for fits in the connection's
   buffer (`inCap`); `lsrv-test` feeds a 10,000-byte head and the largest body
   through `Conn.step` and expects 431, not a silent close. H1 validates the
   request line, the method (unregistered: 501), the version (505), the

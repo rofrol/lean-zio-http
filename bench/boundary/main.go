@@ -1715,12 +1715,14 @@ func main() {
 		{"memory of 400 connections holding all but one byte of a maximum body", nil, false, nil, adapterScenario([]string{"1"}, 400, true, holdBody(expectHead("/echo", ""))), true},
 		{"memory of 100 connections holding a nearly maximum head and all but one body byte, received 7 bytes at a time", nil, false, nil, adapterScenario([]string{"1", "--chunk", "7"}, 100, true, holdBody(longFieldsHead())), true},
 		{"memory of 400 connections holding an incomplete request after 50 pipelined ones", nil, false, nil, adapterScenario([]string{"1"}, 400, false, holdAfterPipelined(50)), true},
-		{"memory of 400 connections holding a head whose target has 4,000 path segments", nil, false, nil, adapterScenario([]string{"1"}, 400, false, holdHead(expectHead("/"+strings.Repeat("a/", 3999)+"a", ""))), true},
-		{"memory of 400 connections holding a head whose target has 4,000 query parameters", nil, false, nil, adapterScenario([]string{"1"}, 400, false, holdHead(expectHead("/echo?"+strings.Repeat("a&", 3999)+"a", ""))), true},
-		// The target with the most elements per byte, as long as the request
-		// line allows (8,192 bytes): its live blocks are the largest lsrv-test
-		// finds. H1 keeps it from the end of the line.
-		{"memory of 400 connections holding a request line whose target has 8,176 empty query parameters", nil, false, nil, adapterScenario([]string{"1"}, 400, true, holdLine("GET /?"+strings.Repeat("&", 8175)+" HTTP/1.1\r\n")), false},
+		{"memory of 400 connections holding a head whose target has 255 path segments", nil, false, nil, adapterScenario([]string{"1"}, 400, false, holdHead(expectHead("/"+strings.Repeat("a/", 254)+"a", ""))), true},
+		{"memory of 400 connections holding a head whose target has 1,000 query parameters", nil, false, nil, adapterScenario([]string{"1"}, 400, false, holdHead(expectHead("/echo?"+strings.Repeat("a&", 999)+"a", ""))), true},
+		// An origin-form target with the most elements H1Adapter's limits
+		// allow (255 empty segments, 1,000 parameters, 999 of them with empty
+		// values), as long as the request line allows (8,192 bytes), the
+		// rest of the line in the last parameter's value: lsrv-test's
+		// largest origin-form case. H1 keeps it from the end of the line.
+		{"memory of 400 connections holding a request line whose target has 255 empty segments and 1,000 parameters, the most the limits allow", nil, false, nil, adapterScenario([]string{"1"}, 400, true, holdLine("GET "+strings.Repeat("/", 255)+"?"+strings.Repeat("=&", 999)+"="+strings.Repeat("v", 5922)+" HTTP/1.1\r\n")), false},
 	}
 	failed, ran := 0, 0
 	for _, sc := range scenarios {

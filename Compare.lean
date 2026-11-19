@@ -205,7 +205,7 @@ def headOf (n : Nat) : String :=
   let fixed := "GET / HTTP/1.1\r\nHost: a\r\nX: "
   fixed ++ Corpus.big (n - fixed.length) ++ "\r\n\r\n"
 
-/-- A request whose field lines count `n` bytes as H1 counts them (H1.lean:1848:
+/-- A request whose field lines count `n` bytes as H1 counts them (H1.lean:1947:
 the bytes of each line, CRLF included). -/
 def fieldBytesOf (n : Nat) : String :=
   -- "Host: a\r\n" is 9 bytes, "X: " and CRLF 5 more.
@@ -215,7 +215,7 @@ def bodyOf (n : Nat) : String :=
   s!"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: {n}\r\n\r\n" ++ Corpus.big n
 
 /-- A request whose request line is `n` bytes, CRLF included, as H1 counts it
-against `maxStartLineLength` (H1.lean:1764). -/
+against `maxStartLineLength` (H1.lean:1862). -/
 def requestLineOf (n : Nat) : String :=
   "GET /" ++ Corpus.big (n - 16) ++ " HTTP/1.1\r\nHost: a\r\n\r\n"
 

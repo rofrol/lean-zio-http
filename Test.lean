@@ -51,6 +51,12 @@ def maxHeadRequest : String :=
   let fixed := "GET / HTTP/1.1\r\nHost: a\r\nX: "
   fixed ++ big (maxHeadBytes - fixed.length) ++ "\r\n\r\n"
 
+/-- A GET of `target`. -/
+def getOf (target : String) : String := s!"GET {target} HTTP/1.1\r\nHost: a\r\n\r\n"
+
+/-- `n` copies of `s` separated by `sep`. -/
+def sepBy (sep s : String) (n : Nat) : String := sep.intercalate (List.replicate n s)
+
 def maxRequest : String :=
   let fixed := "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 8192\r\nX: "
   fixed ++ big (maxHeadBytes - fixed.length) ++ "\r\n\r\n" ++ big maxBodyBytes
@@ -126,6 +132,20 @@ def cases : List Case := [
   { name := "asterisk-form for GET", request := "GET * HTTP/1.1\r\nHost: a\r\n\r\n", kind := 2, status := "HTTP/1.1 400 Bad Request",
     hand := some (1, "HTTP/1.1 404 Not Found") },
   { name := "target without a slash", request := "GET a HTTP/1.1\r\nHost: a\r\n\r\n", kind := 2, status := "HTTP/1.1 400 Bad Request",
+    hand := some (1, "HTTP/1.1 404 Not Found") },
+  -- Element counts of the request-target (`H1Adapter.maxPathSegments`,
+  -- `maxQueryParams`), empty elements counted: at the limit served, over it 414.
+  { name := "255 path segments", request := getOf ("/" ++ sepBy "/" "a" 255), kind := 1, status := "HTTP/1.1 404 Not Found" },
+  { name := "256 path segments", request := getOf ("/" ++ sepBy "/" "a" 256), kind := 2, status := "HTTP/1.1 414 URI Too Long",
+    hand := some (1, "HTTP/1.1 404 Not Found") },
+  { name := "255 empty path segments", request := getOf (sepBy "" "/" 255), kind := 1, status := "HTTP/1.1 404 Not Found" },
+  { name := "256 empty path segments", request := getOf (sepBy "" "/" 256), kind := 2, status := "HTTP/1.1 414 URI Too Long",
+    hand := some (1, "HTTP/1.1 404 Not Found") },
+  { name := "1,000 query parameters", request := getOf ("/?" ++ sepBy "&" "a=1" 1000), kind := 1, status := "HTTP/1.1 404 Not Found" },
+  { name := "1,001 query parameters", request := getOf ("/?" ++ sepBy "&" "a=1" 1001), kind := 2, status := "HTTP/1.1 414 URI Too Long",
+    hand := some (1, "HTTP/1.1 404 Not Found") },
+  { name := "1,000 empty query parameters", request := getOf ("/?" ++ sepBy "&" "" 1000), kind := 1, status := "HTTP/1.1 404 Not Found" },
+  { name := "1,001 empty query parameters", request := getOf ("/?" ++ sepBy "&" "" 1001), kind := 2, status := "HTTP/1.1 414 URI Too Long",
     hand := some (1, "HTTP/1.1 404 Not Found") },
   -- What the application answers is checked before it is written (Server.Response.check).
   { name := "response over maxResponseBytes", request := "GET /too-big HTTP/1.1\r\nHost: a\r\n\r\n", kind := 2,
@@ -700,7 +720,7 @@ example : Response.ownFieldsValid #[("Content-Type", "text/html")] = false := by
 
 The bound docs/memory.md derives for what `H1Adapter.Parser` holds while a
 request is incomplete, by part, in bytes of allocator blocks (toolchain
-nightly-2026-11-17, mimalloc 3.4.5 `mi_good_size`), and the check that the
+nightly-2026-11-19, mimalloc 3.4.5 `mi_good_size`), and the check that the
 blocks the state actually holds stay within each part on requests that drive
 each part to its largest. -/
 
@@ -714,14 +734,28 @@ and the iterator's 24-byte constructor. -/
 def inputBound : Nat := 40960 + 24
 /-- The body pulled so far: under `maxBodyBytes`, capacity at most twice. -/
 def bodyBound : Nat := 20480
-/-- The parsed request-target: every element (a path segment, a query
-parameter, a part of an absolute-form target) takes at least one byte of the
-target and at most 48 bytes of blocks per byte it takes (an empty query
-parameter `&`: a 24-byte pair and a 24-byte empty `ByteArray`); the arrays of
-segments and parameters, at most `maxUriLength` elements together with
-capacity at most twice their size, take at most 163,880 bytes; 128 for the
-target's own constructors. -/
-def targetBound : Nat := 48 * H1Adapter.config.maxUriLength + 163880 + 128
+/-- A block holding an object of `x` bytes: at most `x + x/4 + 7`. -/
+def block (x : Nat) : Nat := x + x / 4 + 7
+
+/-- The parsed request-target, whose element counts `H1Adapter.config` limits.
+A path segment is a `ByteArray` of its bytes (24-byte header, capacity its
+size), so a block of at most 37 bytes plus 5/4 of its bytes; a query parameter
+is a 24-byte pair of its key and, if it has `=`, a 16-byte `some` of its value,
+each such a `ByteArray`: at most 114 plus 5/4 of its bytes, since the pair and
+the `some` take blocks of exactly their size (`mi_good_size` of 16 and 24 is
+16 and 24, as of every multiple of 8 up to 64, measured against the
+toolchain's `libleanshared`). The other parts of
+an absolute-form target (scheme, user name, password, host, fragment) are at
+most five strings (32-byte header, its bytes and NUL): at most 49 each plus
+5/4 of their bytes. The bytes of all of them together are at most
+`maxUriLength`. The arrays of segments and parameters have capacity at most
+twice their size, 8 bytes per slot after a 24-byte header; 512 for the
+target's own constructors (target, URI, path, authority, user info, port,
+host and the `some`s around them). -/
+def targetBound : Nat :=
+  37 * H1Adapter.maxPathSegments + 114 * H1Adapter.maxQueryParams + 5 * 49
+    + (5 * H1Adapter.config.maxUriLength) / 4
+    + block (24 + 16 * H1Adapter.maxPathSegments) + block (24 + 16 * H1Adapter.maxQueryParams) + 512
 /-- The header fields: at most `maxHeaders` pairs (24 bytes each) in an array
 of capacity 126 (1,280 bytes), a 16-byte wrapper, and a name and a value
 string each, whose bytes total at most `maxHeadBytes`; a string is a 32-byte
@@ -740,17 +774,23 @@ def rep (s : String) (n : Nat) : String := String.join (List.replicate n s)
 
 /-- Requests whose incomplete states drive a part of the adapter's state to
 its largest; each ends incomplete. A target is kept from the end of its
-request line, so the longest the line allows (8,192 bytes with CRLF) is
-followed by nothing; fields and a body follow a short line. -/
+request line, so the longest the line allows (8,192 bytes with CRLF), with
+the most elements the limits allow, is followed by nothing; fields and a body
+follow a short line. -/
 def retainedRequests : List (String × String) :=
   let line (target : String) := s!"GET {target} HTTP/1.1\r\n"
   let longValue := rep "v" 64
   let longFields := String.join ((List.range 96).map fun i => s!"x{i}: {longValue}\r\n")
-  [("8,176 empty query parameters", line s!"/?{rep "&" 8175}"),
-   ("8,177 empty path segments", line s!"/{rep "/" 8176}"),
-   ("4,088 parameters with empty values", line s!"/?{rep "=&" 4087}="),
-   ("segments and parameters", line s!"{rep "/" 4088}?{rep "&" 4087}"),
-   ("an absolute-form target", line s!"http://a/?{rep "&" 8167}"),
+  -- Each target is 8,177 bytes, the rest of the line after "GET ", SP,
+  -- "HTTP/1.1" and CRLF; what the counts leave goes to one element.
+  [("255 empty segments and 1,000 parameters, 999 with empty values, the rest in the last value",
+     line s!"{rep "/" 255}?{rep "=&" 999}={rep "v" 5922}"),
+   ("1,000 query parameters, 999 empty, the rest in the last key", line s!"/?{rep "&" 999}{rep "k" 7176}"),
+   ("255 path segments, 254 empty, the rest in the last", line s!"{rep "/" 255}{rep "s" 7922}"),
+   ("an absolute-form target with 255 segments and 1,000 parameters",
+     line s!"http://a{rep "/" 255}?{rep "=&" 999}={rep "v" 5914}"),
+   ("an absolute-form target with user info, a port, 255 segments and 1,000 parameters",
+     line s!"http://u:p@a:80{rep "/" 255}?{rep "=&" 999}={rep "v" 5907}"),
    ("100 fields", s!"POST / HTTP/1.1\r\nHost: a\r\nExpect: 100-continue\r\nContent-Length: 10\r\n{String.join ((List.range 97).map fun i => s!"x{i}:\r\n")}\r\n"),
    ("all but one byte of a maximum body after 96 long fields",
      s!"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 8192\r\n{longFields}\r\n{rep "b" 8191}")]

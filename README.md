@@ -29,8 +29,9 @@ qualification ([Running](docs/running.md)).
   (no host name lookup). libpq's memory for a result is bounded only in
   part.
 - **Memory:** while a request is incomplete, a connection holds at most
-  about 698.5 KiB of live blocks besides its small Lean objects, most of
-  it H1's parsed request-target; one waiting for a query holds instead
+  about 310.2 KiB of live blocks besides its small Lean objects, half of
+  it H1's parsed request-target (at most 255 path segments and 1,000 query
+  parameters; more get 414); one waiting for a query holds instead
   its buffer, what the handler built and a result of at most 1 MiB, and
   libpq's buffers are the pool's. Derived, not a cap to size a deployment by.
 

@@ -13,10 +13,10 @@ The machine lives on the connection while a request is incomplete
 (`Parser`, the adapter's state in `Server.Adapter`): each call `feed`s only the
 bytes received since the last one, then runs `processRead` (start line and
 header block) and `pullBody` until the body is complete (a server-side machine
-leaves the body to the caller, H1.lean:1928). So a request arriving in many
+leaves the body to the caller, H1.lean:2027). So a request arriving in many
 receives is parsed once, not again from its start on every receive; what H1
 itself parses again is the line it is in the middle of (`parseWith` leaves
-its input where it was on a line that has not ended, H1.lean:653), so the
+its input where it was on a line that has not ended, H1.lean:670), so the
 cost of a request in 1-byte receives still grows with the square of its
 longest line. Each request starts from a fresh machine (`Parser.init`). The
 machine's own writer is not used: `Server.Response` writes the bytes.
@@ -40,24 +40,42 @@ namespace Server.H1Adapter
 
 open Std.Http Std.Http.Protocol
 
+/-- Most path segments in a request-target, empty ones counted (`/a/` has 2,
+`/` none): the default of Windows http.sys, `UrlSegmentMaxCount` = 255
+("Http.sys registry settings for Windows", Microsoft Learn). A target with
+more gets 414. -/
+def maxPathSegments : Nat := 255
+
+/-- Most query parameters in a request-target, empty ones counted (`?&` has 2,
+`?` none): the common default of Node's `querystring.parse` (`maxKeys`), the
+`qs` package (`parameterLimit`), Tomcat 11 (`maxParameterCount`) and PHP
+(`max_input_vars`), all 1,000. Go's `net/url` allows 10,000
+(`urlmaxqueryparams`), more than a `maxUriLength` target holds. A target with
+more gets 414. -/
+def maxQueryParams : Nat := 1000
+
 /-- The limits of `Server.Wire` mapped onto H1's. H1 bounds the start line and
 the header block separately (Config.lean), where the connection bounds the
 whole buffer by `inCap`; `maxHeaderValueLength` is the whole buffer, so that a
 complete head over the limit is bounded by the aggregate `maxHeaderBytes`
-check alone (H1.lean:1852, 431).
-H1 maps the request-target's count limits (path segments, query parameters) to
-`maxUriLength` as well (`requestTargetConfig`), so a target may parse into an
-element per byte, which the adapter keeps until the request completes. -/
+check alone (H1.lean:1951, 431).
+The request-target's element counts are limited too: the adapter keeps the
+parsed target until the request completes, and with no count limit a
+`maxUriLength` target may parse into an element per byte (docs/memory.md,
+"The adapter's state"). H1 answers a target over either count with 414, as
+one over `maxUriLength` (`exceedsElementLimits`, H1/Parser.lean:282). -/
 def config : H1.Config :=
   { maxHeaders := maxHeaders
     maxHeaderBytes := maxHeadBytes
     maxStartLineLength := maxHeadBytes
     maxUriLength := maxHeadBytes
+    maxPathSegments := some maxPathSegments
+    maxQueryParams := some maxQueryParams
     maxHeaderValueLength := inCap
     maxBodySize := maxBodyBytes }
 
 /-- The status H1's own server answers each error with: a copy of the private
-`errorResponseStatus` (H1.lean:1512). -/
+`errorResponseStatus` (H1.lean:1572). -/
 def errorStatus : H1.Error → Nat
   | .unsupportedVersion => 505
   | .unsupportedTransferCoding => 501
