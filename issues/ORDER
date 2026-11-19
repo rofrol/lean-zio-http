@@ -14,7 +14,6 @@ fbqrqb Run bench/arena/build.sh and local.sh end to end on the run-scoped image 
 fzddri Rerun ./linux-check.sh for the tests and pool changes added since its last recorded run
 4fued7 Stop discarding bpftrace's and perf's exit statuses in bench/arena/local-inner.sh, and end the go entries' readiness loop when the server exits
 yg56hu Stop a passing serve_test run from printing "failed command:" in every check run
-alblg3 Decide what to do with the dependency assumptions that rest on upstream code only (Rule 6)
 g62mok Decide whether to measure the pool's readiness probe (peek against NetPoll) on Linux
 hyztfj Trace why `zig build test` prints "failed command:" for the passing serve_test step
 
@@ -24,3 +23,4 @@ yvladm Decide whether per-loop PostgreSQL pools should share connections across 
 2ltibq Run a clean D2 acceptance of the Lean HTTP server with the load generator on cores of its own
 b3lisr Retire or record the local workarounds in the HttpArena build: the Rosetta zig wrapper and the gcannon patch
 dhosug Decide whether bench/mdlinks keeps its own CommonMark subset parser or uses a CommonMark library
+alblg3 Decide what to do with the dependency assumptions that rest on upstream code only (Rule 6)
