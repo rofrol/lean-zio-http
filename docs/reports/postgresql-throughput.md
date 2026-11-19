@@ -168,3 +168,39 @@ requests at 1000 rows and c=1 (not traced, since they were not chosen) and
 raised the peak memory with large rows, as their larger residual predicts.
 At 1000-byte rows the cost is in the data, not the per-row results, so no
 mode differs within noise.
+
+## 2026-11-19: the peeking receive against NetPoll (item jexowc)
+
+A rerun of the first paragraph's comparison of readiness through a one-byte
+peeking receive and through zio's `NetPoll`, which it does not replace: that
+one was single runs; this one is interleaved rounds. Commit bccf77f, zio
+f8ca47367765, Zig 0.17.1, PostgreSQL 18.6, on the shared M1 (macOS 27.2,
+one-minute load average 8 to 22 after the runs). `lsrv-db` built twice, once
+as it is ("peek") and once with `Slot.rpoll` as
+`ev.NetPoll.init(self.fd, .recv)` ("NetPoll"; nothing else changed). Both
+processes ran for the whole session against one private cluster (Unix
+socket), 8 loops with 4 connections each; only one of them received load at
+a time. `GET /db?id=42`, 10 s per server and concurrency; in each round c=1
+ran before c=64, and the server named first ran first. Requests per second
+and server CPU time per request (µs, from `ps` before and after the run):
+
+| round, first | c=1 peek | c=1 NetPoll | c=64 peek | c=64 NetPoll |
+|---|---|---|---|---|
+| 1, peek | 11,966; 35.8 | 10,519; 36.5 | 78,901; 40.8 | 65,000; 50.2 |
+| 2, NetPoll | 13,625; 33.9 | 10,122; 38.2 | 33,865; 39.5 | 54,994; 52.6 |
+| 3, peek | 12,196; 36.1 | 10,801; 37.2 | 77,599; 43.2 | 65,627; 51.0 |
+| 4, NetPoll | 11,816; 37.1 | 9,772; 40.1 | 62,442; 37.6 | 48,233; 41.3 |
+| 5, peek | 3,185; 67.8 | 5,161; 54.5 | 48,077; 35.8 | 39,034; 49.8 |
+| 6, NetPoll | 12,527; 37.4 | 10,285; 41.0 | 73,508; 41.2 | 46,250; 46.8 |
+| 7, peek | 12,220; 35.3 | 10,256; 36.5 | 80,552; 40.5 | 65,759; 53.4 |
+| 8, NetPoll | 12,362; 35.3 | 10,593; 36.4 | 79,001; 41.9 | 65,517; 50.5 |
+
+Within each round the peek cost less CPU per request in 8 of 8 rounds at
+c=64 and 7 of 8 at c=1 (not in round 5, where both servers lost most of
+their c=1 throughput at a load average of 19), and served more requests per
+second in 7 of 8 at each concurrency. Medians of the unrounded values: at
+c=64 40.6 against 50.3 µs and 75,554 against 59,997 requests per second; at
+c=1 35.9 against 37.7 µs and 12,208 against 10,270. One shared, loaded
+machine and one query; the syscall measurements and the limits of this
+result are in
+[What the dependency assumptions rest on](dependency-assumptions.md), point 4.

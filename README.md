@@ -113,6 +113,7 @@ naming its date and what it measured):
 - [HttpArena on the VPS](docs/reports/httparena-vps.md)
 - [The over-5 s tail: connections accepted late](docs/reports/over-5s-tail.md)
 - [PostgreSQL measurements: lean-db against Go](docs/reports/postgresql-throughput.md)
+- [What the dependency assumptions rest on](docs/reports/dependency-assumptions.md)
 - [`Std.Http.Protocol.H1` compared with the hand-written parser](docs/reports/h1-vs-hand-parser.md)
 - [The dusty failure at 256 connections](docs/reports/dusty-256-connections.md)
 - [dusty on the real zio](docs/reports/dusty-real-zio.md)

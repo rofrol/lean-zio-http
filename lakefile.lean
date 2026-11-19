@@ -59,7 +59,10 @@ cannot resolve; with the host's newer glibc it references `copy_file_range`,
 nightly-2026-11-17) lacks (issue 4n7czb). Lean's toolchain copies glibc's
 `libc-<version>.so` to `lib/glibc/libc.so`, dropping the version from the name
 (`script/prepare-llvm-linux.sh` in leanprover/lean4), so the version is read
-from the version names the library defines. -/
+from the version names the library defines. That layout rests on that script,
+not on documentation; the Reference Manual documents only the supported floor
+(glibc 2.26+ on x86-64, 2.27+ on aarch64): `docs/reports/dependency-assumptions.md`,
+point 6. -/
 def zsrvTarget (sysroot : FilePath) : IO (Option String) := do
   let libc := sysroot / "lib" / "glibc" / "libc.so"
   unless ← libc.pathExists do return none

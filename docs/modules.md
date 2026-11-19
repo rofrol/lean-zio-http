@@ -50,8 +50,10 @@ only `Server.Query` values.
   protocol or buffering state: each connection holds a Lean `Conn.State`,
   reports the outcome of every operation to it through `src/glue.c`, and
   performs the action it answers. Worker threads call
-  `lean_initialize_thread`, which libleanrt exports but `lean.h` does not
-  declare. It keeps at most one operation in flight per connection and ends
+  `lean_initialize_thread`, which libleanrt exports and the Lean Reference
+  Manual documents for threads the Lean runtime did not start, but `lean.h`
+  does not declare
+  ([what it rests on](reports/dependency-assumptions.md)). It keeps at most one operation in flight per connection and ends
   the process when a completion finds none outstanding; beside a send it may
   also keep a readiness poll while the send waits on the kernel, which
   carries no data ([Production contract](production-contract.md), "Deadlines"),

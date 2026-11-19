@@ -64,6 +64,11 @@
 //   and removes it with `NetClose` once no poll on it is outstanding; during
 //   the connect a fresh duplicate is taken for the wait before each
 //   PQconnectPoll step, the first one's included (a wait to write).
+//   This rests on zio's code, not its documentation (pinned f8ca47367765:
+//   src/ev/sockreg.zig:20-22, `unregister` at 357-375 asserting no parked
+//   op, called by `NetClose` in src/ev/backends/kqueue.zig:634-641 and
+//   src/ev/backends/linux/epoll.zig:609-616); recheck at each update of zio
+//   (docs/reports/dependency-assumptions.md, point 3).
 const std = @import("std");
 const zio = @import("zio");
 const ev = zio.ev;
@@ -187,7 +192,13 @@ pub const Slot = struct {
     /// Readability: a receive of one byte with MSG_PEEK, which leaves the
     /// bytes to libpq. zio tries a receive first and parks on its kqueue or
     /// epoll registration only when nothing is there; NetPoll would probe
-    /// with poll(2) instead, which costs more than the receive.
+    /// with poll(2) instead (pinned zio src/ev/sockreg.zig:431-450). The
+    /// server comparison was run on the shared M1 only (GET /db?id=42): there
+    /// NetPoll cost lsrv-db about a quarter more CPU per request at 64
+    /// connections, and poll(2) on an empty AF_UNIX socket about 7 µs against
+    /// a quarter of one for the receive; in the Linux container the two
+    /// syscalls cost about the same and no server comparison was run
+    /// (docs/reports/dependency-assumptions.md, point 4).
     rpoll: ev.NetRecv = undefined,
     peek: [1]u8 = undefined,
     peek_iov: [1]os.iovec = undefined,

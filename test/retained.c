@@ -10,8 +10,15 @@
 // and not entered. An external object counts its block only.
 #include <lean/lean.h>
 
-// The Lean toolchain's C compiler has no libc headers; lean.h declares
-// malloc and free.
+// The Lean toolchain's include/ has no stdlib.h; lean.h declares
+// malloc and free. C11 7.1.4p2 permits declaring abort without its header;
+// calloc and realloc refer to size_t, which it does not cover, so they rest
+// on the toolchain's libc, as lean.h's own malloc and free do. lean.h also
+// declares mi_usable_size (through lean/mimalloc.h, as the toolchain's
+// lean/config.h defines LEAN_MIMALLOC); that the objects measured here are
+// the start of their mimalloc block rests on the runtime's code, not on
+// documentation
+// (docs/reports/dependency-assumptions.md, point 5).
 void *calloc(size_t, size_t);
 void *realloc(void *, size_t);
 _Noreturn void abort(void);

@@ -9,7 +9,12 @@
 #include <time.h>
 #include <unistd.h>
 
-/* Exported by libleanrt (C linkage) but not declared in lean.h of this toolchain. */
+/* Exported by libleanrt (C linkage) but not declared in lean.h of this
+   toolchain. The calls are documented: the Lean Reference Manual, FFI,
+   "Initialization" ("any other thread not spawned by the Lean runtime itself
+   must be initialized for Lean use by calling ... lean_initialize_thread");
+   this signature is checked against the pinned runtime only
+   (docs/reports/dependency-assumptions.md, point 1). */
 void lean_initialize_thread(void);
 void lean_finalize_thread(void);
 
