@@ -1,6 +1,5 @@
 ## Next, in order
 
-wsejd6 Correct batchOverOutCap's claim that one write under the loopback MTU arrives as one receive
 vhvejg Measure the step cost of a large pipelined batch and the quadratic copying of the receive buffer's suffix
 yg56hu Stop a passing serve_test run from printing "failed command:" in every check run
 
