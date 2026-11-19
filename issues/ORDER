@@ -1,5 +1,6 @@
 ## Next, in order
 
+gjbmli Make ./linux-check.sh run again: check.sh's mdlinks needs a git repository the container's tree lacks
 jexowc Settle the dependency assumptions that rest on upstream code rather than upstream documentation (Rule 6)
 4bngph Move the toolchain to the first nightly with lean4 PR 16562 and set maxPathSegments and maxQueryParams in the H1 adapter
 owgate Find where H1's parse spends 40 % of lsrv-arena's CPU (about 4-6 µs per request), or accept that cost
@@ -14,7 +15,6 @@ lmbozk Make the container scripts' working-tree snapshot skip tracked files dele
 fbqrqb Run bench/arena/build.sh and local.sh end to end on the run-scoped image tags, and record amjip6's accepted limits
 fzddri Rerun ./linux-check.sh for the tests and pool changes added since its last recorded run
 4fued7 Stop discarding bpftrace's and perf's exit statuses in bench/arena/local-inner.sh, and end the go entries' readiness loop when the server exits
-gjbmli Make ./linux-check.sh run again: check.sh's mdlinks needs a git repository the container's tree lacks
 
 ## Needs a decision
 
