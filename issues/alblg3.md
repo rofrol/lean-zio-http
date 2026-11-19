@@ -8,3 +8,6 @@ Needs a decision (meant for "Needs a decision"; rr2 files proposals under "Propo
 - Point 6, lakefile.lean:19-71 (`glibcVersion`, `zsrvTarget`): the toolchain ships glibc as `lib/glibc/libc.so` without its version (lean4 script/prepare-llvm-linux.sh:59-64), so the version is read from the library's version names. The Reference Manual documents only the supported floor ("x86-64 Linux with glibc 2.26+", "aarch64 Linux with glibc 2.27+", Manual/SupportedPlatforms.lean:28-29), which is not a statement of the glibc the toolchain links against.
 
 Documented (no decision needed): point 1 (lean_initialize_thread/lean_finalize_thread: Reference Manual, FFI, "Initialization"; the hand declaration's signature is checked against the pinned runtime only) and point 5's `abort` (C11 7.1.4p2). Point 4 was measured; see the separate proposal about Linux.
+
+Question: For points 2, 3, 5 and 6 (each may differ), approve a supported-subset contract, ask upstream, or stop relying on it?
+Options: approve supported-subset contracts for all four (recommended: guards exist, each is rechecked at updates) | ask zio upstream about points 2 and 3 (outward, your go) | stop relying where possible (point 5: use lean.h's declaration)
