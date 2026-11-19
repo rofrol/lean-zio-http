@@ -17,6 +17,7 @@ uo5qcn Bring the pool's libpq calls in line with libpq's documented call order, 
 5ffu5o Derive or mechanically check the values copied by hand between languages, files and upstream
 p7nicw Stop discarding statuses and errors that can hide a failure, and replace waits on our own processes with their events (Rule 10)
 b3lisr Retire or record the local workarounds in the HttpArena build: the Rosetta zig wrapper and the gcannon patch
+c6yngw Fix stale and contradictory comments found by the comment audit
 
 ## Needs a decision
 
