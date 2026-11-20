@@ -9,3 +9,5 @@ Open questions for the owner:
 - Does item jexowc (the mimalloc-dependent `retainedBytes` checks) decide the same question first? If so, this item waits for it.
 
 Decided 2026-11-19 by the coordinating session with sol and hydrogen (consult round 20261119-131820-9a89; calls 2457b2df, db84fdb7) under the user's delegation to decide the next items with the models: stays Proposed until alblg3 decides the allocator dependency.
+
+Approved by the models under the user's delegation of 2026-11-20 to decide the queue (consult round 20261120-155056-df17; sol call 421584d0, hydrogen call 69355b88), both agreeing, after alblg3: measure the real block sizes (mi_usable_size) across result shapes as the independent oracle; first check zig/src/pg.c's object_cost and its test for checks added since.
