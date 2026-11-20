@@ -20,5 +20,5 @@ VPS run"); item 4fued7 did only the go entries' readiness wait.
   for the child and records its status) is the pattern the go entries' wait
   now uses; whether bpftrace's wait takes it is part of this item.
 
-Question: Where should bpftrace's and perf's exit statuses be measured before local-inner.sh checks them?
-Options: in local.sh's privileged container on the M1 (needs an HttpArena checkout next to this repository; none is there, checked 2026-11-20) | on the VPS (your go for VPS load) | defer to the next arena run (2ltibq)
+
+Decided by the models under the user's delegation of 2026-11-20 to decide the queue (consult round 20261120-155056-df17; sol call 421584d0, hydrogen call 69355b88), both agreeing: measure the tracers' exit statuses in local.sh's privileged container on the M1, after fbqrqb provides the pinned HttpArena checkout (da3ded60952b); first check that perf and bpftrace run in OrbStack. No VPS run.
