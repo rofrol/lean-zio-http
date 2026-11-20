@@ -1,6 +1,5 @@
 ## Next, in order
 
-63cdgt Open the zio PR with the accept documentation wording asked for in issue 937
 umtm4l Decide whether to bound the work one Conn.step does for a connection's pipelined requests
 4fued7 Stop discarding bpftrace's and perf's exit statuses in bench/arena/local-inner.sh, and end the go entries' readiness loop when the server exits
 g62mok Decide whether to measure the pool's readiness probe (peek against NetPoll) on Linux
@@ -25,3 +24,4 @@ udpq6h Decide whether the head budget of a request left behind several responses
 ov7ele Decide how to report Zig's "failed command:" line printed for a passing test step (an upstream bug)
 5f54l4 Should H1Adapter decode chunked request bodies, so HttpArena's baseline and limited-conn run with their whole request mix?
 qipzi4 Confirm bench/fairness's probe maxima on an idle host or on Linux?
+63cdgt Open the zio PR with the accept documentation wording asked for in issue 937
