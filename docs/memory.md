@@ -217,9 +217,19 @@ own namespace, only the sockets among its descriptors, after a check
 against connections whose queues are known: `checkQueues`), show before
 each measurement that the server has read all 8,192 bytes and
 after it that it has not sent all the responses; from that, each connection
-was sending a whole response with at least 7,300 bytes buffered, unless its
+was sending a whole response with its 8,192 bytes buffered less the 27-byte
+GETs it had consumed, unless its
 bytes arrived in two receives and Lean had not yet been handed the second at
 the measurement, which the queues cannot exclude (the scenario's comment).
+That is at most 8,165 bytes (the GET being answered is consumed). The
+figure the scenario prints is a lower bound inferred from the queues, not a
+measurement of the buffer: 8,192 less one 27-byte GET for each whole
+response's worth of bytes in the queues and one for the response being
+sent, the least over the connections. It varies from run to run with how
+many bytes the queues held; the server's buffering did not change: every
+kept log of the M1's runs from 2026-11-16 to 2026-11-20 printed between
+6,626 and 8,057, and 7,301, the source of the figure this document stated
+before, was one run of 2026-11-17.
 Matched snapshots of the server's allocators at its two measurements
 (`bench/boundary -memsnap DIR`: `vmmap -summary` and `heap -s`; nine runs,
 five with H1 and four with the hand-written parser, 90.6 to 91.5 KiB per
@@ -233,10 +243,13 @@ connection by region category, within these ranges in every run:
   not show (0.1 KiB), and 1.0 KiB resident beyond the bytes allocated;
 - the region vmmap names IOAccelerator, VM tag 100, which is the tag the
   toolchain's mimalloc gives its mappings by default (`mi_option_os_tag`),
-  so most likely Lean's objects: 69.4 to 70.4 KiB, against 72 to 74 KiB of
-  blocks allocated for the buffer (7,300 to 8,191 bytes: an 8,192 or
-  10,240-byte block) and the response (a 65,536-byte block whose last 5.2
-  KiB are never written);
+  so most likely Lean's objects: 69.4 to 70.4 KiB, against 71 to 72 KiB of
+  blocks allocated, by estimate, for the buffer (with its 24-byte header a
+  7,168-byte block when it holds 6,121 to 7,144 bytes, an 8,192-byte one
+  from 7,145 to its 8,165: `mi_good_size` and `mi_usable_size`,
+  nightly-2026-11-19; the snapshot runs' printed figures were not kept, so
+  this assumes theirs, like every kept one, were above 6,120) and the response (a
+  65,536-byte block whose last 5.2 KiB are never written);
 - no other region category more than 0.8 KiB.
 
 So the growth is consistent with the blocks allocated; it does not attribute
