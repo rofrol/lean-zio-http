@@ -8,8 +8,11 @@ the documents [README.md](../../README.md#documentation) lists. Item ids
 name queue items; `git log --grep ID` finds their commits.
 
 A diagnostic, reproduced locally before any use of the VPS:
-`bench/arena/local.sh OUT ARENA [ROUNDS]` runs HttpArena's baseline and
-pipelined profiles (gcannon, 4,096 connections, 5 s, at the commits
+`bench/arena/local.sh OUT ARENA [ROUNDS]` runs HttpArena's baseline
+(adapted: its GET and Content-Length POST templates for every server, without
+the chunked POST, which lsrv-arena answers 501; label added 2026-11-20, item
+5f54l4) and pipelined
+profiles (gcannon, 4,096 connections, 5 s, at the commits
 `build.sh` pins) against lsrv-arena on epoll, go-stdlib and go-fasthttp in
 OrbStack's arm64 Linux VM on the M1 (kernel 7.2.12), each server and the
 generator pinned to the same two CPUs, with `bench/arena/trace.bt`

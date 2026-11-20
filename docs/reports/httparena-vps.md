@@ -55,7 +55,9 @@ Deviations from HttpArena's own run, all applied to every contender alike:
   bodies 501 ([Production contract](../production-contract.md), "Not yet"), so HttpArena's validation check "POST
   /baseline11 chunked" fails for lsrv-arena. Every other check passes for
   every contender: the sums, a random sum, Content-Type, `/pipeline`, and
-  16 requests pipelined on one connection.
+  16 requests pipelined on one connection. The baseline and limited-conn
+  results below are therefore adapted HttpArena results, not full-profile
+  ones (label added 2026-11-20, item 5f54l4).
 - gcannon carries `gcannon-served.patch`, which only counts: its report
   gains "Connections served", the connection slots answered at least once
   in the measured window (after the warm-up). It is how this run counts the
@@ -86,6 +88,7 @@ in the window, of 4,096 (in limited-conn, connection slots, each reopened
 after 10 requests, `-r 10`).
 
 baseline (gcannon, 4096 connections, 5 s, GET and POST alternating):
+[Label added 2026-11-20, item 5f54l4: adapted HttpArena, no chunked POST.]
 
 | server | runs | req/s | p99 ms | p99.9 ms | CPU µs/resp | peak MB | non-2xx | over 5 s | served |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
@@ -104,6 +107,7 @@ pipelined (gcannon, 4096 connections, 16 requests in flight on each, 5 s):
 | go-fasthttp | 5 | 421,898 (306,909-441,098) | 601.5 (373.6-911.2) | 976 (669-1490) | 3 (3-4) | 80 (79-83) | 0 | 0 | 4,096 in each |
 
 limited-conn (baseline with a new connection after every 10 requests):
+[Label added 2026-11-20, item 5f54l4: adapted HttpArena, no chunked POST.]
 
 | server | runs | req/s | p99 ms | p99.9 ms | CPU µs/resp | peak MB | non-2xx | over 5 s | served |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|

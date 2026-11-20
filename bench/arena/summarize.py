@@ -29,6 +29,8 @@ from pathlib import Path
 
 ORDER = ["lsrv-epoll", "lsrv-io_uring", "go-stdlib", "go-fasthttp"]
 TICK_S = 0.01  # CLK_TCK on the VPS (getconf CLK_TCK: 100)
+# baseline and limited-conn are adapted profiles: inner.sh's generate() says why.
+ADAPTED = " (adapted HttpArena: GET and Content-Length POST templates only, no chunked POST)"
 
 
 def gcannon(text):
@@ -95,7 +97,7 @@ def main():
         r["hwm_mb"] = int(hwm) / 1024
         rows.setdefault(prof, {}).setdefault(srv, []).append(r)
     for prof, servers in rows.items():
-        print(f"\n{prof}\n")
+        print(f"\n{prof}{ADAPTED if prof in ('baseline', 'limited-conn') else ''}\n")
         print("| server | runs | req/s | p99 ms | p99.9 ms | CPU µs/resp | peak MB | non-2xx | over 5 s | zrk errors | served |")
         print("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
         for srv, rs in sorted(servers.items(), key=lambda kv: ORDER.index(kv[0])):

@@ -162,6 +162,11 @@ if grep FAIL "$out/validate.log" | grep -v '^FAIL lsrv-[a-z_]* POST /baseline11?
 fi
 
 generate() { # PROFILE FILE
+  # baseline and limited-conn are adapted HttpArena profiles: they leave out
+  # HttpArena's third template, post_chunked.raw, for every contender alike,
+  # because lsrv-arena answers chunked request bodies 501 by contract
+  # (docs/production-contract.md, "Not yet"); their results are not
+  # full-profile results (summarize.py labels them).
   case $1 in
     baseline) "$d/gcannon" "$url" --raw "$req/get.raw,$req/post_cl.raw" -c 4096 -t 2 -d 5s -p 1 ;;
     pipelined) "$d/gcannon" "$url/pipeline" -c 4096 -t 2 -d 5s -p 16 ;;

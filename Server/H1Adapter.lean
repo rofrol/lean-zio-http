@@ -26,8 +26,13 @@ What H1 checks and this adapter relies on: request-line syntax, a registered
 method (else 501), HTTP/1.0 or 1.1 (1.x above 1 read as 1.1, else 505), the
 request-target's form and URI syntax, exactly one valid Host in HTTP/1.1
 (RFC 9112 3.2), Content-Length and Transfer-Encoding framing, and the limits
-of `config`. A chunked request body is refused with 501 once its head is read
-(no chunked bodies yet), although H1 could decode it.
+of `config`.
+
+Chunked request bodies are not accepted: once a valid head that frames its
+body as chunked is read (`chunkedBody`), the request is answered 501 without
+decoding or draining any of its body, although H1 could decode it. This is
+the contract, not a gap to fill silently; the decision and what accepting
+chunked bodies would need are in docs/production-contract.md, "Not yet".
 
 `Expect: 100-continue` (RFC 9110 10.1.1): H1 pauses its reader after such a
 head in HTTP/1.1 (never for HTTP/1.0, to which no 1xx may be sent). The

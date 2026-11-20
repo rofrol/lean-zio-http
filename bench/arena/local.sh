@@ -1,6 +1,6 @@
 #!/bin/sh
-# bench/arena/local.sh OUT ARENA [ROUNDS]: HttpArena's baseline and pipelined
-# profiles on this machine's container runtime (on the M1, OrbStack's arm64
+# bench/arena/local.sh OUT ARENA [ROUNDS]: HttpArena's baseline (adapted: no
+# chunked POST template, as in inner.sh) and pipelined profiles on this machine's container runtime (on the M1, OrbStack's arm64
 # Linux VM), with the accept delay of every connection and the servers'
 # system calls traced (item 6p6tu6; docs/reports/over-5s-tail.md). A labelled stress diagnostic, not a test and not a
 # measurement of the VPS: OUT (a new, empty directory) gets the generator's

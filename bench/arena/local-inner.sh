@@ -1,7 +1,8 @@
 #!/bin/sh
 # local-inner.sh OUT ROUNDS PERF SERVER...: bench/arena/local.sh runs this in
 # its privileged container (item 6p6tu6; docs/reports/over-5s-tail.md). A labelled stress diagnostic, not a test:
-# HttpArena's baseline and pipelined profiles (gcannon, 4096 connections, 5 s)
+# HttpArena's baseline (adapted: GET and Content-Length POST templates, no
+# chunked POST, as in inner.sh) and pipelined profiles (gcannon, 4096 connections, 5 s)
 # against each SERVER (a binary in /b), with the server and the generator
 # pinned to the same two CPUs (0 and 1), as on the VPS (inner.sh), and
 # trace.bt beside each sample. PERF=1 adds a CPU profile of each lsrv sample

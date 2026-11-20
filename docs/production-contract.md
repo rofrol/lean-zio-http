@@ -249,3 +249,12 @@
   turn. They do not assert which order a backend takes.
 - **Not yet:** chunked
   request bodies, percent-decoding and query parsing, Go's larger limits.
+  Chunked request bodies stay refused with 501 (`Server.H1Adapter`), decided
+  2026-11-20 by the models under the owner's delegation of that day (item
+  5f54l4): HttpArena's baseline and limited-conn therefore run without their
+  chunked POST template and are reported as adapted HttpArena results, not
+  full-profile ones. Revisit when a real client needs chunked bodies or the
+  owner makes full HttpArena compatibility a requirement; accepting them then
+  needs the owner's approval (a contract and untrusted-input change), with
+  bounded decoding, limits on chunks and trailers, tests for fragmented and
+  malformed input, and the parsing cost measured.
