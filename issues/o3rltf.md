@@ -5,3 +5,5 @@ After item udpq6h (commit 407ae1a) a pipelined request's head budget runs from t
 Options: (a) keep it and state it in docs/production-contract.md "Deadlines"; (b) run the head budget beside the interim response and the body as well, which adds a third phase that carries `Phase.ahead` and its tests.
 
 Also seen during udpq6h: `headsDone` (the complete-head exemption's walk) passes a response that closes the connection, so bytes behind such a request still count as buffered heads. This only matters for an expiry before the close response is sent, and it can only close a connection that is about to close.
+
+Consult round 20261120-183340-59f4 (sol 07e46b10, hydrogen a8d8e1d1): split, so it stays Proposed. hydrogen approves (a), documenting the bounded delay; sol keeps it, the third phase not being justified and the contract to stay as it is.
