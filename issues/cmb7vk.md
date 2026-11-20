@@ -22,3 +22,5 @@ VPS run"); item 4fued7 did only the go entries' readiness wait.
 
 
 Decided by the models under the user's delegation of 2026-11-20 to decide the queue (consult round 20261120-155056-df17; sol call 421584d0, hydrogen call 69355b88), both agreeing: measure the tracers' exit statuses in local.sh's privileged container on the M1, after fbqrqb provides the pinned HttpArena checkout (da3ded60952b); first check that perf and bpftrace run in OrbStack. No VPS run.
+
+fbqrqb (89d5d9c, 2026-11-20) left a HttpArena checkout at da3ded60952b in ~/.cache/lean-zio-http/httparena, with which build.sh and local.sh ran end to end in OrbStack; use it.
