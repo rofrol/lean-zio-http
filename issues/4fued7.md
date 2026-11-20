@@ -10,3 +10,5 @@ Found by the review round 20261119-090027-380f (hydrogen, call 951383b4) and in 
 Decided 2026-11-19 by the coordinating session with sol and hydrogen (consult round 20261119-131820-9a89; calls 2457b2df, db84fdb7) under the user's delegation to decide the next items with the models: needs the owner (VPS load to learn bpftrace's and perf's statuses after SIGINT).
 Question: Measure bpftrace's and perf's exit statuses on the VPS and fix local-inner.sh, or only fix the go entries' readiness loop locally?
 Options: fix the go entries' loop locally now, the tracer statuses at the next VPS run | measure on the VPS now and fix both (your go for VPS load) | defer both
+
+Decided 2026-11-20 by the coordinating session with sol and hydrogen (consult round 20261120-024100-ec06; calls 722834f8, e97c0537) at the user's request to set the queue with the models: approved into Next, second, limited to the local half (both models): end the go entries' readiness loop when the server exits (its supervisor records the exit; test an early exit and a successful readiness). The tracer exit statuses wait for an authorized VPS run.
