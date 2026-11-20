@@ -1364,7 +1364,9 @@ export fn ekk_serve(port: u16, threads: u32, maxc: u32, conninfo: *anyopaque, co
     // thread against this loop's state. zio's `Completion.callback`
     // documentation (src/ev/completion.zig:294) says only "Called on the
     // loop's thread", not which loop's when loops are grouped, so this rests
-    // on the code cited above. Checks keep this: serve_test.zig
+    // on the code cited above: a supported-subset contract, not an upstream
+    // guarantee (approved 2026-11-20, item alblg3; AGENTS.project.md,
+    // "Supported-subset contracts"). Checks keep this: serve_test.zig
     // checks that `startLoop` leaves its loop in the loop's own internal
     // group and that no identifier or string literal in the transport's Zig
     // sources is `loop_group` or `LoopGroup`; and every callback panics when

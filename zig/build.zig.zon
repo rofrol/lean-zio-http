@@ -5,6 +5,9 @@
     .fingerprint = 0xd71e869024ae1e78,
     .paths = .{ "build.zig", "build.zig.zon", "src" },
     .dependencies = .{
+        // At each update of zio, recheck the zio contracts in
+        // AGENTS.project.md, "Supported-subset contracts", and run
+        // ./linux-check.sh (docs/running.md).
         .zio = .{
             .url = "git+https://github.com/lalinsky/zio#f8ca47367765b46a0636e3836bc059dcd10630a7",
             .hash = "zio-0.20.1-xHbVVHJ5LwDFkA-H60i6talbpUANhbMq2ZrtL_FU8ygK",

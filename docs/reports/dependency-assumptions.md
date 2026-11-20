@@ -180,3 +180,8 @@ comparison on Linux). Code only: 2, 3, 5's `calloc` and `realloc` and the Lean o
 the start of their mimalloc blocks, 6. The code-only points go to the owner
 for a decision (approve a supported-subset contract, ask upstream, or stop
 relying on it); no behaviour was changed.
+
+2026-11-20 (item alblg3): the code-only points 2, 3, 5 (`calloc`,
+`realloc`, the objects' layout) and 6 were approved as supported-subset
+contracts, recorded in `AGENTS.project.md`, "Supported-subset contracts";
+`test/retained.c` now takes `mi_usable_size` from `lean.h`.

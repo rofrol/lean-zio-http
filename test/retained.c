@@ -13,16 +13,22 @@
 // The Lean toolchain's include/ has no stdlib.h; lean.h declares
 // malloc and free. C11 7.1.4p2 permits declaring abort without its header;
 // calloc and realloc refer to size_t, which it does not cover, so they rest
-// on the toolchain's libc, as lean.h's own malloc and free do. lean.h also
-// declares mi_usable_size (through lean/mimalloc.h, as the toolchain's
-// lean/config.h defines LEAN_MIMALLOC); that the objects measured here are
+// on the toolchain's libc, as lean.h's own malloc and free do. lean.h
+// declares mi_usable_size (through lean/mimalloc.h) when the toolchain's
+// lean/config.h defines LEAN_MIMALLOC. That the objects measured here are
 // the start of their mimalloc block rests on the runtime's code, not on
-// documentation
-// (docs/reports/dependency-assumptions.md, point 5).
+// documentation (lean.h's lean_alloc_small_object; lean4 55069db87ef1
+// src/runtime/mimalloc.cpp:39-52, src/runtime/object.cpp:365-378).
+// calloc, realloc and that layout are supported-subset contracts, not
+// upstream guarantees (approved 2026-11-20, item alblg3; AGENTS.project.md,
+// "Supported-subset contracts"; docs/reports/dependency-assumptions.md,
+// point 5); recheck at each update of the Lean toolchain.
+#ifndef LEAN_MIMALLOC
+#error "lean.h does not declare mi_usable_size: this toolchain is not built with mimalloc"
+#endif
 void *calloc(size_t, size_t);
 void *realloc(void *, size_t);
 _Noreturn void abort(void);
-size_t mi_usable_size(const void *p);
 
 typedef struct {
   lean_object **slots;

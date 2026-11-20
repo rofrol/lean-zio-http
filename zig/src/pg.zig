@@ -67,8 +67,10 @@
 //   This rests on zio's code, not its documentation (pinned f8ca47367765:
 //   src/ev/sockreg.zig:20-22, `unregister` at 357-375 asserting no parked
 //   op, called by `NetClose` in src/ev/backends/kqueue.zig:634-641 and
-//   src/ev/backends/linux/epoll.zig:609-616); recheck at each update of zio
-//   (docs/reports/dependency-assumptions.md, point 3).
+//   src/ev/backends/linux/epoll.zig:609-616): a supported-subset contract,
+//   not an upstream guarantee (approved 2026-11-20, item alblg3;
+//   AGENTS.project.md, "Supported-subset contracts"); recheck at each update
+//   of zio (docs/reports/dependency-assumptions.md, point 3).
 const std = @import("std");
 const zio = @import("zio");
 const ev = zio.ev;
@@ -160,8 +162,9 @@ fn due(t: zio.Timestamp, at: zio.Timestamp) bool {
 /// completing loop's thread, and zio passes that completing loop to the
 /// callback. It relies on zio's callback dispatch at the pin (f8ca47367765):
 /// `Completion.call(loop)` calls the callback with the loop whose state
-/// completes it (src/ev/completion.zig:491-495, src/ev/loop.zig:310-362);
-/// recheck at each update of zio. An explicit `@panic`, not
+/// completes it (src/ev/completion.zig:491-495, src/ev/loop.zig:310-362),
+/// part of the supported-subset contract of serve.zig's comment, not an
+/// upstream guarantee; recheck at each update of zio. An explicit `@panic`, not
 /// `std.debug.assert`, which ReleaseFast compiles out.
 pub fn ownLoop(got: *const ev.Loop, own: *const ev.Loop) void {
     if (got != own) @panic("a callback ran on a loop other than the one that owns its state");

@@ -117,3 +117,42 @@ ogcdwm). It is development evidence, not production qualification.
 the transport tests' cleanup (`Single.deinit`, `zig/src/serve_test.zig`).
 Run it at each update of Zig and for every change to `Single.deinit`; it is
 not part of `./check.sh` (decided 2026-11-17, item znorfg).
+
+## Supported-subset contracts
+
+Decided 2026-11-20 (item alblg3), by the models under the owner's
+delegation of that day to decide the queue: the assumptions below rest on
+the pinned dependency's code, not on its documentation or a maintainer's
+statement (`AGENTS.md`, Rule 6), and are approved as supported-subset
+contracts. Each is written next to the code that relies on it, with the
+pinned implementation as its reference, marked as not an upstream
+guarantee. The evidence is in
+[docs/reports/dependency-assumptions.md](docs/reports/dependency-assumptions.md),
+points 2, 3, 5 and 6.
+
+- zio: accept and pool callbacks run on their own loop's thread because
+  the loops share no LoopGroup (`zig/src/serve.zig`, the comment above
+  `for (loops) |*lp| lp.* = .{ .lfd = lfd };`, and `ownLoop` in
+  `zig/src/pg.zig`, which checks the loop zio passes to a callback, not the
+  thread it runs on).
+- zio: a socket registration lives until `NetClose`, which asserts nothing
+  is parked on it, so the pool polls a duplicate of libpq's socket
+  (`zig/src/pg.zig`, header comment).
+- Lean toolchain: `test/retained.c` declares `calloc` and `realloc` by
+  hand, and measures a Lean object as the mimalloc block that starts at its
+  pointer (it takes `mi_usable_size` from `lean.h` and fails to compile
+  without `LEAN_MIMALLOC`).
+- Lean toolchain: on Linux the toolchain's glibc is `lib/glibc/libc.so`
+  and its version is read from its version names (`lakefile.lean`,
+  `zsrvTarget`).
+
+At each update of zio or of the Lean toolchain, recheck the contracts on
+that dependency against its new code and documentation and update the
+references in those comments: drop a contract that upstream now documents
+(cite the passage instead), and bring one that no longer holds to the
+owner. The repository's checks cover them only in part (serve_test.zig's
+LoopGroup checks, `pg.ownLoop`, the `#error` in `test/retained.c`, and
+`zsrvTarget`'s error when `libc.so` defines no version; a toolchain that
+moves or drops `lib/glibc/libc.so` is not detected: `zsrvTarget` then
+builds for the host). `zig/build.zig.zon` points here beside the zio pin;
+`lean-toolchain` cannot hold a comment.

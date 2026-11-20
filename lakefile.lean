@@ -62,7 +62,9 @@ nightly-2026-11-19) lacks (issue 4n7czb). Lean's toolchain copies glibc's
 from the version names the library defines. That layout rests on that script,
 not on documentation; the Reference Manual documents only the supported floor
 (glibc 2.26+ on x86-64, 2.27+ on aarch64): `docs/reports/dependency-assumptions.md`,
-point 6. -/
+point 6. It is a supported-subset contract, not an upstream guarantee
+(approved 2026-11-20, item alblg3; `AGENTS.project.md`, "Supported-subset
+contracts"); recheck at each update of the Lean toolchain. -/
 def zsrvTarget (sysroot : FilePath) : IO (Option String) := do
   let libc := sysroot / "lib" / "glibc" / "libc.so"
   unless ← libc.pathExists do return none
