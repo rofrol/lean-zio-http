@@ -1,6 +1,5 @@
 ## Next, in order
 
-udpq6h Decide whether the head budget of a request left behind several responses or batches may restart with each of them
 alblg3 Decide what to do with the dependency assumptions that rest on upstream code only (Rule 6)
 gaf5x5 Decide whether a pipelined batch is bounded by maxResponseBytes (65,536) or by the transport's out_cap (8,192)
 gihgde Check zig/src/pg.c's model of a query result's Lean allocation cost against the runtime's real block sizes
@@ -12,6 +11,7 @@ cmb7vk Stop discarding bpftrace's and perf's exit statuses in bench/arena/local-
 ## Proposed
 
 q2g4am Act on leanprover/lean4's answers to the Std.Http questions 16522 and 16523
+o3rltf Decide whether bytes pipelined behind a request that got 100 Continue start their head budget at their receive
 
 ## Needs a decision
 
