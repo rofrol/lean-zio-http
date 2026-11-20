@@ -192,3 +192,32 @@ Measured on 2026-11-20 in the same container (bpftrace 0.23.2, perf
 323477d plus this change, with every check passing and a profile of each
 lsrv-arena sample (8K and 9K samples). Its figures are not recorded: the
 change touches only the tracers' handling.
+
+## A helper warning at the accept histogram (item auhogk, 2026-11-20)
+
+Two runs of `PERF=1 bench/arena/local.sh OUT ARENA 1` in the same
+container (bpftrace 0.23.2), one before item 6lqxi5's change to
+`trace.bt` and one after it, each put this into one go-fasthttp trace
+(`trace-go-fasthttp-pipelined-1.txt`, `trace-go-fasthttp-baseline-1.txt`):
+
+```
+/s/trace.bt:33:18-26: WARNING: File exists
+Additional Info - helper: map_update_elem, retcode: -17
+    @accept_ms = hist($d);
+```
+
+Line 33 is `kretprobe:inet_csk_accept`'s `@accept_ms = hist($d)`: a
+`map_update_elem` call bpftrace made for that statement returned -17
+(EEXIST). Its cause is not traced, and whether an accept is missing from
+`@accept_ms` for it, or whether
+`@accepted`, `@over_1s`, `@over_5s` or `@max_ms` can lose an update the
+same way, is unverified; so is whether this report's accept figures
+(accepted during the load, slowest accept) can be short of an accept for
+it. The summary line does not read `@accept_ms`; the warning lands in the
+trace file beside the maps. Neither run's figures are recorded here, and
+whether the traces behind the tables above held the warning is not
+recorded.
+The probes are unchanged and no sample is rejected for it (decided
+2026-11-20 by the models under the owner's delegation); the question is
+reopened if the warning recurs in a run whose figures a conclusion of this
+report rests on.
