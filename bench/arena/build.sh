@@ -124,7 +124,7 @@ for entry in go-stdlib go-fasthttp; do
     go build -trimpath -ldflags="-s -w" -o "$out/$entry" main.go)
 done
 cp "$arena"/requests/get.raw "$arena"/requests/post_cl.raw "$arena"/requests/post_chunked.raw "$arena"/requests/pipeline.raw "$out/requests/"
-cp bench/arena/run.sh bench/arena/inner.sh "$out/"
+cp bench/arena/run.sh bench/arena/inner.sh bench/arena/start-polled.sh "$out/"
 { echo "httparena: $arena_commit"; echo "gcannon: $gcannon_commit (liburing 2.9, $liburing_commit)"
   echo "zrk: $zrk_version"; echo "go (go entries): $(go version)"; echo "lsrv: $(git rev-parse HEAD)$(git diff --quiet HEAD || echo ' with uncommitted changes')"; } >>"$out/versions.txt"
 du -sh "$out"

@@ -14,6 +14,8 @@ mount -t tracefs nodev /sys/kernel/tracing 2>/dev/null || true
 echo -1 >/proc/sys/kernel/perf_event_paranoid
 sysctl -q -w net.ipv4.ip_local_port_range="1024 65535" net.core.somaxconn=65535 net.ipv4.tcp_max_syn_backlog=65535
 ulimit -n 262144
+. /s/start-polled.sh
+polled=$(mktemp -d)
 port=8080 url=http://127.0.0.1:8080 req=/b/requests
 for round in $(seq "$rounds"); do
   for prof in baseline pipelined; do
@@ -32,6 +34,7 @@ for round in $(seq "$rounds"); do
           # $cmd is unquoted on purpose: fixed words without spaces.
           taskset -c 0,1 $cmd >/tmp/server.fifo 2>&1 &
           pid=$!
+          reap=$pid
           exec 3</tmp/server.fifo
           : >"$log"; up=no
           while IFS= read -r line <&3; do
@@ -44,16 +47,9 @@ for round in $(seq "$rounds"); do
           exec 3<&-
           ;;
         *)
-          taskset -c 0,1 $cmd >"$log" 2>&1 &
-          pid=$!
-          # HttpArena's go entries print nothing once listening: this polls
-          # that external server with an idempotent request until it
-          # answers, at most 5000 times; its exit ends the wait too (inner.sh).
-          i=0
-          until curl -s -o /dev/null "$url/pipeline"; do
-            kill -0 $pid 2>/dev/null || { echo "$srv exited before answering"; exit 1; }
-            i=$((i + 1)); [ $i -lt 5000 ] || { echo "$srv did not answer"; exit 1; }
-          done
+          # HttpArena's go entries print nothing once listening:
+          # start-polled.sh sets pid and reap.
+          start_polled "$srv" "$polled" "$url/pipeline" "$log" taskset -c 0,1 $cmd || exit 1
           ;;
       esac
       : >"$out/trace-$tag.txt"
@@ -89,8 +85,8 @@ for round in $(seq "$rounds"); do
       # entries handle no signal, so SIGTERM ends them with 128 + 15
       # (inner.sh, stop). Anything else is a crash or an error exit.
       s=0
-      kill -TERM $pid || { wait $pid || s=$?; echo "$srv exited with $s before SIGTERM:"; tail -n 5 "$log"; exit 1; }
-      wait $pid || s=$?
+      kill -TERM $pid || { wait $reap || s=$?; echo "$srv exited with $s before SIGTERM:"; tail -n 5 "$log"; exit 1; }
+      wait $reap || s=$?
       [ -z "$drain" ] || wait $drain
       case $srv in lsrv-*) want=0 ;; *) want=143 ;; esac
       [ $s -eq $want ] || { echo "$srv exited with $s after SIGTERM, want $want:"; tail -n 5 "$log"; exit 1; }

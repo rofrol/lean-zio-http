@@ -23,6 +23,7 @@ ip link set lo up
 sysctl -q -w net.ipv4.ip_local_port_range="1024 65535" net.core.somaxconn=65535 net.ipv4.tcp_max_syn_backlog=65535
 ulimit -n 262144
 export LD_LIBRARY_PATH="$d/lib"
+. "$d/start-polled.sh"
 # run.sh's watcher writes $d/stop when the site fails; its kill of the scope
 # fails while the scope is still starting, so every step checks the file.
 stopped() { [ ! -e "$d/stop" ] || exit 3; }
@@ -76,7 +77,9 @@ server_cmd() {
     go-fasthttp) echo "$d/go-fasthttp" ;;
   esac
 }
-pid= drain= cur=
+# pid is the server's process, reap the child whose exit status is the
+# server's: the server itself, or start_polled's supervisor.
+pid= reap= drain= cur=
 start() {
   cur=$1 log=$out/server-$1.log
   : >"$log"
@@ -91,6 +94,7 @@ start() {
       # $(server_cmd) is unquoted on purpose: fixed words without spaces.
       $(server_cmd "$1") >"$d/server.fifo" 2>&1 &
       pid=$!
+      reap=$pid
       exec 3<"$d/server.fifo"
       up=no
       while IFS= read -r line <&3; do
@@ -103,18 +107,9 @@ start() {
       exec 3<&-
       ;;
     *)
-      $(server_cmd "$1") >"$log" 2>&1 &
-      pid=$!
-      # HttpArena's go entries print nothing once listening (main.go at
-      # $arena_commit in build.sh: ListenAndServe, reuseport.Listen, no
-      # output), so this polls that external server: an idempotent request
-      # until it answers, at most 5000 times; its exit ends the wait too.
-      i=0
-      until curl -s -o /dev/null "$url/pipeline"; do
-        kill -0 "$pid" 2>/dev/null || { echo "$1 exited before answering"; exit 1; }
-        i=$((i + 1))
-        [ $i -lt 5000 ] || { echo "$1 did not answer"; exit 1; }
-      done
+      # HttpArena's go entries print nothing once listening: start-polled.sh.
+      # $(server_cmd) is unquoted on purpose: fixed words without spaces.
+      start_polled "$1" "$d" "$url/pipeline" "$log" $(server_cmd "$1") || exit 1
       ;;
   esac
 }
@@ -124,8 +119,8 @@ start() {
 # error exit) voids the run.
 stop() {
   s=0
-  kill -TERM "$pid" || { wait "$pid" || s=$?; echo "$cur exited with $s before SIGTERM: $(tail -n 3 "$out/server-$cur.log")"; exit 1; }
-  wait "$pid" || s=$?
+  kill -TERM "$pid" || { wait "$reap" || s=$?; echo "$cur exited with $s before SIGTERM: $(tail -n 3 "$out/server-$cur.log")"; exit 1; }
+  wait "$reap" || s=$?
   if [ -n "$drain" ]; then wait "$drain"; drain=; fi
   case $cur in lsrv-*) want=0 ;; *) want=143 ;; esac
   [ $s -eq $want ] || { echo "$cur exited with $s after SIGTERM, want $want: $(tail -n 3 "$out/server-$cur.log")"; exit 1; }
