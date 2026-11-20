@@ -1,5 +1,7 @@
 ## Next, in order
 
+umtm4l Decide whether to bound the work one Conn.step does for a connection's pipelined requests
+
 ## Proposed
 
 q2g4am Act on leanprover/lean4's answers to the Std.Http questions 16522 and 16523
@@ -19,7 +21,6 @@ g62mok Decide whether to measure the pool's readiness probe (peek against NetPol
 2mb4o4 Decide whether to propose cheaper head parsing to leanprover/lean4's Std.Http, or accept H1's parse cost
 gaf5x5 Decide whether a pipelined batch is bounded by maxResponseBytes (65,536) or by the transport's out_cap (8,192)
 udpq6h Decide whether the head budget of a request left behind several responses or batches may restart with each of them
-umtm4l Decide whether to bound the work one Conn.step does for a connection's pipelined requests
 ov7ele Decide how to report Zig's "failed command:" line printed for a passing test step (an upstream bug)
 5f54l4 Should H1Adapter decode chunked request bodies, so HttpArena's baseline and limited-conn run with their whole request mix?
 qipzi4 Confirm bench/fairness's probe maxima on an idle host or on Linux?
