@@ -111,3 +111,52 @@ and nothing above rests on them.
 - Whether to bound that work per step, at the cost of the pipelined
   throughput the batch brought, is a choice for the owner; it was proposed
   as a follow-up item.
+
+## 2026-11-20: the request bound of 64 (item umtm4l)
+
+Measured on 2026-11-20 by item umtm4l, on the M1, at this item's change
+(`Conn.maxBatchRequests` = 64: one step answers at most 64 requests) on top
+of 296f036, against the same tree built with the bound removed (`gather`'s
+fuel back to `buf.size`, as at 296f036), the two runs of each interleaved.
+The host was contended: load averages of 30 to 36 at the start of the
+in-process runs, falling to 10 to 16 during the loop runs. These figures
+add to the sections above, which stay as written; they do not replace the
+comparison of 64, 16 and no bound on a quiet host with several loaders,
+which item qipzi4 owns.
+
+In process (`lsrv-parsebench`'s `full` section, median of five runs; two
+runs each, µs):
+
+| build | case | responses in the first send | first step | receive | copy |
+| --- | --- | --- | --- | --- | --- |
+| bound 64 | full-404 | 64 | 220, 219 | 2,246, 2,114 | 21, 20 |
+| no bound | full-404 | 512 | 1,669, 1,671 | 2,118, 2,192 | 111, 118 |
+| bound 64 | full-pipeline | 64 | 260, 269 | 1,383, 1,389 | 14, 14 |
+| no bound | full-pipeline | 341 | 1,431, 1,436 | 1,434, 1,440 | 61, 57 |
+
+On the loop (`bench/fairness/run.sh`, one loader, 20,000 probes; µs, and
+the loader's responses per second while the probes ran):
+
+| build | loader | p50 | p90 | p99 | p99.9 | loader responses/s |
+| --- | --- | --- | --- | --- | --- | --- |
+| bound 64 | none | 49, 49 | 69, 73 | 121, 133 | 441, 854 | - |
+| bound 64 | pipeline | 276, 279 | 340, 342 | 676, 1,040 | 2,452, 4,516 | 207,560, 197,864 |
+| bound 64 | 404 | 240, 239 | 292, 295 | 611, 723 | 1,996, 2,537 | 239,353, 241,331 |
+| no bound | none | 48, 47 | 68, 60 | 119, 100 | 859, 604 | - |
+| no bound | pipeline | 755, 752 | 876, 872 | 2,333, 2,137 | 6,226, 5,970 | 206,675, 208,154 |
+| no bound | 404 | 1,096, 1,098 | 1,296, 1,293 | 3,738, 3,553 | 24,583, 15,329 | 230,777, 238,729 |
+
+With the bound, one step on a full buffer takes about 0.22 to 0.27 ms
+instead of 1.4 to 1.7 ms, and the whole receive costs about what it did
+(the steps after the first answer the rest, each after its send completes).
+The probe's median round trip beside one loader is 0.24 to 0.28 ms instead
+of 0.75 to 1.1 ms, about one bounded step, and its 99th percentile 0.6 to
+1.0 ms instead of 2.1 to 3.7 ms. The loader's responses per second were
+197,864 to 207,560 with the bound and 206,675 to 208,154 without it for
+`pipeline`, and 239,353 to 241,331 with it and 230,777 to 238,729 without
+it for `404`: no loss of the loader's throughput shows, but two runs each
+on a contended host do not establish that there is none. As before, the harness does not
+observe the server's steps: that the probe waits behind one step of the
+loader is inferred from the round trips' matching the step's length. The
+tail percentiles and maxima on this loaded host were not traced and nothing
+here rests on them; several loaders on one loop were not measured.

@@ -419,7 +419,7 @@ func expectations(addr string) (int64, string, error) {
 }
 
 // batchOverOutCap sends k pipelined POST /echo requests, each with a
-// two-byte body naming its place, in one write to a one-loop server whose
+// `bodyLen`-byte body naming its place, in one write to a one-loop server whose
 // receives and sends take at most `chunk` bytes, and checks that one receive
 // held them all (--report-recv). That one receive is a premise, not a
 // guarantee: TCP may split a write into several receives on any interface
@@ -438,15 +438,19 @@ func expectations(addr string) (int64, string, error) {
 // copy, ending inside a response, so Lean asked again from that offset (item
 // vxcuze). k is odd and `chunk` just over half the responses' bytes, so one
 // batch takes two sends and every split at a response boundary three; the
-// check computes both from the responses received. Test.lean's
+// check computes both from the responses received. k is at most
+// Conn.maxBatchRequests (64), so one batch can hold them all (item umtm4l);
+// the empty Host and the 15-byte bodies make 63 responses pass outCap while
+// their requests still fit one receive of `chunk` bytes. Test.lean's
 // batchScenario and batchEdgeScenario check the batch itself.
 func batchOverOutCap(path string) (string, error) {
-	const k = 71
-	const chunk = 4199
-	const echo = "POST /echo HTTP/1.1\r\nHost: a\r\nContent-Length: 2\r\n\r\n"
+	const k = 63
+	const chunk = 4159
+	const bodyLen = 15
+	echo := fmt.Sprintf("POST /echo HTTP/1.1\r\nHost:\r\nContent-Length: %d\r\n\r\n", bodyLen)
 	var reqs strings.Builder
 	for i := range k {
-		fmt.Fprintf(&reqs, "%s%02d", echo, i)
+		fmt.Fprintf(&reqs, "%s%0*d", echo, bodyLen, i)
 	}
 	if reqs.Len() > chunk {
 		return "", fmt.Errorf("%d bytes of requests do not fit one receive of %d", reqs.Len(), chunk)
@@ -477,7 +481,7 @@ func batchOverOutCap(path string) (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("response %d: %w", i, err)
 		}
-		if want := fmt.Sprintf("%02d", i); resp.StatusCode != 200 || string(got) != want {
+		if want := fmt.Sprintf("%0*d", bodyLen, i); resp.StatusCode != 200 || string(got) != want {
 			return "", fmt.Errorf("response %d: status %d body %q, want 200 %q", i, resp.StatusCode, got, want)
 		}
 		ends = append(ends, raw.Len()-r.Buffered())

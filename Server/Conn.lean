@@ -64,11 +64,13 @@ it reports nothing after `close`). The values of the budgets are the loop's
 Pipelined responses (item paarzq). A response that keeps the connection
 open is sent together with the responses to the requests already complete
 in the buffer behind it that the adapter answers at once (`batch`), in
-request order and within `maxResponseBytes`, so a receive of many pipelined
-requests is answered with one send rather than one send and one loop turn
-each. The batch stops before a request that is incomplete, asks for
-`100 Continue` or a query, closes the connection or would pass the bound;
-that request is served from the buffer once the batch is sent, as before.
+request order, within `maxResponseBytes` and at most `maxBatchRequests`
+requests (item umtm4l), so a receive of many pipelined requests is answered
+with a few sends rather than one send and one loop turn each. The batch
+stops before a request that is incomplete, asks for `100 Continue` or a
+query, closes the connection or would pass either bound; that request is
+served from the buffer once the batch is sent, as before (a complete one
+without another receive).
 The batch is one response to this model: it runs under one write deadline,
 and, as a connection receives only while it reads, no byte is read until the
 whole batch is sent (`lsrv-test`'s `batchScenario` checks the order, partial
@@ -229,6 +231,19 @@ def startSend (p : σ) (buf out : ByteArray) (next : Next) : State σ × Action 
   if 0 < out.size ∧ out.size ≤ maxResponseBytes then ({ buf, parser := p, phase := .writing out 0 next }, .send out 0)
   else closeNow ad
 
+/-- The most requests one step answers: the response it starts with and the
+ones `batch` gathers behind it (item umtm4l). A connection whose buffer
+holds more complete requests answers the rest once the batch's send
+completes, which the loop reports on a later turn, after the connections
+ready before it (serve.zig, `LoopCtx.ready`); no further receive or read
+readiness is needed. The bound keeps one pipelining connection from holding
+its loop for the work of `maxResponseBytes` / (smallest response) requests
+in one step (512 for App.Arena's 404, 1.6 to 1.7 ms on the M1:
+docs/reports/full-buffer-step.md);
+its value was decided on 2026-11-20 (item umtm4l) and its comparison with
+16 and with no bound on a quiet host is item qipzi4's. -/
+def maxBatchRequests : Nat := 64
+
 /-- The responses to the pipelined requests at the start of `buf` that the
 adapter answers at once (`respond`), each written at `now`, pushed onto
 `parts` in request order, with the batch's size (`size`, the bytes before
@@ -236,8 +251,11 @@ them included) and the bytes not consumed (item paarzq). It stops before the
 first request that is incomplete, asks for `100 Continue` or a query, closes
 the connection, has an empty response, or would bring the batch over
 `maxResponseBytes`: that request is served as before once the batch is sent.
-`fuel` bounds the rounds; each consumes at least one byte, so `buf.size`
-rounds are enough. -/
+`fuel` bounds the rounds, each of which answers at most one request
+(`gather_size_le`); `batch` gives it the requests the batch may still take
+after its first response (`maxBatchRequests - 1`), and never more than
+`buf.size`, since each round
+consumes at least one byte. -/
 def gather (now : Nat) (parts : Array ByteArray) (size : Nat) (buf : ByteArray) :
     Nat → Array ByteArray × Nat × ByteArray
   | 0 => (parts, size, buf)
@@ -251,15 +269,16 @@ def gather (now : Nat) (parts : Array ByteArray) (size : Nat) (buf : ByteArray) 
     | _ => (parts, size, buf)
 
 /-- A response `first` that keeps the connection open, followed by the
-responses `gather` answers at once from `buf` behind it, as one send, with
-the bytes left in the buffer. The batch is one array whose capacity is its
-size, as `Response.write` gives a single response (docs/memory.md); with
-nothing gathered it is `first` itself. An empty `first`, which `startSend`
-answers with a close, gathers nothing. -/
+responses `gather` answers at once from `buf` behind it, at most
+`maxBatchRequests` in all, as one send, with the bytes left in the buffer.
+The batch is one array whose capacity is its size, as `Response.write` gives
+a single response (docs/memory.md); with nothing gathered it is `first`
+itself. An empty `first`, which `startSend` answers with a close, gathers
+nothing. -/
 def batch (now : Nat) (first buf : ByteArray) : ByteArray × ByteArray :=
   if first.size = 0 then (first, buf)
   else
-    let g := gather ad now #[] first.size buf buf.size
+    let g := gather ad now #[] first.size buf (min buf.size (maxBatchRequests - 1))
     if g.1.isEmpty then (first, g.2.2)
     else (g.1.foldl (· ++ ·) ((ByteArray.emptyWithCapacity g.2.1).append first), g.2.2)
 
@@ -430,6 +449,21 @@ theorem gather_le (parts : Array ByteArray) (size : Nat) (buf : ByteArray) (fuel
       · exact Nat.le_trans (ih _ _ _) (by simp [ByteArray.size_extract])
       · exact Nat.le_refl _
     · exact Nat.le_refl _
+
+/-- Each round of `gather` answers at most one request: it gathers at most
+`fuel` responses, so `batch` sends at most `maxBatchRequests`, `first`
+included. -/
+theorem gather_size_le (parts : Array ByteArray) (size : Nat) (buf : ByteArray) (fuel : Nat) :
+    (gather ad now parts size buf fuel).1.size ≤ parts.size + fuel := by
+  induction fuel generalizing parts size buf with
+  | zero => simp [gather]
+  | succ n ih =>
+    unfold gather
+    split
+    · dsimp only; split
+      · exact Nat.le_trans (ih _ _ _) (by simp; omega)
+      · simp
+    · simp
 
 theorem batch_le (first buf : ByteArray) : (batch ad now first buf).2.size ≤ buf.size := by
   unfold batch

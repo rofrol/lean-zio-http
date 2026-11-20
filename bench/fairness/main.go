@@ -7,8 +7,9 @@
 //     back to back without pause, and reads and checks every response (its
 //     status line and body). The stream is meant to leave more bytes waiting
 //     in the server's socket than its buffer has room for at each receive, so
-//     that each step answers as many requests as fit in one send
-//     (Conn.gather); the harness does not observe the server's receives;
+//     that each step answers as many requests as fit in one send, at most
+//     Conn.maxBatchRequests (Conn.gather); the harness does not observe the
+//     server's receives;
 //   - the probe sends `GET /pipeline` and waits for its `200 ok`, -n times
 //     one after the other, timing each round trip.
 //

@@ -33,10 +33,17 @@
   `maxResponseBytes` (65,536) bytes and sent in pieces of at most 8,192 bytes
   (the loop's send buffer). The responses to the pipelined requests already
   complete in the connection's buffer that the handler answers at once
-  follow it in the same buffer, in request order, within the same bound,
-  and are sent with it (`Conn.batch`); a request that is incomplete, asks
-  for `100 Continue` or a query, closes the connection or would pass the
-  bound is answered once they are sent. A larger response, a status outside 200-599, a
+  follow it in the same buffer, in request order, within the same bound
+  and at most `Conn.maxBatchRequests` (64) responses in all, and are sent
+  with it (`Conn.batch`); a request that is incomplete, asks for
+  `100 Continue` or a query, closes the connection or would pass either
+  bound is answered once they are sent (a complete one without another
+  receive; the loop reports the send's completion after the connections
+  already ready). One step of a connection thus answers at most 64
+  requests, so a connection ready on the same loop waits for that much
+  work per ready connection ahead of it, not for a whole buffer of small
+  requests (item umtm4l; docs/reports/full-buffer-step.md). The count does
+  not bound a slow handler's own work. A larger response, a status outside 200-599, a
   body with 204, 205 or 304, a field the adapter owns (Content-Length,
   Transfer-Encoding, Connection, Date, Keep-Alive, Upgrade, Trailer) or a
   field name or value that is not valid becomes `500` with

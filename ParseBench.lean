@@ -25,8 +25,8 @@ small request pipelined, per receive (the median of five runs):
 
 - `first step`: the one `Conn.step` on the receive, on a kept-alive
   connection waiting for it: it answers as many of the requests as fit in
-  one send (`Conn.gather`), the longest step a connection of lsrv-arena's
-  takes; with the responses in its send.
+  one send, at most `Conn.maxBatchRequests` (`Conn.gather`), the longest
+  step a connection of lsrv-arena's takes; with the responses in its send.
 - `receive`: the whole receive as `step` above measures it, every step until
   the connection asks to receive again.
 - `copy`: only the copies of the buffer's suffix that the first step makes,

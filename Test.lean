@@ -972,10 +972,11 @@ head budget of a request behind it runs beside it as beside a single
 response): in request order, the same bytes as each
 request gets alone, across partial sends of any size, in an array whose
 capacity is its size, never over `maxResponseBytes` (a batch at exactly the
-bound is taken, one byte over is not), and without a receive until every
-complete request in the buffer is answered (backpressure: a buffer filled
-with requests is answered in sends of at most `maxResponseBytes` before the
-connection reads again). A batch stops before a request that is incomplete,
+bound is taken, one byte over is not) or `Conn.maxBatchRequests` responses,
+and without a receive until every complete request in the buffer is
+answered (backpressure: a buffer filled with requests is answered in sends
+within both bounds before the connection reads again; the requests behind
+a batch are served when its send completes). A batch stops before a request that is incomplete,
 asks for `100 Continue` or a query, or closes the connection; that one is
 served once the batch is sent, as before. -/
 def batchScenario : Check Unit := do
@@ -998,6 +999,39 @@ def batchScenario : Check Unit := do
     if sends != #[want] then fail s!"batch: 16 pipelined requests in pieces of {k}: {sends.size} sends, not their responses in order"
     expectRecv s!"batch: after 16 pipelined responses in pieces of {k}" a2 inCap
     expectDeadline s!"batch: after 16 pipelined responses in pieces of {k}" s2 (some .idle) 2
+  -- The request bound (item umtm4l): of `maxBatchRequests` + 5 complete
+  -- requests one step answers `maxBatchRequests`; the rest stay buffered,
+  -- the next one's head budget beside the send, and the send's completion
+  -- alone starts their batch: no receive and no arrival between.
+  let over := Conn.maxBatchRequests + 5
+  let rep (n : Nat) (r : ByteArray) := (List.replicate n r).foldl (· ++ ·) ByteArray.empty
+  let (o1, oa1) := Conn.step h 0 (Conn.initial h) (.received (bytes (String.join (List.replicate over get))))
+  match oa1 with
+  | .send d 0 =>
+    if d != rep Conn.maxBatchRequests rGet then fail s!"batch: {over} requests: the first send is not {Conn.maxBatchRequests} responses"
+    if o1.buf != bytes (String.join (List.replicate 5 get)) || o1.phase.ahead != some .head then
+      fail s!"batch: {over} requests: the 5 behind the bound are not buffered with a head budget beside the send"
+    match Conn.step h 0 o1 (.sent d.size) with
+    | (o2, .send d2 0) =>
+      if d2 != rep 5 rGet || o2.buf.size != 0 then fail s!"batch: {over} requests: the second send is not the 5 responses left"
+      expectDeadline s!"batch: {over} requests, the second send" o2 (some .write) 2
+      expectRecv s!"batch: {over} requests, after the second send" (Conn.step h 0 o2 (.sent d2.size)).2 inCap
+    | _ => fail s!"batch: {over} requests: the first send's completion did not start the second"
+    -- The head budget beside the first send ends on the complete head behind
+    -- the bound, and the send goes on.
+    match Conn.step h 0 o1 (.expired .head 2) with
+    | (oe, .none) =>
+      if oe.phase.ahead != none || oe.buf != o1.buf then fail s!"batch: {over} requests: the head budget beside the bounded batch did not end"
+      -- The send goes on: its completion still starts the batch of the rest.
+      let stillSending := match oe.phase, oa1 with
+        | .writing out 0 _, .send d 0 => out == d
+        | _, _ => false
+      unless stillSending do fail s!"batch: {over} requests: the bounded batch's send did not survive the head budget's expiry"
+      match Conn.step h 0 oe (.sent (rep Conn.maxBatchRequests rGet).size) with
+      | (_, .send d2 0) => if d2 != rep 5 rGet then fail s!"batch: {over} requests: after the head budget's expiry, the second send is not the 5 responses left"
+      | _ => fail s!"batch: {over} requests: after the head budget's expiry, the first send's completion did not start the second"
+    | _ => fail s!"batch: {over} requests: the expiry of a complete head behind the bounded batch was acted on"
+  | _ => fail s!"batch: {over} requests: the receive was not answered with a send"
   -- An incomplete request behind the batch waits, its head budget beside it.
   let tail := "GET / HTTP/1.1\r\nHo"
   let (t1, ta1) := Conn.step h 0 (Conn.initial h) (.received (bytes (get ++ miss ++ tail)))
@@ -1082,7 +1116,7 @@ def batchScenario : Check Unit := do
   let (fs, f2, fa2) ← drain "batch: a full buffer" h 8192 f1 fa1
   if fs.foldl (· ++ ·) ByteArray.empty != (List.replicate many rGet).foldl (· ++ ·) ByteArray.empty then
     fail s!"batch: a full buffer of {many} requests: not their responses in order"
-  if fs.size < 2 || fs.any (·.size > maxResponseBytes) then
+  if fs.size < 2 || fs.any (·.size > min maxResponseBytes (Conn.maxBatchRequests * rGet.size)) then
     fail s!"batch: a full buffer of {many} requests: {fs.size} sends of {fs.map (·.size)} bytes"
   expectRecv "batch: after a full buffer" fa2 inCap
   if f2.buf.size != 0 then fail "batch: a full buffer was not consumed"
@@ -1110,7 +1144,8 @@ than are buffered, or answers an empty response, as before one that would
 pass the bound, and the connection closes when it serves that request once
 the batch is sent; an empty first response (`Conn.batch`'s `first.size =
 0` branch) or an oversized one (`startSend`) sends nothing, not even the
-responses to the requests behind it. Complete requests left behind the
+responses to the requests behind it. A batch holds at most
+`Conn.maxBatchRequests` responses. Complete requests left behind either
 bound are answered in consecutive batches, in order, each in an array
 whose capacity is its size. A full buffer that ends on an incomplete
 request is answered in several batches, then that request is read with the
@@ -1137,9 +1172,24 @@ def batchEdgeScenario : Check Unit := do
     let (s, a) := Conn.step o 0 (Conn.initial o) (.received (bytes s!"{first}ab"))
     expectClose s!"batch edges: {first}ab" a
     unless closed s do fail s!"batch edges: {first}ab: the connection is not closed"
-  -- Requests left behind the bound are answered in consecutive batches, as
-  -- `gather` takes them (each next response while the batch stays within
-  -- `maxResponseBytes`): a buffer of GET / (200) and GET /nope (404) in
+  -- The request bound (item umtm4l): `maxBatchRequests` one-byte requests
+  -- are one send; one more is answered in a second send, which follows the
+  -- first's completion with no receive between. (That the loop reports
+  -- that completion after the connections already ready is the transport's,
+  -- tested in zig/src/serve_test.zig: "connections that perform their next
+  -- send during a ready turn are reported once in it and kept for the
+  -- next".) The value is the one decided (item umtm4l); changing it is a
+  -- decision, not a tuning.
+  if Conn.maxBatchRequests != 64 then fail s!"batch edges: maxBatchRequests is {Conn.maxBatchRequests}, not the decided 64"
+  for (n, sends) in [(Conn.maxBatchRequests, 1), (Conn.maxBatchRequests + 1, 2)] do
+    let input := "".pushn 'a' n
+    let (bs, _, ba) ← run input
+    let want := if sends == 1 then #[bytes input] else #[bytes ("".pushn 'a' Conn.maxBatchRequests), bytes "a"]
+    if bs != want then fail s!"batch edges: {n} one-byte requests: sends of {bs.map (·.size)} bytes, want {want.map (·.size)}"
+    expectRecv s!"batch edges: after {n} one-byte requests" ba inCap
+  -- Requests left behind either bound are answered in consecutive batches,
+  -- as `gather` takes them (each next response while the batch stays within
+  -- `maxResponseBytes` and `maxBatchRequests`): a buffer of GET / (200) and GET /nope (404) in
   -- turn, alone, or followed by an incomplete request that fills the buffer
   -- to `inCap` exactly, whose rest is then received under its head deadline
   -- in the period the last batch's head budget ran in (`gen + 1` of each
@@ -1162,10 +1212,11 @@ def batchEdgeScenario : Check Unit := do
     let tail := if incomplete then "".pushn 'o' (inCap - size - head.length) |> (head ++ ·) else ""
     let input := String.join reqs.toList ++ tail
     if incomplete && input.length != inCap then fail s!"{what}: {input.length} bytes, not {inCap}"
-    let want := (reqs.map fun r => if r == get then rGet else rMiss).foldl (init := (#[] : Array ByteArray)) fun bs r =>
+    let want := ((reqs.map fun r => if r == get then rGet else rMiss).foldl (init := (#[] : Array (ByteArray × Nat))) fun bs r =>
       match bs.back? with
-      | some b => if b.size + r.size ≤ maxResponseBytes then bs.pop.push (b ++ r) else bs.push r
-      | none => #[r]
+      | some (b, k) =>
+        if b.size + r.size ≤ maxResponseBytes && k < Conn.maxBatchRequests then bs.pop.push (b ++ r, k + 1) else bs.push (r, 1)
+      | none => #[(r, 1)]).map (·.1)
     if want.size < 2 then fail s!"{what}: the responses of {reqs.size} requests fit one batch"
     let (s1, a1) := Conn.step h 0 (Conn.initial h) (.received (bytes input))
     let (sends, s2, a2) ← drain what h 8192 s1 a1

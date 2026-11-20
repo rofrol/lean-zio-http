@@ -195,7 +195,7 @@ def arenaShapesCheck : Option String := Id.run do
 /-! The full receive buffer (item vhvejg): `inCap` bytes, as near as whole
 requests fill it, of one small request pipelined, which `lsrv-parsebench`'s
 `full` section measures. `Conn.gather` answers them in one `Conn.step` up to
-`maxResponseBytes` of responses, copying the rest of the buffer once per
+`maxResponseBytes` of responses and `Conn.maxBatchRequests` requests, copying the rest of the buffer once per
 request answered (`buf.extract consumed buf.size`), so these are the cases
 where one step does the most work. `full-404` is the smallest request the H1
 adapter completes (25 bytes, `Host` empty; App.Arena answers it 404),
