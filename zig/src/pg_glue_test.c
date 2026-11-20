@@ -825,8 +825,10 @@ static PGresult *made(int nf, const char *const *cols, int nt, value_fn value) {
 
 /* The rows of value(t, f) for t < nt as chunked-rows mode delivers them,
    `chunk` rows a PGresult (the last of fewer), then the zero-row result,
-   gathered as collect does. */
-static lean_object *rows_in_chunks(int nf, const char *const *cols, int nt, int chunk, value_fn value, size_t limit) {
+   gathered as collect does; *cost, when `cost` is not NULL, is what
+   rows_take charged for them. */
+static lean_object *rows_charged(int nf, const char *const *cols, int nt, int chunk, value_fn value, size_t limit,
+                                 size_t *cost) {
     ekk_rows b = {0};
     for (int t = 0;; t += chunk) {
         int k = nt - t < chunk ? (nt - t > 0 ? nt - t : 0) : chunk;
@@ -839,25 +841,36 @@ static lean_object *rows_in_chunks(int nf, const char *const *cols, int nt, int 
         }
         if (k == 0) break;
     }
+    if (cost) *cost = b.cost;
     return rows_finish(&b);
 }
 
-/* What the Lean value rows_of built costs by the same measure as
-   rows_take charges, from the sizes its objects have (capacities included). */
+static lean_object *rows_in_chunks(int nf, const char *const *cols, int nt, int chunk, value_fn value, size_t limit) {
+    return rows_charged(nf, cols, nt, chunk, value, limit, NULL);
+}
+
+/* What one object of a built result costs by the measure pg.c states
+   (its comment above `charge`), taken from the runtime, not from pg.c's
+   object_cost: the runtime's own size of the object (lean_object_byte_size,
+   capacity included), rounded up to LEAN_OBJECT_SIZE_DELTA, plus pg.c's
+   8-byte margin. */
+static size_t runtime_cost(lean_object *o) { return lean_align(lean_object_byte_size(o), LEAN_OBJECT_SIZE_DELTA) + 8; }
+
+/* What the Lean value rows_of built costs: runtime_cost of each of its
+   objects. */
 static size_t built_cost(lean_object *res) {
-    size_t total = object_cost(sizeof(lean_ctor_object), 2);
+    size_t total = runtime_cost(res);
     lean_object *cols = lean_ctor_get(res, 0), *rows = lean_ctor_get(res, 1);
-    total += object_cost(sizeof(lean_array_object), lean_array_capacity(cols));
-    for (size_t f = 0; f < lean_array_size(cols); f++)
-        total += object_cost(lean_string_byte_size(lean_array_get_core(cols, f)), 0);
-    total += object_cost(sizeof(lean_array_object), lean_array_capacity(rows));
+    total += runtime_cost(cols);
+    for (size_t f = 0; f < lean_array_size(cols); f++) total += runtime_cost(lean_array_get_core(cols, f));
+    total += runtime_cost(rows);
     for (size_t t = 0; t < lean_array_size(rows); t++) {
         lean_object *row = lean_array_get_core(rows, t);
-        total += object_cost(sizeof(lean_array_object), lean_array_capacity(row));
+        total += runtime_cost(row);
         for (size_t f = 0; f < lean_array_size(row); f++) {
             lean_object *v = lean_array_get_core(row, f);
             if (lean_is_scalar(v)) continue;
-            total += object_cost(sizeof(lean_ctor_object), 1) + object_cost(lean_string_byte_size(lean_ctor_get(v, 0)), 0);
+            total += runtime_cost(v) + runtime_cost(lean_ctor_get(v, 0));
         }
     }
     return total;
@@ -893,6 +906,60 @@ static const char *valid_value(int t, int f, int *len) {
     const char *v = mixed[(t + f) % 4];
     if (v) *len = (int)strlen(v);
     return v;
+}
+
+/* Long text values, by row: lengths around mimalloc's size classes
+   (docs/reports/result-cost-blocks.md) and one of 1,000,000 bytes, the
+   largest that fits Query.maxResultBytes with little else; each a prefix
+   of one buffer of ASCII. */
+static const int long_lens[] = {32742, 100000, 525676, 1000000, 0, 7, 4093};
+#define LONG_ROWS (int)(sizeof long_lens / sizeof long_lens[0])
+static char long_text[1000000];
+static const char *long_value(int t, int f, int *len) {
+    (void)f;
+    *len = long_lens[t % LONG_ROWS];
+    return long_text;
+}
+
+/* The cost rows_take charges for a result equals what the runtime says
+   its Lean value takes (built_cost: lean_object_byte_size of every object,
+   rounded, plus the margin), for results of every shape: no columns, no
+   rows, one row, many rows, NULL and empty fields, valid multibyte text,
+   long text; in chunks of one row, of EKK_CHUNK_ROWS, and whole. A wrong
+   copy of the runtime's sizes in pg.c (object_cost, string_cost, the sizes
+   rows_take passes them) fails it. Rows of no columns are not covered:
+   libpq's PGresult builders cannot make them (PQsetvalue needs a field). */
+static void cost_shapes(void) {
+    memset(long_text, 'x', sizeof long_text);
+    const char *cols[] = {"a", "column b", "\xc5\xbc", ""};
+    struct {
+        const char *what;
+        int nf, nt;
+        value_fn value;
+    } shapes[] = {
+        {"result cost: no columns, no rows", 0, 0, null_value},
+        {"result cost: no rows", 2, 0, valid_value},
+        {"result cost: one row", 2, 1, valid_value},
+        {"result cost: many rows", 4, 1000, valid_value},
+        {"result cost: NULL fields", 3, 100, null_value},
+        {"result cost: empty fields", 3, 100, empty_value},
+        {"result cost: long text", 1, 2 * LONG_ROWS, long_value},
+        {"result cost: long text, two columns", 2, LONG_ROWS, long_value},
+    };
+    int chunks[] = {1, EKK_CHUNK_ROWS, 1000000};
+    for (size_t i = 0; i < sizeof shapes / sizeof shapes[0]; i++)
+        for (size_t k = 0; k < sizeof chunks / sizeof chunks[0]; k++) {
+            current = shapes[i].what;
+            size_t charged = 0;
+            lean_object *res =
+                rows_charged(shapes[i].nf, cols, shapes[i].nt, chunks[k], shapes[i].value, SIZE_MAX - 1, &charged);
+            CHECK(lean_ptr_tag(res) == 0, "refused without a limit");
+            CHECK(lean_array_size(lean_ctor_get(res, 1)) == (size_t)shapes[i].nt, "%zu rows",
+                  lean_array_size(lean_ctor_get(res, 1)));
+            size_t built = built_cost(res);
+            CHECK(charged == built, "chunks of %d: charged %zu, the runtime's sizes give %zu", chunks[k], charged, built);
+            lean_dec(res);
+        }
 }
 
 /* utf8_valid agrees with the Lean runtime: a string Lean keeps byte for
@@ -944,7 +1011,7 @@ static void cost_overflow(void) {
     CHECK(string_cost(SIZE_MAX - sizeof(lean_string_object), 1) == SIZE_MAX, "string header overflows");
     CHECK(object_cost(sizeof(lean_array_object), 1) == 40 && string_cost(1, 1) == 48 && string_cost(1, 0) == 48
               && string_cost(4, 0) == 56,
-          "an object's cost: header, rounding to 8, one word");
+          "an object's cost: its size, rounded to 8, and the 8-byte margin");
 }
 
 /* A result is accepted exactly up to its cost, which is what its Lean value
@@ -1321,6 +1388,7 @@ int main(void) {
     utf8_agrees();
     cost_overflow();
     cost_bound();
+    cost_shapes();
     printf("pg_glue_test: result cost: ok\n");
     startup_options();
     CHECK(ekk_pg_options("", 4321, &start_options) == 0, "ekk_pg_options");

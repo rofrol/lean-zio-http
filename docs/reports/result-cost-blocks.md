@@ -74,3 +74,18 @@ int main(void) {
 
 Built with `cc -I$T/include probe.c -L$T/lib/lean -lleanshared
 -Wl,-rpath,$T/lib/lean`, `$T` the toolchain's directory.
+
+## Follow-up: the oracle chosen (2026-11-20, item avvieu)
+
+Decided by the models under the owner's delegation of 2026-11-20 to decide
+the queue (consult round 20261120-164926-87db, sol and hydrogen agreeing):
+`Query.maxResultBytes` keeps its contract (headers and rounding counted,
+the allocator's overhead on top), and the independent oracle of `pg.c`'s
+charge is the runtime's `lean_object_byte_size`, not `mi_usable_size`.
+`zig/src/pg_glue_test.c` (`cost_shapes`, `built_cost`) checks that the
+cost `rows_take` charges equals the sum, over every object of the built
+result, of its `lean_object_byte_size` rounded up to 8 plus 8, for results with no
+columns, no rows, one row, 1,000 rows, NULL and empty fields, and text of
+up to 1,000,000 bytes, in chunks of 1 and 16 rows and whole. `pg.c`'s
+comment now gives the `+ 8` as a margin, not a header. The measurement
+above stays as written.

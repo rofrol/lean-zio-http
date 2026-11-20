@@ -364,8 +364,13 @@ int ekk_pg_consume(ekk_pg *p) {
    each row's array (one slot per field, so a NULL or empty value costs its
    slot), and for each non-NULL value its `some` and its string. Each object
    costs what lean_alloc_object or lean_alloc_ctor asks for, rounded up to
-   LEAN_OBJECT_SIZE_DELTA, plus one word for the size a big object's
-   allocation keeps before it (lean.h). The arithmetic saturates at SIZE_MAX,
+   LEAN_OBJECT_SIZE_DELTA (the runtime's lean_object_byte_size, rounded the
+   same way; pg_glue_test.c checks the charge against it), plus 8 bytes. The
+   8 bytes are a margin, not a header: under LEAN_MIMALLOC, which the
+   toolchain defines, Lean keeps no word before an object (lean.h,
+   lean_alloc_small_object and lean_alloc_object). They do not cover the
+   allocator's size classes, which make a block up to about a quarter larger
+   (docs/reports/result-cost-blocks.md). The arithmetic saturates at SIZE_MAX,
    which no limit reaches. Rows are charged one at a time as chunked-rows
    mode delivers them, so the rows held are bounded by the limit too. The row
    array doubles as rows arrive and is copied to its exact size once
@@ -382,8 +387,8 @@ static int charge(size_t *total, size_t n, size_t limit) {
     return !__builtin_add_overflow(*total, n, total) && *total <= limit;
 }
 
-/* What an object of `fixed` bytes and `n` words more costs; SIZE_MAX on
-   overflow. */
+/* What an object of `fixed` bytes and `n` words more costs (rounded up,
+   plus the 8-byte margin above); SIZE_MAX on overflow. */
 static size_t object_cost(size_t fixed, size_t n) {
     size_t sz;
     if (__builtin_mul_overflow(n, sizeof(void *), &sz) || __builtin_add_overflow(sz, fixed, &sz)
