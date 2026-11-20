@@ -1,6 +1,5 @@
 ## Next, in order
 
-alblg3 Decide what to do with the dependency assumptions that rest on upstream code only (Rule 6)
 gaf5x5 Decide whether a pipelined batch is bounded by maxResponseBytes (65,536) or by the transport's out_cap (8,192)
 gihgde Check zig/src/pg.c's model of a query result's Lean allocation cost against the runtime's real block sizes
 rvi53e Derive or check the memory bounds docs/memory.md repeats (163,880, 1,024, 81,920 bytes) once jexowc decides the allocator dependency
