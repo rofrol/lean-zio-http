@@ -82,6 +82,12 @@ The batch is one response to this model: it runs under one write deadline,
 and, as a connection receives only while it reads, no byte is read until the
 whole batch is sent (`lsrv-test`'s `batchScenario` checks the order, partial
 sends, the bound and this backpressure).
+The two bounds are separate, and neither is the transport's: a batch's bytes
+are bounded by `maxResponseBytes`, the bound `step_inv` proves for every
+array this model sends, and its requests by `maxBatchRequests`. The
+transport's per-send copy buffer (`out_cap`, 8,192 bytes, zig/src/serve.zig)
+bounds no batch: a batch over it goes out in several system calls, as a
+single response over it does (decided on 2026-11-20, item gaf5x5).
 
 Effects precede their record: a receive or send has happened in the kernel
 before its event reaches `step`, and a close is chosen before it is performed.
