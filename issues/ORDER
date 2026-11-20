@@ -2,6 +2,7 @@
 
 umtm4l Decide whether to bound the work one Conn.step does for a connection's pipelined requests
 4fued7 Stop discarding bpftrace's and perf's exit statuses in bench/arena/local-inner.sh, and end the go entries' readiness loop when the server exits
+g62mok Decide whether to measure the pool's readiness probe (peek against NetPoll) on Linux
 
 ## Proposed
 
@@ -17,7 +18,6 @@ yvladm Decide whether per-loop PostgreSQL pools should share connections across 
 b3lisr Retire or record the local workarounds in the HttpArena build: the Rosetta zig wrapper and the gcannon patch
 dhosug Decide whether bench/mdlinks keeps its own CommonMark subset parser or uses a CommonMark library
 alblg3 Decide what to do with the dependency assumptions that rest on upstream code only (Rule 6)
-g62mok Decide whether to measure the pool's readiness probe (peek against NetPoll) on Linux
 2mb4o4 Decide whether to propose cheaper head parsing to leanprover/lean4's Std.Http, or accept H1's parse cost
 gaf5x5 Decide whether a pipelined batch is bounded by maxResponseBytes (65,536) or by the transport's out_cap (8,192)
 udpq6h Decide whether the head budget of a request left behind several responses or batches may restart with each of them
