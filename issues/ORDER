@@ -1,6 +1,5 @@
 ## Next, in order
 
-umtm4l Decide whether to bound the work one Conn.step does for a connection's pipelined requests
 4fued7 Stop discarding bpftrace's and perf's exit statuses in bench/arena/local-inner.sh, and end the go entries' readiness loop when the server exits
 g62mok Decide whether to measure the pool's readiness probe (peek against NetPoll) on Linux
 
