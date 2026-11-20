@@ -36,20 +36,27 @@ names the current pair closes the connection, silently; any other changes
 nothing (`step_expired_current`, `step_expired_stale`).
 
 A pipelined request's head budget starts at its first byte (item dv6ikn), so
-it may run beside the send of the response before it, as a second pair
-(`Phase.ahead`, generation `gen + 1`). The first byte is known to Lean in
-one of two ways: it was left over in the buffer when the response started
-(it arrived in the receive that completed the previous request, which is
-when the response starts, or, for a request that waited for a query, when
-the query answered: bytes are not read while a query runs), or the loop,
-which watches the socket for readability while a response is sent with
-nothing buffered (`State.watches`), reports `arrived` when it becomes
-readable, leaving the bytes in the kernel. When that budget ends during the
-send, the connection closes unless the buffer already holds the whole head
-(`step_expired_ahead_partial`, `step_expired_ahead_complete`); once the
-response is sent, the reading of that head keeps the same pair
-(`step_sent_handoff`), so finishing the response neither starts nor resets
-its budget. A step starts a new
+it may run beside the send of the response before it, or beside a query, as
+a second pair (`Phase.ahead`, generation `State.headGen`). The first byte is
+known to Lean in one of two ways: it was left over in the buffer when the
+response started, having arrived in the receive that completed the previous
+request, or the loop, which watches the socket for readability while a
+response is sent with nothing buffered (`State.watches`), reports `arrived`
+when it becomes readable, leaving the bytes in the kernel. The budget starts
+then (a new `headGen`), and covers every byte buffered behind the request
+being answered: it is kept, not restarted, across the further responses,
+batches and queries answered from the buffer before that head is read
+(item udpq6h, `step_keeps_head`), so a request left behind several of them
+is bounded from the receive that brought its first byte. When that budget
+ends during a send, the connection closes unless the buffer holds only
+complete heads (`headsDone`; `step_expired_ahead_partial`,
+`step_expired_ahead_complete`), also mid-send, while requests before the
+incomplete head are still being answered; when it ends during a query, the
+query's answer closes the connection instead of being sent if a head was
+incomplete (the loop cannot cancel a query; the pool's deadline bounds it,
+`step_expired_query`, `step_answered_lapsed`). Once a response is sent, the
+reading of that head keeps the same pair (`step_sent_handoff`), so finishing
+the response neither starts nor resets its budget. A step starts a new
 period, with a newer generation, unless it continues the current one
 (`continues`, `step_gen`): bytes received do not extend the head or the body
 deadline, and a partial send does not extend the write deadline. The loop
@@ -90,7 +97,8 @@ inductive Deadline where
   /-- Keep-alive: from the end of a response to the next request's first byte. -/
   | idle
   /-- A request's head: from accept for the first request, and for a later
-  one from its first byte (`Phase.ahead`). -/
+  one from its first byte (`Phase.ahead`), across every response and query
+  answered before it is read. -/
   | head
   /-- A request's body: from the acceptance of its head. -/
   | body
@@ -131,6 +139,19 @@ inductive Next where
   head budget then runs beside the send (`Phase.ahead`). -/
   | read (r : Read)
 
+/-- The head budget of the bytes buffered behind a request that waits for a
+query (item udpq6h). -/
+inductive Behind where
+  /-- No budget: nothing is buffered behind it, or every buffered head is
+  complete (`headsDone`). -/
+  | clear
+  /-- The budget runs, as the pair (`head`, `State.headGen`). -/
+  | runs
+  /-- The budget ended while a buffered head was incomplete: the query's
+  answer closes the connection. -/
+  | lapsed
+deriving DecidableEq, Repr
+
 inductive Phase where
   /-- Waiting for bytes from the peer, for what `r` says. -/
   | reading (r : Read)
@@ -138,8 +159,9 @@ inductive Phase where
   | writing (out : ByteArray) (off : Nat) (next : Next)
   /-- Waiting for the result of the query just asked for, then going on with
   `k`; the request is already consumed from `buf`, and no receive is in
-  flight, so bytes the peer pipelines wait in the kernel. -/
-  | querying (k : Query.Result → Await Dated)
+  flight, so bytes the peer pipelines wait in the kernel. `b` is the head
+  budget of the bytes buffered behind it. -/
+  | querying (k : Query.Result → Await Dated) (b : Behind)
   /-- The close action was issued; nothing more happens. -/
   | closed
 
@@ -152,17 +174,18 @@ def Phase.deadline : Phase → Option Deadline
   | .reading (.body _) => some .body
   | .writing _ _ (.read (.body _)) => some .body
   | .writing _ _ _ => some .write
-  | .querying _ => none
+  | .querying _ _ => none
   | .closed => none
 
-/-- The second deadline a phase runs under: the head budget of the request
-after the response being sent, once a byte of it is known (item dv6ikn). Its
-generation is the one after the phase's own (`State.gen + 1`), which is the
-generation `step` gives the reading of that head once the response is sent
-(`step_sent_handoff`), so finishing the response neither starts nor resets
-the head's budget. -/
+/-- The second deadline a phase runs under: the head budget of the bytes
+after the response being sent, once a byte of them is known (item dv6ikn),
+or of the bytes buffered behind a query (item udpq6h). Its generation is
+`State.headGen`, which the reading of that head keeps
+(`step_sent_handoff`), so finishing a response or a query neither starts
+nor resets the head's budget. -/
 def Phase.ahead : Phase → Option Deadline
   | .writing _ _ (.read .head) => some .head
+  | .querying _ .runs => some .head
   | _ => none
 
 structure State (σ : Type) where
@@ -173,9 +196,24 @@ structure State (σ : Type) where
   parser : σ
   phase : Phase
   /-- The generation of the deadline period the connection is in: the loop
-  arms its timer for the pair (`phase.deadline`, `gen`), and an expiry naming
+  arms its timer for the pair (`phase.deadline`, `State.dgen`), which is
+  `gen` except while a head is read (then `headGen`), and an expiry naming
   another pair is stale. Unbounded; the loop keeps it as a Lean `Nat`. -/
   gen : Nat := 0
+  /-- The generation of the head budget: the pair (`head`, `headGen`) is
+  the reading phase's own deadline while a head is read (`State.dgen`) and
+  the second one beside a send or a query (`Phase.ahead`). A budget gets a
+  new generation when it starts (`stamp`, `arrive`) and keeps it until that
+  head is read (`step_keeps_head`); generations of head budgets never
+  decrease (`step_headGen`). -/
+  headGen : Nat := 0
+
+/-- The generation of the pair the phase's own deadline runs in: the head
+budget's while a head is read, `gen` otherwise. -/
+def State.dgen (s : State σ) : Nat :=
+  match s.phase with
+  | .reading .head => s.headGen
+  | _ => s.gen
 
 /-- The outcome of the loop's last operation. -/
 inductive Event where
@@ -295,7 +333,7 @@ def resume (now : Nat) (buf : ByteArray) : Await Dated → State σ × Action
     else
       let b := batch ad now r.1 buf
       startSend ad ad.init b.2 b.1 (.read (if 0 < b.2.size then .head else .idle))
-  | .query q k => ({ buf, parser := ad.init, phase := .querying k }, .query q)
+  | .query q k => ({ buf, parser := ad.init, phase := .querying k (if 0 < buf.size then .runs else .clear) }, .query q)
 
 /-- Answers what is buffered at wall clock `now`, given the adapter's state
 `p` for it: a response to send, a query to run, the interim `100 Continue`, a
@@ -331,7 +369,8 @@ def advance (now : Nat) (s : State σ) (e : Event) : State σ × Action :=
       | .read r =>
         if 0 < s.buf.size then serve ad now r.continued s.parser s.buf
         else ({ s with phase := .reading r }, .recv inCap)
-  | .querying k, .answered r => resume ad now s.buf (k r)
+  | .querying _ .lapsed, .answered _ => closeNow ad
+  | .querying k _, .answered r => resume ad now s.buf (k r)
   | _, _ => closeNow ad
 
 /-- Whether event `e` leaves the connection in the deadline period it was in,
@@ -350,17 +389,34 @@ def continues : Phase → Event → Phase → Bool
   | .writing _ _ (.read (.body _)), .sent _, .reading (.body _) => true
   | _, _, _ => false
 
-/-- Sets the generation of `r`, the answer to `e` in a state of phase `ph`
-and generation `g`: kept while the period continues, the next one otherwise;
-a closed connection keeps none. It takes the phase and the generation rather
-than the state so that `step` reads them before `advance` and holds no
-reference to the state while `advance` runs: a shared state would make
-`advance` copy the buffer it appends a receive to (item l46evh,
+/-- Whether event `e`, going from phase `p` to phase `p'`, keeps the head
+budget (item udpq6h): more bytes of the head being read, or any step from a
+phase whose head budget runs beside a send or a query, whose buffered bytes
+are then served (in further batches, behind a query, or read as that head)
+under the budget that started when their first byte was known. A receive
+in such a phase closes. -/
+def keepsHead : Phase → Event → Phase → Bool
+  | .reading .head, .received _, .reading .head => true
+  | .writing _ _ (.read .head), _, _ => true
+  | .querying _ .runs, _, _ => true
+  | _, _, _ => false
+
+/-- Sets the generations of `r`, the answer to `e` in a state of phase `ph`,
+generation `g` and head budget generation `h`: the generation is kept while
+the period continues, the next one otherwise; the head budget's is kept
+when `keepsHead`, and otherwise a new one, the one after the period's
+(`step_headGen`: it never equals an earlier one). A closed connection keeps
+none. It takes the phase and the generations rather than the state so that
+`step` reads them before `advance` and holds no reference to the state
+while `advance` runs: a shared state would make `advance` copy the buffer
+it appends a receive to (item l46evh,
 docs/reports/chunked-receive-memory.md). -/
-def stamp (ph : Phase) (g : Nat) (e : Event) (r : State σ × Action) : State σ × Action :=
+def stamp (ph : Phase) (g h : Nat) (e : Event) (r : State σ × Action) : State σ × Action :=
   match r.1.phase with
   | .closed => r
-  | p => ({ r.1 with gen := if continues ph e p then g else g + 1 }, r.2)
+  | p =>
+    let g' := if continues ph e p then g else g + 1
+    ({ r.1 with gen := g', headGen := if keepsHead ph e p then h else g' + 1 }, r.2)
 
 /-- Whether the loop is to watch for bytes of a next request while it
 sends: a response is sent, nothing is buffered, and no byte of a next
@@ -371,34 +427,55 @@ def State.watches (s : State σ) : Bool :=
   | _ => false
 
 /-- The answer to `arrived`: a watched send learns that a next request has
-begun, and its head budget starts beside the send (`Phase.ahead`), in the
-same generation; any other phase ignores it. -/
+begun, and its head budget starts beside the send (`Phase.ahead`), with the
+generation after the send's; any other phase ignores it. -/
 def arrive (s : State σ) : State σ × Action :=
   match s.phase with
   | .writing out off (.read .idle) =>
-    if s.buf.size = 0 then ({ s with phase := .writing out off (.read .head) }, .none) else (s, .none)
+    if s.buf.size = 0 then ({ s with phase := .writing out off (.read .head), headGen := s.gen + 1 }, .none) else (s, .none)
   | _ => (s, .none)
 
+/-- Whether every head in `buf` is complete, `p` being the adapter's state
+for its first request: the adapter answers each request in turn as `serve`
+and `gather` ask it (a request it answers, or that waits for a query, ends
+where its consumed bytes end), and none needs more of its head (item
+udpq6h). A request whose head is complete and whose body is not, or that
+asks for `100 Continue`, ends the walk: no head follows it in the buffer. A
+response that closes the connection does not, so the bytes behind it count
+too. `fuel` bounds the rounds; `expire` gives it `buf.size`, since each
+round consumes at least one byte. -/
+def headsDone (p : σ) (buf : ByteArray) : Nat → Bool
+  | 0 => true
+  | fuel + 1 =>
+    match (ad.handle p buf).2 with
+    | .needMore .head => false
+    | .respond consumed _ =>
+      if 0 < consumed ∧ consumed < buf.size then headsDone ad.init (buf.extract consumed buf.size) fuel else true
+    | .await consumed _ _ =>
+      if 0 < consumed ∧ consumed < buf.size then headsDone ad.init (buf.extract consumed buf.size) fuel else true
+    | _ => true
+
 /-- The answer to the expiry of deadline `d` in generation `g`. The current
-period's deadline closes. The head budget running beside a send
-(`Phase.ahead`, generation `gen + 1`) closes when that head is not complete
-in the buffer: its bytes may still be in the kernel (none buffered), or the
-adapter still lacks part of it. When the buffered bytes hold the whole head
-(the adapter, asked as `serve` will ask it once the send ends, answers
-anything but `needMore .head`), the head kept its budget: the send goes on
-and that request has no head deadline left. Any other expiry is stale and
-changes nothing. -/
+period's deadline (`State.dgen`) closes. The head budget running beside a
+send or a query (`Phase.ahead`, generation `headGen`) ended while a head it
+covers is not complete when nothing is buffered (the bytes are in the
+kernel) or a buffered head is incomplete (`headsDone`, which asks the
+adapter as `serve` will once the send or the query ends): beside a send the
+connection closes, also while the requests before that head are being
+answered; beside a query it closes when the query answers (the loop cannot
+cancel one, and the pool's deadline bounds it). When every buffered head is
+complete, the budget ends with nothing asked for: the send or the query goes
+on, and those requests have no head deadline left. Any other expiry is
+stale and changes nothing. -/
 def expire (s : State σ) (d : Deadline) (g : Nat) : State σ × Action :=
-  if s.phase.deadline = some d ∧ s.gen = g then closeNow ad
-  else match s.phase with
-    | .writing out off (.read .head) =>
-      if d = .head ∧ s.gen + 1 = g then
-        if s.buf.size = 0 then closeNow ad
-        else match (ad.handle s.parser s.buf).2 with
-          | .needMore .head => closeNow ad
-          | _ => ({ s with phase := .writing out off (.read .idle) }, .none)
-      else (s, .none)
+  if s.phase.deadline = some d ∧ s.dgen = g then closeNow ad
+  else if s.phase.ahead = some d ∧ s.headGen = g then
+    let done := decide (0 < s.buf.size) && headsDone ad s.parser s.buf s.buf.size
+    match s.phase with
+    | .writing out off _ => if done then ({ s with phase := .writing out off (.read .idle) }, .none) else closeNow ad
+    | .querying k _ => ({ s with phase := .querying k (if done then .clear else .lapsed) }, .none)
     | _ => (s, .none)
+  else (s, .none)
 
 /-- The connection's answer to event `e`, reported at wall clock `now` (Unix
 seconds), which only a response sent in answer to it sees (`Dated`). An
@@ -408,7 +485,7 @@ def step (now : Nat) (s : State σ) (e : Event) : State σ × Action :=
   | .closed, _ => (s, .none)
   | _, .expired d g => expire ad s d g
   | _, .arrived => arrive s
-  | ph, _ => let g := s.gen; stamp ph g e (advance ad now s e)
+  | ph, _ => let g := s.gen; let h := s.headGen; stamp ph g h e (advance ad now s e)
 
 /-! ## Guarantees
 
@@ -519,6 +596,7 @@ theorem advance_inv (s : State σ) (e : Event) (hs : Inv s) : Inv (advance ad no
         · split
           · exact serve_inv ad now _ _ _ hb
           · refine ⟨hb, ?_⟩; intro o f n h; simp at h
+  · exact closeNow_inv ad
   · exact resume_inv ad now _ _ hb
   · exact closeNow_inv ad
 
@@ -583,6 +661,7 @@ theorem advance_close (s : State σ) (e : Event) :
         · split
           · exact serve_close ad now _ _ _
           · simp
+  · simp [closeNow]
   · exact resume_close ad now _ _
   · simp [closeNow]
 
@@ -644,6 +723,7 @@ theorem advance_recv (s : State σ) (e : Event) (room : Nat) :
             simp only [Action.recv.injEq] at h
             subst h
             simp_all [inCap, maxHeadBytes, maxBodyBytes]
+  · simp [closeNow]
   · intro h; exact absurd h (resume_recv ad now _ _ _)
   · simp [closeNow]
 
@@ -696,18 +776,19 @@ theorem advance_send (s : State σ) (e : Event) (data : ByteArray) (off : Nat) :
         · split
           · exact serve_send ad now _ _ _ _ _
           · simp
+  · simp [closeNow]
   · exact resume_send ad now _ _ _ _
   · simp [closeNow]
 
 theorem resume_query (buf : ByteArray) (a : Await Dated) (q : Query) :
-    (resume ad now buf a).2 = .query q → ∃ k, (resume ad now buf a).1.phase = .querying k := by
+    (resume ad now buf a).2 = .query q → ∃ k b, (resume ad now buf a).1.phase = .querying k b := by
   match a with
   | .done f =>
     intro h; simp only [resume] at h; split at h <;> (simp only [startSend] at h; split at h <;> simp [closeNow] at h)
-  | .query q' k => intro _; exact ⟨k, rfl⟩
+  | .query q' k => intro _; exact ⟨k, _, rfl⟩
 
 theorem serve_query (c : Bool) (p : σ) (buf : ByteArray) (q : Query) :
-    (serve ad now c p buf).2 = .query q → ∃ k, (serve ad now c p buf).1.phase = .querying k := by
+    (serve ad now c p buf).2 = .query q → ∃ k b, (serve ad now c p buf).1.phase = .querying k b := by
   unfold serve
   split
   · unfold wait; split <;> simp [closeNow]
@@ -728,7 +809,7 @@ file's header, which the loop checks at run time, `serve.zig` `answered`),
 a connection has at most one query outstanding and that event finds its
 continuation. -/
 theorem advance_query (s : State σ) (e : Event) (q : Query) :
-    (advance ad now s e).2 = .query q → ∃ k, (advance ad now s e).1.phase = .querying k := by
+    (advance ad now s e).2 = .query q → ∃ k b, (advance ad now s e).1.phase = .querying k b := by
   unfold advance
   split
   · simp
@@ -748,6 +829,7 @@ theorem advance_query (s : State σ) (e : Event) (q : Query) :
         · split
           · exact serve_query ad now _ _ _ _
           · simp
+  · simp [closeNow]
   · exact resume_query ad now _ _ _
   · simp [closeNow]
 
@@ -842,6 +924,7 @@ theorem advance_fed (s : State σ) (e : Event) (hs : FedInv ad s) : FedInv ad (a
         · split
           · exact serve_fed ad now _ _ _ hs
           · exact hs
+  · exact closeNow_fed ad
   · exact resume_fed ad now _ _
   · exact closeNow_fed ad
 
@@ -863,7 +946,7 @@ def Event.isLoop : Event → Bool
   | .expired .. | .arrived => true
   | _ => false
 
-theorem stamp_obs (ph : Phase) (g : Nat) (e : Event) (r : State σ × Action) : obs (stamp ph g e r) = obs r := by
+theorem stamp_obs (ph : Phase) (g h : Nat) (e : Event) (r : State σ × Action) : obs (stamp ph g h e r) = obs r := by
   unfold stamp; split <;> rfl
 
 /-- An event other than the loop's own report is answered as `advance`
@@ -875,7 +958,7 @@ theorem step_obs (s : State σ) (e : Event) (he : e.isLoop = false) :
   · rename_i h; simp [advance, h]
   · simp [Event.isLoop] at he
   · simp [Event.isLoop] at he
-  · exact stamp_obs _ _ _ _
+  · exact stamp_obs _ _ _ _ _
 
 /-- What a report of the loop may do: close, or ask for nothing while keeping
 the buffer, the adapter's state and the generation, and leaving the phase
@@ -894,15 +977,16 @@ theorem expire_quiet (s : State σ) (d : Deadline) (g : Nat) : Quiet ad s (expir
   split
   · exact .inl rfl
   · split
-    · rename_i out off h
+    · dsimp only
       split
-      · split
+      · rename_i out off next h
+        split
+        · refine .inr ⟨rfl, rfl, rfl, rfl, by simp, ?_⟩
+          intro o f n hw; simp only [Phase.writing.injEq] at hw
+          obtain ⟨rfl, rfl, -⟩ := hw; exact ⟨_, h⟩
         · exact .inl rfl
-        · split
-          · exact .inl rfl
-          · refine .inr ⟨rfl, rfl, rfl, rfl, by simp, ?_⟩
-            intro o f n hw; simp only [Phase.writing.injEq] at hw
-            obtain ⟨rfl, rfl, -⟩ := hw; exact ⟨_, h⟩
+      · refine .inr ⟨rfl, rfl, rfl, rfl, by simp, ?_⟩
+        intro o f n hw; simp at hw
       · exact quiet_same ad s
     · exact quiet_same ad s
 
@@ -1022,7 +1106,7 @@ file's header, which the loop checks at run time, `serve.zig` `answered`; a
 and changes nothing, and so does an arrival), a connection has at most one query outstanding and
 that event finds its continuation. -/
 theorem step_query (s : State σ) (e : Event) (q : Query) :
-    (step ad now s e).2 = .query q → ∃ k, (step ad now s e).1.phase = .querying k := by
+    (step ad now s e).2 = .query q → ∃ k b, (step ad now s e).1.phase = .querying k b := by
   cases he : e.isLoop
   · have h := step_obs ad now s e he
     simp only [obs, Prod.mk.injEq] at h
@@ -1243,72 +1327,158 @@ and generations never decrease while the connection is open, so an expiry
 the loop armed for an earlier period never closes it. -/
 
 /-- An expiry that names neither the current period nor the head budget
-running beside a send changes nothing and asks for nothing. -/
+running beside a send or a query changes nothing and asks for nothing. -/
 theorem step_expired_stale (s : State σ) (d : Deadline) (g : Nat)
-    (h : ¬ (s.phase.deadline = some d ∧ s.gen = g)) (ha : ¬ (s.phase.ahead = some d ∧ s.gen + 1 = g)) :
+    (h : ¬ (s.phase.deadline = some d ∧ s.dgen = g)) (ha : ¬ (s.phase.ahead = some d ∧ s.headGen = g)) :
     step ad now s (.expired d g) = (s, .none) := by
   by_cases hc : s.phase = .closed
   · exact step_closed ad now s _ hc
   rw [step_expired ad now s d g hc]
   unfold expire
-  simp only [h, ite_false]
-  split
-  · rename_i out off hp
-    rw [hp] at ha; simp only [Phase.ahead, Option.some.injEq] at ha
-    split
-    · rename_i hd; exact absurd ⟨hd.1.symm, hd.2⟩ ha
-    · rfl
-  · rfl
+  simp only [h, ha, ite_false]
 
 /-- An expiry of the current deadline period closes the connection. -/
 theorem step_expired_current (s : State σ) (d : Deadline) (g : Nat)
-    (h : s.phase.deadline = some d) (hg : s.gen = g) : step ad now s (.expired d g) = closeNow ad := by
+    (h : s.phase.deadline = some d) (hg : s.dgen = g) : step ad now s (.expired d g) = closeNow ad := by
   have hc : s.phase ≠ .closed := by intro hc; rw [hc] at h; simp [Phase.deadline] at h
   rw [step_expired ad now s d g hc]
   unfold expire
   simp [h, hg]
 
-/-- The head budget of a pipelined request, running beside the send of the
-response before it, closes the connection when it ends while that head is
-not complete in the buffer: none of it buffered (its bytes are in the
-kernel), or the adapter still lacking part of it. -/
+/-- The head budget running beside a send closes the connection when it
+ends while a head it covers is not complete: nothing buffered (the bytes are
+in the kernel), or a buffered head that the adapter still lacks part of,
+the first or one behind requests that are complete (item udpq6h). -/
 theorem step_expired_ahead_partial (s : State σ) (out : ByteArray) (off : Nat)
     (hw : s.phase = .writing out off (.read .head))
-    (hp : s.buf.size = 0 ∨ (ad.handle s.parser s.buf).2 = .needMore .head) :
-    step ad now s (.expired .head (s.gen + 1)) = closeNow ad := by
+    (hp : s.buf.size = 0 ∨ headsDone ad s.parser s.buf s.buf.size = false) :
+    step ad now s (.expired .head s.headGen) = closeNow ad := by
   rw [step_expired ad now s _ _ (by rw [hw]; simp)]
   unfold expire
   rw [hw]
-  simp only [Phase.deadline, Option.some.injEq, reduceCtorEq, false_and, ite_false, and_self, ite_true]
-  split
-  · rfl
-  · rename_i h0
-    rcases hp with hp | hp
-    · exact absurd hp h0
-    · rw [hp]
+  rcases hp with hp | hp <;> simp [Phase.deadline, Phase.ahead, hp]
 
-/-- When the head budget running beside a send ends and the buffer already
-holds that whole head, the head kept its budget: the send goes on, nothing is
-asked for, and that request has no head deadline left (`Phase.ahead` is
-none, and the loop watches no more: the buffer is not empty). -/
+/-- When the head budget running beside a send ends and every buffered head
+is complete, the budget ends: the send goes on, nothing is asked for, and
+those requests have no head deadline left (`Phase.ahead` is none, and the
+loop watches no more: the buffer is not empty). -/
 theorem step_expired_ahead_complete (s : State σ) (out : ByteArray) (off : Nat)
     (hw : s.phase = .writing out off (.read .head)) (hb : 0 < s.buf.size)
-    (hp : (ad.handle s.parser s.buf).2 ≠ .needMore .head) :
-    step ad now s (.expired .head (s.gen + 1)) = ({ s with phase := .writing out off (.read .idle) }, .none) := by
+    (hp : headsDone ad s.parser s.buf s.buf.size = true) :
+    step ad now s (.expired .head s.headGen) = ({ s with phase := .writing out off (.read .idle) }, .none) := by
   rw [step_expired ad now s _ _ (by rw [hw]; simp)]
   unfold expire
   rw [hw]
-  simp only [Phase.deadline, Option.some.injEq, reduceCtorEq, false_and, ite_false, and_self, ite_true]
-  simp only [show ¬ s.buf.size = 0 by omega, ite_false]
-  all_goals (split <;> simp_all)
+  simp [Phase.deadline, Phase.ahead, hb, hp]
+
+/-- The head budget running beside a query, when it ends, asks for nothing
+(the loop cannot cancel a query): with every buffered head complete it ends,
+and otherwise it lapses, so that the query's answer closes the connection
+(`step_answered_lapsed`). -/
+theorem step_expired_query (s : State σ) (k : Query.Result → Await Dated) (hq : s.phase = .querying k .runs) :
+    step ad now s (.expired .head s.headGen) =
+      ({ s with phase := .querying k (if 0 < s.buf.size ∧ headsDone ad s.parser s.buf s.buf.size = true then .clear else .lapsed) }, .none) := by
+  rw [step_expired ad now s _ _ (by rw [hq]; simp)]
+  unfold expire
+  rw [hq]
+  by_cases hb : 0 < s.buf.size <;> by_cases hd : headsDone ad s.parser s.buf s.buf.size = true <;>
+    simp [Phase.deadline, Phase.ahead, hb, hd]
+
+/-- A query whose head budget lapsed is answered with the close: no response
+is sent and no further request is served. -/
+theorem step_answered_lapsed (s : State σ) (k : Query.Result → Await Dated) (r : Query.Result)
+    (hq : s.phase = .querying k .lapsed) : step ad now s (.answered r) = closeNow ad := by
+  unfold step
+  split
+  · rename_i h; rw [hq] at h; cases h
+  · simp_all
+  · simp_all
+  · unfold advance; rw [hq]; rfl
 
 /-- The first byte of a next request, reported while a response is sent with
-nothing buffered, starts that request's head budget beside the send, in the
-send's generation, and asks for nothing. -/
+nothing buffered, starts that request's head budget beside the send, with
+the generation after the send's, and asks for nothing. -/
 theorem step_arrived (s : State σ) (out : ByteArray) (off : Nat)
     (hw : s.phase = .writing out off (.read .idle)) (hb : s.buf.size = 0) :
-    step ad now s .arrived = ({ s with phase := .writing out off (.read .head) }, .none) := by
+    step ad now s .arrived = ({ s with phase := .writing out off (.read .head), headGen := s.gen + 1 }, .none) := by
   rw [step_arrive ad now s (by rw [hw]; simp)]; unfold arrive; rw [hw]; simp [hb]
+
+theorem keepsHead_of_ahead (ph : Phase) (h : ph.ahead = some .head) (e : Event) (p : Phase) :
+    keepsHead ph e p = true := by
+  unfold Phase.ahead at h
+  split at h <;> simp_all [keepsHead]
+
+/-- A step from a phase whose head budget runs beside a send or a query
+keeps that budget's generation, whatever it is answered with (further
+batches from the buffer, a query, the reading of the head): the budget of
+bytes left behind several responses, batches or queries runs from when
+their first byte was known, not from the last of them (item udpq6h). -/
+theorem step_keeps_head (s : State σ) (e : Event) (ha : s.phase.ahead = some .head)
+    (hc : (step ad now s e).1.phase ≠ .closed) : (step ad now s e).1.headGen = s.headGen := by
+  have hk := keepsHead_of_ahead s.phase ha
+  have hn : s.phase ≠ .closed := by intro h; rw [h] at ha; simp [Phase.ahead] at ha
+  revert hc
+  unfold step
+  split
+  · intro hc; exact absurd ‹_› hn
+  · unfold expire
+    split
+    · simp [closeNow]
+    · split
+      · dsimp only; split
+        · split <;> simp [closeNow]
+        · simp
+        · simp
+      · simp
+  · unfold arrive
+    split
+    · rename_i out off h; rw [h] at ha; simp [Phase.ahead] at ha
+    · simp
+  · unfold stamp
+    split
+    · intro hc; exact absurd ‹_› hc
+    · intro _; simp [hk]
+
+theorem stamp_headGen (ph : Phase) (g h : Nat) (e : Event) (r : State σ × Action) (hi : h ≤ g + 1)
+    (hc : (stamp ph g h e r).1.phase ≠ .closed) :
+    h ≤ (stamp ph g h e r).1.headGen ∧ (stamp ph g h e r).1.headGen ≤ (stamp ph g h e r).1.gen + 1 := by
+  obtain ⟨⟨buf, parser, phase, g0, h0⟩, a⟩ := r
+  revert hc
+  unfold stamp
+  dsimp only
+  split
+  · intro hc; exact absurd rfl hc
+  · intro _
+    by_cases hk : keepsHead ph e phase = true <;> by_cases hcon : continues ph e phase = true <;>
+      simp [hk, hcon] <;> omega
+
+/-- Head budgets get newer generations: a step that leaves the connection
+open never lowers the head budget's generation, and keeps it at most one
+past the period's. So an expiry of an earlier head budget is stale
+(`expired_old_head_stale`). -/
+theorem step_headGen (s : State σ) (e : Event) (hi : s.headGen ≤ s.gen + 1)
+    (hc : (step ad now s e).1.phase ≠ .closed) :
+    s.headGen ≤ (step ad now s e).1.headGen ∧ (step ad now s e).1.headGen ≤ (step ad now s e).1.gen + 1 := by
+  revert hc
+  unfold step
+  split
+  · intro _; exact ⟨Nat.le_refl _, hi⟩
+  · unfold expire
+    split
+    · simp [closeNow]
+    · split
+      · dsimp only; split
+        · split <;> simp [closeNow, hi]
+        · simp [hi]
+        · simp [hi]
+      · simp [hi]
+  · unfold arrive
+    split
+    · split
+      · intro _; simp; omega
+      · intro _; exact ⟨Nat.le_refl _, hi⟩
+    · intro _; exact ⟨Nat.le_refl _, hi⟩
+  · intro hc; exact stamp_headGen _ _ _ _ _ hi hc
 
 /-- The actions answered to the events `es`, in order. -/
 def actions (s : State σ) : List (Nat × Event) → List Action
@@ -1334,7 +1504,7 @@ then for nothing: no request is dispatched, no query asked for and no byte
 sent, whatever events the loop still reports (the completion of an operation
 that was in flight included). -/
 theorem expired_then_nothing (s : State σ) (d : Deadline) (g : Nat)
-    (h : s.phase.deadline = some d) (hg : s.gen = g) (es : List (Nat × Event)) :
+    (h : s.phase.deadline = some d) (hg : s.dgen = g) (es : List (Nat × Event)) :
     (step ad now s (.expired d g)).2 = .close ∧ ∀ a ∈ actions ad (step ad now s (.expired d g)).1 es, a = .none := by
   rw [step_expired_current ad now s d g h hg]
   exact ⟨rfl, (run_closed ad (closeNow ad).1 rfl es).2⟩
@@ -1401,16 +1571,68 @@ theorem run_gen_le (es : List (Nat × Event)) :
       intro hcl; rw [(run_closed ad _ hcl es).1] at hc; exact hc hcl
     exact Nat.le_trans (step_gen_le ad t s e hs) (ih _ hc)
 
+theorem ahead_head (ph : Phase) (d : Deadline) (h : ph.ahead = some d) : d = .head := by
+  unfold Phase.ahead at h; split at h <;> simp_all
+
+theorem dgen_of_ne (s : State σ) (d : Deadline) (h : s.phase.deadline = some d) (hd : d ≠ .head) :
+    s.dgen = s.gen := by
+  unfold State.dgen; split
+  · rename_i hp; rw [hp] at h; simp [Phase.deadline] at h; exact absurd h.symm hd
+  · rfl
+
+theorem dgen_of_head (s : State σ) (h : s.phase.deadline = some .head) : s.dgen = s.headGen := by
+  unfold State.dgen; split
+  · rfl
+  · rename_i hn
+    revert h hn
+    cases s.phase with
+    | reading r => cases r <;> simp [Phase.deadline]
+    | writing out off next =>
+      cases next with
+      | close => simp [Phase.deadline]
+      | read r => cases r <;> simp [Phase.deadline]
+    | _ => simp [Phase.deadline]
+
 /-- A phase change invalidates older generations: an expiry the loop armed
-for a generation older than the current one changes nothing, now or after
-any further events. -/
-theorem expired_old_stale (s : State σ) (d : Deadline) (g : Nat) (hg : g < s.gen) (es : List (Nat × Event)) :
+for an idle, body or write period older than the current one changes
+nothing, now or after any further events. -/
+theorem expired_old_stale (s : State σ) (d : Deadline) (g : Nat) (hd : d ≠ .head) (hg : g < s.gen)
+    (es : List (Nat × Event)) :
     step ad now (run ad s es) (.expired d g) = (run ad s es, .none) := by
   by_cases hc : (run ad s es).phase = .closed
   · exact step_closed ad now _ _ hc
   · have := run_gen_le ad es s hc
     apply step_expired_stale
-    · intro ⟨_, h⟩; omega
+    · intro ⟨h1, h⟩; rw [dgen_of_ne _ d h1 hd] at h; omega
+    · intro ⟨h1, _⟩; exact hd (ahead_head _ d h1)
+
+theorem run_headGen (es : List (Nat × Event)) :
+    ∀ (s : State σ), s.headGen ≤ s.gen + 1 → (run ad s es).phase ≠ .closed →
+      s.headGen ≤ (run ad s es).headGen ∧ (run ad s es).headGen ≤ (run ad s es).gen + 1 := by
+  induction es with
+  | nil => intro s hi _; exact ⟨Nat.le_refl _, hi⟩
+  | cons x es ih =>
+    obtain ⟨t, e⟩ := x
+    intro s hi hc
+    simp only [run] at hc ⊢
+    have hs : (step ad t s e).1.phase ≠ .closed := by
+      intro hcl; rw [(run_closed ad _ hcl es).1] at hc; exact hc hcl
+    have h1 := step_headGen ad t s e hi hs
+    have h2 := ih _ h1.2 hc
+    exact ⟨Nat.le_trans h1.1 h2.1, h2.2⟩
+
+/-- A head budget replaced by a newer one is stale: an expiry the loop
+armed for a head generation older than the current one changes nothing, now
+or after any further events, in every state the connection reaches from
+`initial` (which keeps `headGen ≤ gen + 1`). -/
+theorem expired_old_head_stale (s : State σ) (g : Nat) (hi : s.headGen ≤ s.gen + 1) (hg : g < s.headGen)
+    (es : List (Nat × Event)) :
+    step ad now (run ad s es) (.expired .head g) = (run ad s es, .none) := by
+  by_cases hc : (run ad s es).phase = .closed
+  · exact step_closed ad now _ _ hc
+  · have := (run_headGen ad es s hi hc).1
+    apply step_expired_stale
+    · intro ⟨h1, h⟩; rw [dgen_of_head _ h1] at h; omega
     · intro ⟨_, h⟩; omega
 
 /-- Bytes received do not extend the head or the body deadline: a receive
@@ -1474,13 +1696,32 @@ theorem step_sent_partial (s : State σ) (out : ByteArray) (off : Nat) (next : N
 /-- Finishing a response neither starts nor resets the head budget running
 beside it: when the send that ends it leaves the connection reading that
 head, the reading's deadline and generation are the pair the head budget ran
-under beside the send (`Phase.ahead`, `gen + 1`), so the loop keeps that
+under beside the send (`Phase.ahead`, `headGen`), so the loop keeps that
 timer. -/
 theorem step_sent_handoff (s : State σ) (out : ByteArray) (off n : Nat)
     (hw : s.phase = .writing out off (.read .head)) (hr : (step ad now s (.sent n)).1.phase = .reading .head) :
-    (step ad now s (.sent n)).1.phase.deadline = s.phase.ahead ∧ (step ad now s (.sent n)).1.gen = s.gen + 1 := by
+    (step ad now s (.sent n)).1.phase.deadline = s.phase.ahead ∧ (step ad now s (.sent n)).1.dgen = s.headGen := by
   refine ⟨by rw [hr, hw]; rfl, ?_⟩
-  rw [step_gen ad now s _ rfl (by rw [hr]; simp), hr, hw]
-  simp [continues]
+  have := step_keeps_head ad now s (.sent n) (by rw [hw]; rfl) (by rw [hr]; simp)
+  unfold State.dgen; rw [hr]; exact this
+
+/-- Bytes received do not extend the head deadline: a receive that leaves
+the connection reading the same head keeps the pair it runs under. -/
+theorem step_received_keeps_head (s : State σ) (d : ByteArray)
+    (hr : s.phase = .reading .head) (hr' : (step ad now s (.received d)).1.phase = .reading .head) :
+    (step ad now s (.received d)).1.dgen = s.dgen := by
+  have hs : s.phase ≠ .closed := by rw [hr]; simp
+  have : (step ad now s (.received d)).1.headGen = s.headGen := by
+    revert hr'
+    unfold step
+    split
+    · intro hc; exact absurd ‹_› hs
+    · simp_all
+    · simp_all
+    · unfold stamp
+      split
+      · intro h; rename_i hc; rw [hc] at h; cases h
+      · rename_i p _; intro hp; dsimp only at hp ⊢; rw [hp, hr]; simp [keepsHead]
+  unfold State.dgen; rw [hr, hr']; exact this
 
 end Server.Conn

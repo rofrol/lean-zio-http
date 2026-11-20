@@ -1,10 +1,13 @@
 # PostgreSQL
 
 A handler that answers `Await.query q k` puts its connection in
-`Conn.Phase.querying k`; the loop runs `q` on its own pool and feeds the
+`Conn.Phase.querying k b` (`b`: the head budget of bytes buffered behind it); the loop runs `q` on its own pool and feeds the
 result back as `Conn.Event.answered`, and `k`'s answer continues the
 connection (another query or the response). The connection does nothing
-else meanwhile; the loop serves its other connections (`Conn.step_query`,
+else meanwhile, except that the head budget of bytes buffered behind the
+query runs on; when it ends on an incomplete head, the answer closes the
+connection instead of continuing it (`Conn.step_answered_lapsed`;
+[production contract](production-contract.md), "Deadlines"); the loop serves its other connections (`Conn.step_query`,
 `bench/dbcheck`'s slow-query test).
 
 - **Pool.** Each loop has its own pool of at most `--pg-conns` libpq

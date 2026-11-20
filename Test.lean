@@ -198,6 +198,11 @@ def expectSend (what : String) (a : Conn.Action) : Check (Option (ByteArray × N
   | .send d off => pure (some (d, off))
   | _ => do fail s!"{what}: did not send"; pure none
 
+def expectQuery (what : String) (a : Conn.Action) (sql : String) (params : Array (Option String)) : Check Unit :=
+  match a with
+  | .query q => if q.sql != sql || q.params != params then fail s!"{what}: asked {repr q.sql} {q.params}" else pure ()
+  | _ => fail s!"{what}: did not ask for a query"
+
 def expectClose (what : String) (a : Conn.Action) : Check Unit :=
   match a with
   | .close => pure ()
@@ -279,10 +284,18 @@ def refusedScenario : Check Unit := do
   let (s, _) := Conn.step h 0 (Conn.initial h) (.received (bytes "GET / HTTP/1.1\r\nHo"))
   expectClose "refused with a partial request" (Conn.step h 0 s .refused).2
 
-/-- The deadline `s` runs under, and its generation. -/
+/-- The deadline `s` runs under, and the generation of its pair
+(`Conn.State.dgen`: the head budget's while a head is read). -/
 def expectDeadline (what : String) (s : Conn.State σ) (d : Option Conn.Deadline) (gen : Nat) : Check Unit := do
   if s.phase.deadline != d then fail s!"{what}: deadline {repr s.phase.deadline}, want {repr d}"
-  if s.gen != gen then fail s!"{what}: generation {s.gen}, want {gen}"
+  if s.dgen != gen then fail s!"{what}: generation {s.dgen}, want {gen}"
+
+/-- The head budget running beside a send or a query: `some g` for the pair
+(`head`, `g`), `none` for none. -/
+def expectAhead (what : String) (s : Conn.State σ) (g : Option Nat) : Check Unit := do
+  let got := if s.phase.ahead == some .head then some s.headGen else none
+  if s.phase.ahead.isSome && s.phase.ahead != some .head then fail s!"{what}: a second deadline other than a head budget"
+  if got != g then fail s!"{what}: head budget {got}, want {g}"
 
 /-- An expiry of `d` in generation `g` that must change nothing. -/
 def expectStale (what : String) (h : Server.Adapter σ) (s : Conn.State σ) (d : Conn.Deadline) (g : Nat) : Check Unit := do
@@ -290,7 +303,8 @@ def expectStale (what : String) (h : Server.Adapter σ) (s : Conn.State σ) (d :
   match a with
   | .none => pure ()
   | _ => fail s!"{what}: a stale expiry was acted on"
-  if s'.phase.deadline != s.phase.deadline || s'.gen != s.gen || s'.buf != s.buf then
+  if s'.phase.deadline != s.phase.deadline || s'.gen != s.gen || s'.headGen != s.headGen ||
+      s'.phase.ahead != s.phase.ahead || s'.buf != s.buf then
     fail s!"{what}: a stale expiry changed the state"
 
 /-- The deadlines through `Conn.step` with H1 (item ytzycm): which deadline
@@ -299,10 +313,13 @@ fragment of the same head, body or response keeps it, that an expiry of an
 older generation or of another deadline changes nothing, and that the
 current one closes, after which nothing is acted on. A pipelined request's
 head budget runs from its first byte (item dv6ikn): beside the response's
-write, as the next generation (`Phase.ahead`), from the receive that brought
-it or from its arrival in the kernel (`Event.arrived`); the end of the
-response keeps that pair, and its expiry during the write closes on a
-partial head and ends the budget on a complete one. -/
+write, as the generation after the write's (`Phase.ahead`), from the receive
+that brought it or from its arrival in the kernel (`Event.arrived`); the end
+of the response keeps that pair, and its expiry during the write closes on a
+partial head and ends the budget on a complete one. A query answered before
+that head keeps the pair too (item udpq6h): its expiry during the query
+closes the connection when the query answers if the head is partial, and
+ends the budget if it is complete. -/
 def deadlineScenario : Check Unit := do
   let h := H1Adapter.adapter {} App.Fixture.app
   let s0 := Conn.initial h
@@ -334,9 +351,13 @@ def deadlineScenario : Check Unit := do
       (Conn.step h 0 s7 (.expired .idle 3)).2 with
   | .none, .none => pure ()
   | _, _ => fail "deadlines: an event after the expiry was acted on"
-  -- The next request's first byte ends keep-alive and starts its head.
+  -- The next request's first byte ends keep-alive and starts its head, with
+  -- the generation after the period's (4).
   let (s8, _) := Conn.step h 0 s6 (.received (bytes "GET"))
-  expectDeadline "deadlines: the next head" s8 (some .head) 4
+  expectDeadline "deadlines: the next head" s8 (some .head) 5
+  let (s9, _) := Conn.step h 0 s8 (.received (bytes " / HT"))
+  expectDeadline "deadlines: more of the next head" s9 (some .head) 5
+  expectStale "deadlines: the period's generation for the next head" h s9 .head 4
   -- Pipelined: the head left over from the request's receive runs its budget
   -- beside the response, as generation 2; the reading after the response
   -- keeps that pair, so finishing the response neither starts nor resets it.
@@ -417,11 +438,43 @@ def deadlineScenario : Check Unit := do
   expectDeadline "deadlines: querying" q1 none 1
   for d in [Conn.Deadline.idle, .head, .body, .write] do
     for g in [0, 1] do expectStale "deadlines: querying" hd q1 d g
-
-def expectQuery (what : String) (a : Conn.Action) (sql : String) (params : Array (Option String)) : Check Unit :=
-  match a with
-  | .query q => if q.sql != sql || q.params != params then fail s!"{what}: asked {repr q.sql} {q.params}" else pure ()
-  | _ => fail s!"{what}: did not ask for a query"
+  -- A request left behind a response and a query (item udpq6h): its head
+  -- budget starts with the first response (generation 2) and runs beside
+  -- the query and the query's response, then the reading of the head keeps
+  -- it. Ending during the query, it closes the connection at the answer
+  -- when the head is partial, and only ends when it is complete.
+  let getH := "GET / HTTP/1.1\r\nHost: a\r\n\r\n"
+  let dbQ := "GET /db?id=1 HTTP/1.1\r\nHost: a\r\n\r\n"
+  let row : Query.Result := .rows #["id", "randomnumber"] #[#[some "1", some "2"]]
+  for complete in [false, true] do
+    let what := if complete then "deadlines: a complete head behind a query" else "deadlines: a partial head behind a query"
+    let (x1, xa1) := Conn.step hd 0 (Conn.initial hd) (.received (bytes (getH ++ dbQ ++ (if complete then getH else "GET / HTTP/1.1\r\nHo"))))
+    let some (rA, _) ← expectSend s!"{what}: the first response" xa1 | return
+    expectDeadline s!"{what}: the first response" x1 (some .write) 1
+    expectAhead s!"{what}: the first response" x1 (some 2)
+    let (x2, xa2) := Conn.step hd 0 x1 (.sent rA.size)
+    expectQuery s!"{what}: the query" xa2 "SELECT id, randomnumber FROM world WHERE id = $1" #[some "1"]
+    expectDeadline s!"{what}: the query" x2 none 2
+    expectAhead s!"{what}: the query" x2 (some 2)
+    expectStale s!"{what}: the next head generation beside the query" hd x2 .head 3
+    match Conn.step hd 0 x2 (.expired .head 2) with
+    | (x3, .none) =>
+      expectAhead s!"{what}: the budget's end during the query" x3 none
+      let (_, xa4) := Conn.step hd 0 x3 (.answered row)
+      if complete then
+        let some _ ← expectSend s!"{what}: the answer after the budget ended" xa4 | return
+      else expectClose s!"{what}: the answer after the budget lapsed" xa4
+    | _ => fail s!"{what}: the budget's end during the query was acted on"
+    let (x4, xa4) := Conn.step hd 0 x2 (.answered row)
+    let some (rQ, _) ← expectSend s!"{what}: the query's response" xa4 | return
+    if complete then
+      expectAhead s!"{what}: the query's response with the head answered" x4 none
+    else
+      expectDeadline s!"{what}: the query's response" x4 (some .write) 3
+      expectAhead s!"{what}: the query's response" x4 (some 2)
+      let (x5, xa5) := Conn.step hd 0 x4 (.sent rQ.size)
+      expectRecv s!"{what}: the head after the query's response" xa5 (inCap - "GET / HTTP/1.1\r\nHo".length)
+      expectDeadline s!"{what}: the head after the query's response" x5 (some .head) 2
 
 def statusLine (d : ByteArray) : String := ((String.fromUTF8! d).splitOn "\r\n").head!
 
@@ -1191,9 +1244,10 @@ def batchEdgeScenario : Check Unit := do
   -- as `gather` takes them (each next response while the batch stays within
   -- `maxResponseBytes` and `maxBatchRequests`): a buffer of GET / (200) and GET /nope (404) in
   -- turn, alone, or followed by an incomplete request that fills the buffer
-  -- to `inCap` exactly, whose rest is then received under its head deadline
-  -- in the period the last batch's head budget ran in (`gen + 1` of each
-  -- send, one send per batch).
+  -- to `inCap` exactly, whose rest is then received under the head budget
+  -- that started with the first batch (generation 2) and ran beside every
+  -- batch (item udpq6h); without it, keep-alive follows the last batch (one
+  -- period per send).
   let h := H1Adapter.adapter {} App.Hello.app
   let get := "GET / HTTP/1.1\r\nHost: a\r\n\r\n"
   let miss := "GET /nope HTTP/1.1\r\nHost: a\r\n\r\n"
@@ -1219,6 +1273,22 @@ def batchEdgeScenario : Check Unit := do
       | none => #[(r, 1)]).map (·.1)
     if want.size < 2 then fail s!"{what}: the responses of {reqs.size} requests fit one batch"
     let (s1, a1) := Conn.step h 0 (Conn.initial h) (.received (bytes input))
+    -- The second batch runs beside the first batch's head budget, and its
+    -- end closes when the incomplete request is behind complete ones (every
+    -- buffered head counts), and ends the budget otherwise.
+    expectAhead s!"{what}: the first batch" s1 (some 2)
+    let some (d1, _) ← expectSend s!"{what}: the first batch" a1 | return
+    let (sb, ab) := Conn.step h 0 s1 (.sent d1.size)
+    let some _ ← expectSend s!"{what}: the second batch" ab | return
+    expectDeadline s!"{what}: the second batch" sb (some .write) 2
+    expectAhead s!"{what}: the second batch" sb (some 2)
+    expectStale s!"{what}: the head generation after the second batch's" h sb .head 3
+    match Conn.step h 0 sb (.expired .head 2) with
+    | (se, .none) =>
+      if incomplete then fail s!"{what}: the head budget's end beside the second batch did not close"
+      else expectAhead s!"{what}: the head budget's end beside the second batch" se none
+    | (_, .close) => if !incomplete then fail s!"{what}: the head budget's end beside the second batch closed on complete heads"
+    | _ => fail s!"{what}: the head budget's end beside the second batch asked for an operation"
     let (sends, s2, a2) ← drain what h 8192 s1 a1
     if sends != want then
       fail s!"{what}: {sends.size} sends of {sends.map (·.size)} bytes, not the responses of {reqs.size} requests in batches of {want.map (·.size)}"
@@ -1226,7 +1296,8 @@ def batchEdgeScenario : Check Unit := do
       if byteArrayCapacity d != d.size then fail s!"{what}: capacity {byteArrayCapacity d} for {d.size} bytes"
     if s2.buf != bytes tail then fail s!"{what}: {s2.buf.size} bytes left, not the {tail.length} of the incomplete request"
     expectRecv what a2 (inCap - tail.length)
-    expectDeadline what s2 (some (if incomplete then .head else .idle)) (sends.size + 1)
+    if incomplete then expectDeadline what s2 (some .head) 2
+    else expectDeadline what s2 (some .idle) (sends.size + 1)
 
 /-! ## Values the Zig and C sources state again
 

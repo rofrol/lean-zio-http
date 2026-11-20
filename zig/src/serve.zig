@@ -9,7 +9,7 @@
 // SIGINT (docs/production-contract.md), and the per-connection deadlines'
 // timers: it arms one for the deadline and generation Lean's state names
 // after each event, and one more for the head budget a pipelined request
-// runs while a response is written (Conn.Phase.ahead), and reports their
+// runs while a response is written or a query runs (Conn.Phase.ahead), and reports their
 // end back (Conn.Event.expired). While Lean's state watches for a next
 // request's first byte (Conn.State.watches), the loop keeps a readiness
 // poll on the socket beside the send and reports it (Conn.Event.arrived);
@@ -56,7 +56,7 @@ pub const Action = extern struct {
     query: ?*anyopaque, // query: the Server.Query, owned
     deadline: u8, // the deadline of Lean's new state: deadline_*
     gen: Gen, // with a deadline: its generation, owned; null without
-    ahead: u8, // the head budget beside a send (Conn.Phase.ahead): deadline_none or deadline_head
+    ahead: u8, // the head budget beside a send or a query (Conn.Phase.ahead): deadline_none or deadline_head
     ahead_gen: Gen, // with ahead: its generation, owned; null without
     watch: u8, // 1: watch the socket for readability (Conn.State.watches)
 };
@@ -231,9 +231,11 @@ pub const Arm = struct {
     /// expiry to Lean (each arm names a pair of Lean's state, so it is
     /// current). The phase's own deadline closes
     /// (Conn.step_expired_current); the head budget beside a send closes
-    /// when that head is incomplete and otherwise ends with nothing new
+    /// when a buffered head is incomplete and otherwise ends with nothing new
     /// (Conn.step_expired_ahead_partial, step_expired_ahead_complete), and
-    /// the send goes on.
+    /// the send goes on; beside a query it always ends with nothing new and
+    /// the query goes on, its answer closing when a head was incomplete
+    /// (Conn.step_expired_query, step_answered_lapsed).
     fn timerCb(loop: *ev.Loop, c: *ev.Completion) void {
         const self: *Arm = @ptrCast(@alignCast(c.userdata.?));
         const conn = self.conn;
@@ -334,7 +336,7 @@ pub const Conn = struct {
     waiter: pg.Waiter = .{ .deliver = answered },
     /// The timer of the deadline Lean's state runs under, if any.
     arm: ?*Arm = null,
-    /// The timer of the head budget beside a send (Conn.Phase.ahead), if any.
+    /// The timer of the head budget beside a send or a query (Conn.Phase.ahead), if any.
     ahead_arm: ?*Arm = null,
     /// The next connection in the loop's ready list (`LoopCtx.ready_head`).
     ready_next: ?*Conn = null,
@@ -597,8 +599,8 @@ pub const Conn = struct {
                 self.lp.pool.submit(&self.waiter, act.query);
             },
             // `none`: nothing new, the operation in flight goes on (an
-            // arrival, or a head budget beside a send that ended on a
-            // complete head). No event after close is reported (Conn.step_close).
+            // arrival, a head budget beside a send that ended on complete
+            // heads, or one beside a query). No event after close is reported (Conn.step_close).
             action_none => if (self.cur == null) @panic("Lean answered none with no operation in flight"),
             else => @panic("Lean answered an unknown action"),
         }

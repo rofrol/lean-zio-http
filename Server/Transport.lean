@@ -9,7 +9,7 @@ exports the loop's entry points (`ekk_conn_open`, `ekk_conn_on_recv`,
 `ekk_conn_on_sent`, `ekk_conn_on_fail`, `ekk_conn_on_refused`,
 `ekk_conn_on_answer`, `ekk_conn_on_expired`, `ekk_conn_on_arrived`, the
 deadline a state runs under, `ekk_conn_deadline` and `ekk_conn_gen`, the head
-budget beside a send, `ekk_conn_ahead` and `ekk_conn_ahead_gen`, and whether
+budget beside a send or a query, `ekk_conn_ahead` and `ekk_conn_ahead_gen`, and whether
 the loop watches for a next request, `ekk_conn_watch`) through the functions below;
 the command `server_exports` writes them. -/
 
@@ -70,13 +70,13 @@ def stateDeadline (s : Conn.State σ) : UInt8 := match s.phase.deadline with
   | some d => deadlineCode d
   | none => 0
 
-/-- The head budget running beside a send (`Conn.Phase.ahead`), as the loop
-names it, 0 for none; its generation is `aheadGen`. -/
+/-- The head budget running beside a send or a query (`Conn.Phase.ahead`),
+as the loop names it, 0 for none; its generation is `aheadGen`. -/
 def stateAhead (s : Conn.State σ) : UInt8 := match s.phase.ahead with
   | some d => deadlineCode d
   | none => 0
 
-def aheadGen (s : Conn.State σ) : Nat := s.gen + 1
+def aheadGen (s : Conn.State σ) : Nat := s.headGen
 
 /-- The timer the loop armed for deadline `kind` (as `stateDeadline` named it)
 in generation `gen` ended. The loop passes back only a pair it was given, so
@@ -108,7 +108,7 @@ macro "server_exports " adapter:term : command => `(
       Server.Transport.ConnState $adapter × Server.Conn.Action := Server.Transport.onExpired $adapter s kind gen
   @[export ekk_conn_deadline] def deadline (s : Server.Transport.ConnState $adapter) : UInt8 :=
     Server.Transport.stateDeadline s
-  @[export ekk_conn_gen] def gen (s : Server.Transport.ConnState $adapter) : Nat := s.gen
+  @[export ekk_conn_gen] def gen (s : Server.Transport.ConnState $adapter) : Nat := s.dgen
   @[export ekk_conn_on_arrived] def onArrived (s : Server.Transport.ConnState $adapter) :
       Server.Transport.ConnState $adapter × Server.Conn.Action := Server.Transport.onArrived $adapter s
   @[export ekk_conn_ahead] def ahead (s : Server.Transport.ConnState $adapter) : UInt8 :=
@@ -142,8 +142,8 @@ structure Options where
   idle: 60 s from the end of a response to the next request's first byte. -/
   idleMs : Nat := 60000
   /-- A request's head: 10 s, from accept for the first request and from its
-  first byte for a later one, also while the response before it is sent
-  (`Conn.Phase.ahead`); bytes do not extend it. -/
+  first byte for a later one, also while the responses and queries before it
+  are answered (`Conn.Phase.ahead`); bytes do not extend it. -/
   headMs : Nat := 10000
   /-- A request's body: 30 s from the acceptance of its head. -/
   bodyMs : Nat := 30000

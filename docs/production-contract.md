@@ -50,16 +50,19 @@
   `Connection: close` (`Server.Response.check`). Streaming larger bodies is
   not offered; it would change the handler interface.
 - **Deadlines.** Each connection has one deadline at a time, set by its
-  phase, and while it writes a response, also the head budget of a request
-  pipelined behind it; when one passes, the connection closes silently: no
+  phase, and while it writes a response or waits for a query, also the head
+  budget of a request pipelined behind it; when one passes, the connection closes silently: no
   408, and bytes already sent stay sent. Every budget is a peer's budget,
   configurable from 1 ms to below 2^32 ms (another value: exit status 2):
   keep-alive idle `--idle-ms` 60,000 (nginx's `keepalive_timeout` default is
   75 s), from the end of a response with nothing buffered to the next byte;
   request head `--head-ms` 10,000 (H2O's header timeout), absolute, from the
   accept for the first request and from its first byte for a later one, also
-  while the previous response is still being written (`Conn.Phase.ahead`;
-  the end of that response keeps the period, `Conn.step_sent_handoff`); body
+  while the responses and queries before it are still answered
+  (`Conn.Phase.ahead`): the period that started with the first of them runs
+  on across every later response, batch and query, and the end of the last
+  response keeps it (item udpq6h; `Conn.step_keeps_head`,
+  `Conn.step_sent_handoff`); body
   `--body-ms` 30,000 from the head's acceptance, across an interim
   `100 Continue`; response write `--write-ms` 30,000 from the start of each
   response. A connection waiting for a query runs under no deadline of its
@@ -81,14 +84,19 @@
   registration ([PostgreSQL measurements](reports/postgresql-throughput.md) measure that
   cost on macOS), which a
   poll on every keep-alive response would add to each request.
+  Bytes in the server's buffer behind a query keep their head budget
+  running beside it; when it ends during the query, the connection closes
+  when the query answers (the loop cannot cancel a query) if a buffered head
+  is incomplete (`Conn.step_expired_query`, `Conn.step_answered_lapsed`).
   Bytes that arrive while a query runs are seen when its response starts, so
   that head's budget starts late by at most the time the handler's queries
   take, each bounded by its completion deadline: for a request pipelined
   behind a query, the query deadlines bound how late its head budget starts;
   they do not make that budget absolute from the head's first byte. When the
-  head budget ends during the write and the next request's head is already
-  complete in the server's buffer, the budget ends without a close
-  (`Conn.step_expired_ahead_complete`); a head still in the kernel is not
+  head budget ends during the write and every request head in the server's
+  buffer is complete, the budget ends without a close
+  (`Conn.step_expired_ahead_complete`); an incomplete one behind complete
+  ones closes, also in the middle of a send; a head still in the kernel is not
   read before the response is written, so it closes even when complete
   (`Conn.step_expired_ahead_partial` covers the partial head). Which of a due timer and
   a ready receive or send wins is the order zio runs their callbacks in; an
