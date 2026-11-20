@@ -791,11 +791,16 @@ each part to its largest. -/
 (shared, initialization-time) objects left out: `test/retained.c`. -/
 @[extern "lsrv_retained_bytes"] opaque retainedBytes {α : Type} (x : @& α) : Nat
 
+/-- The block of a `ByteArray` of capacity at most 2 × `inCap` (an append
+that runs out doubles the size it needs): the connection's buffer after a
+growth, and the adapter's copy of it. `blocksAgree` measures it. -/
+def grownBufferBlock : Nat := 40960
 /-- The machine's input: at most `inCap` bytes, with capacity at most twice
-that (an append that runs out doubles the size it needs), a 40,960-byte block,
-and the iterator's 24-byte constructor. -/
-def inputBound : Nat := 40960 + 24
-/-- The body pulled so far: under `maxBodyBytes`, capacity at most twice. -/
+that, a `grownBufferBlock`, and the iterator's constructor. -/
+def iteratorBytes : Nat := 24
+def inputBound : Nat := grownBufferBlock + iteratorBytes
+/-- The body pulled so far: under `maxBodyBytes`, capacity at most twice, a
+block `blocksAgree` measures. -/
 def bodyBound : Nat := 20480
 /-- A block holding an object of `x` bytes: at most `x + x/4 + 7`. -/
 def block (x : Nat) : Nat := x + x / 4 + 7
@@ -814,11 +819,18 @@ most five strings (32-byte header, its bytes and NUL): at most 49 each plus
 `maxUriLength`. The arrays of segments and parameters have capacity at most
 twice their size, 8 bytes per slot after a 24-byte header; 512 for the
 target's own constructors (target, URI, path, authority, user info, port,
-host and the `some`s around them). -/
-def targetBound : Nat :=
-  37 * H1Adapter.maxPathSegments + 114 * H1Adapter.maxQueryParams + 5 * 49
-    + (5 * H1Adapter.config.maxUriLength) / 4
-    + block (24 + 16 * H1Adapter.maxPathSegments) + block (24 + 16 * H1Adapter.maxQueryParams) + 512
+host and the `some`s around them). The terms in the order docs/memory.md
+prints them (`memoryDocAgrees`). -/
+def segmentFixed : Nat := 37
+def paramFixed : Nat := 114
+def targetStrings : Nat := 5
+def stringFixed : Nat := 49
+def targetCtors : Nat := 512
+def targetTerms : List Nat :=
+  [segmentFixed * H1Adapter.maxPathSegments, paramFixed * H1Adapter.maxQueryParams, targetStrings * stringFixed,
+   (5 * H1Adapter.config.maxUriLength) / 4,
+   block (24 + 16 * H1Adapter.maxPathSegments), block (24 + 16 * H1Adapter.maxQueryParams), targetCtors]
+def targetBound : Nat := targetTerms.sum
 /-- The header fields: at most `maxHeaders` pairs (24 bytes each) in an array
 of capacity 126 (1,280 bytes), a 16-byte wrapper, and a name and a value
 string each, whose bytes total at most `maxHeadBytes`; a string is a 32-byte
@@ -831,6 +843,26 @@ def headersBound : Nat :=
 message head. -/
 def fixedBound : Nat := 1024
 def adapterBound : Nat := inputBound + bodyBound + targetBound + headersBound + fixedBound
+
+/-- The loop's connection: a 16,712-byte `Conn` (Zig's `@sizeOf`) from
+`std.heap.c_allocator`, a 20,480-byte malloc block (`heap -s` on the M1,
+docs/memory.md); stated, not measured here. -/
+def connBlock : Nat := 20480
+/-- The buffer while a final response is sent: an exact copy of under
+`recv_cap` bytes (`zig/src/serve.zig`), a block `blocksAgree` measures. -/
+def sendBufferBlock : Nat := 10240
+/-- A response or a batch: capacity at most `maxResponseBytes`, a block
+`blocksAgree` measures. -/
+def responseBlock : Nat := 81920
+/-- What a connection holds while reading: the connection, a grown buffer and
+H1's state, the most of any state. -/
+def readingBound : Nat := connBlock + grownBufferBlock + adapterBound
+/-- What a connection holds while sending a final response, the adapter at
+its shared `init`; `bench/boundary`'s `sendingBound` adds an allowance to it. -/
+def sendingBytes : Nat := connBlock + sendBufferBlock + responseBlock
+/-- What `bench/boundary` allows over `sendingBytes` for the state's small Lean
+objects and the allocators' metadata; not derived. -/
+def sendingAllowance : Nat := 2048
 
 /-- `s` repeated `n` times. -/
 def rep (s : String) (n : Nat) : String := String.join (List.replicate n s)
@@ -908,7 +940,7 @@ def expectedWrite (now : Nat) (r : Response) (close headOnly : Bool) : ByteArray
 /-- `Response.write` gives an array whose capacity is its size, with heads
 shorter and longer than the scratch 192 bytes and responses of exactly
 `maxResponseBytes`, bytes as `expectedWrite` spells them; a response at the
-limit is one 81,920-byte block (docs/memory.md). -/
+limit is one `responseBlock` (docs/memory.md). -/
 def responseCapacityScenario : Check Unit := do
   let now := 253402300799
   for (what, fs) in [("a short head", #[Response.contentType]),
@@ -932,8 +964,8 @@ def responseCapacityScenario : Check Unit := do
             fail s!"response capacity, {what}, {status} body {body.size} close {close} head {headOnly}: capacity {cap} for {out.size} bytes"
           if body.size == atLimit && !headOnly then
             if out.size != maxResponseBytes then fail s!"response capacity, {what}, close {close}: {out.size} bytes at the limit"
-            if retainedBytes out != 81920 then
-              fail s!"response capacity, {what}, close {close}: a {retainedBytes out}-byte block at the limit, want 81,920"
+            if retainedBytes out != responseBlock then
+              fail s!"response capacity, {what}, close {close}: a {retainedBytes out}-byte block at the limit, want {responseBlock}"
 
 /-! ## A receive appends in place (item l46evh) -/
 
@@ -1144,7 +1176,7 @@ def batchScenario : Check Unit := do
   expectQuery "batch: the query after the batch" qa2 "SELECT id, randomnumber FROM world WHERE id = $1" #[some "1"]
   if q2.buf != bytes get then fail "batch: the request after the query was consumed"
   -- The bound: a batch of exactly `maxResponseBytes` is one send, held in
-  -- one 81,920-byte block (docs/memory.md); a byte more is two sends.
+  -- one `responseBlock` (docs/memory.md); a byte more is two sends.
   let hf := H1Adapter.adapter {} App.Fixture.app
   let echo (n : Nat) := s!"POST /echo HTTP/1.1\r\nHost: a\r\nContent-Length: {n}\r\n\r\n" ++ big n
   let some rBig := aloneResponse hf get | fail "batch: the fixture's GET / alone"; return
@@ -1160,7 +1192,7 @@ def batchScenario : Check Unit := do
     expectRecv s!"batch: after {rBig.size} + {rEcho.size} bytes" ba2 inCap
     if sends == 1 then
       if let .send d _ := ba1 then
-        if d.size != maxResponseBytes || byteArrayCapacity d != d.size || retainedBytes d != 81920 then
+        if d.size != maxResponseBytes || byteArrayCapacity d != d.size || retainedBytes d != responseBlock then
           fail s!"batch at the bound: {d.size} bytes, capacity {byteArrayCapacity d}, a {retainedBytes d}-byte block"
   -- Backpressure: a buffer filled with requests is answered in sends of at
   -- most `maxResponseBytes`, all before the next receive.
@@ -1405,7 +1437,8 @@ def transportCodesAgree : Check Unit := do
 /-- The Go programs `check.sh` runs state values of the server again, each a
 `const NAME = VALUE` line: the request limits (`Server.Wire`,
 `H1Adapter`), the transport's receive and send buffers (`recv_cap` and
-`out_cap` of `serve.zig`, read from it), the size of `App.Fixture.body` and the query of `App.Db`.
+`out_cap` of `serve.zig`, read from it), the blocks of a connection sending a
+final response with `bench/boundary`'s allowance (`sendingBound`, in KiB), the size of `App.Fixture.body` and the query of `App.Db`.
 That body takes several sends and ends with a short one (App/Fixture.lean)
 only while it is longer than `out_cap` and no multiple of it. -/
 def benchValuesAgree : Check Unit := do
@@ -1418,7 +1451,9 @@ def benchValuesAgree : Check Unit := do
   for (n, v) in limits do goConst "bench/check/main.go" n v
   let boundary : System.FilePath := "bench/boundary/main.go"
   for (n, v) in limits ++ [("maxHeaders", maxHeaders), ("maxPathSegments", H1Adapter.maxPathSegments),
-      ("maxQueryParams", H1Adapter.maxQueryParams), ("bodySize", App.Fixture.body.size)] do
+      ("maxQueryParams", H1Adapter.maxQueryParams), ("bodySize", App.Fixture.body.size),
+      -- In KiB, rounded up, so that the Go bound is never below the bytes.
+      ("sendingBound", (sendingBytes + sendingAllowance + 1023) / 1024)] do
     goConst boundary n v
   if let some c := recvCap then goConst boundary "recvCap" c
   if let some c := outCap then goConst boundary "outCap" c
@@ -1429,6 +1464,100 @@ def benchValuesAgree : Check Unit := do
   if let some c := outCap then
     if App.Fixture.body.size ≤ c || App.Fixture.body.size % c == 0 then
       fail s!"bench values: App.Fixture.body has {App.Fixture.body.size} bytes, not over out_cap ({c}) and no multiple of it"
+
+/-! ## The memory bounds the documents print
+
+docs/memory.md derives a connection's memory from the definitions of "The H1
+adapter's retained state" and prints the numbers; README.md repeats the
+total. `blocksAgree` measures the blocks those definitions state, and
+`memoryDocAgrees` checks that the documents print what the definitions give. -/
+
+/-- The block of a `ByteArray` allocated with capacity `cap`, and its capacity. -/
+@[noinline] def capacityBlock (cap : Nat) : Nat × Nat :=
+  let a := ByteArray.emptyWithCapacity cap
+  (retainedBytes a, byteArrayCapacity a)
+
+/-- Each block size the bounds use, measured as the block of a `ByteArray` of
+the largest capacity the bound allows (block sizes grow with the capacity).
+`connBlock`, a malloc block of the Zig side, is not measured here. -/
+def blocksAgree : Check Unit := do
+  let recvCap ← definedNat "blocks" "zig/src/serve.zig" "const" "recv_cap" "const recv_cap = " ";"
+  let sendCap := recvCap.map (· - 1)
+  for (name, cap?, want) in [("grownBufferBlock", some (2 * inCap), grownBufferBlock),
+      ("bodyBound", some (2 * (maxBodyBytes - 1)), bodyBound),
+      ("sendBufferBlock", sendCap, sendBufferBlock), ("responseBlock", some maxResponseBytes, responseBlock)] do
+    if let some cap := cap? then
+      let (got, gotCap) := capacityBlock cap
+      if gotCap != cap then fail s!"blocks: {name}: capacity {gotCap} asked {cap}"
+      if got != want then fail s!"blocks: {name}: a capacity of {cap} takes a {got}-byte block, want {want}"
+
+/-- `n` with a comma between thousands, as the documents print it. -/
+def commas (n : Nat) : String :=
+  if n < 1000 then toString n
+  else
+    let r := toString (n % 1000)
+    s!"{commas (n / 1000)},{"".pushn '0' (3 - r.length)}{r}"
+
+/-- `n` bytes in KiB, to a tenth unless whole. -/
+def kib (n : Nat) : String :=
+  let t := (n * 10 + 512) / 1024
+  if t % 10 == 0 then toString (t / 10) else s!"{t / 10}.{t % 10}"
+
+/-- `n` bytes in GiB, to a hundredth. -/
+def gib (n : Nat) : String :=
+  let h := (n * 100 + 2 ^ 29) / 2 ^ 30
+  let f := toString (h % 100)
+  s!"{h / 100}.{"".pushn '0' (2 - f.length)}{f}"
+
+/-- Each document prints each phrase, built from the definitions, with runs
+of whitespace (line breaks included) read as one space; and each of the
+numbers only these bounds give appears in it exactly as often as in its
+phrases, so that no other copy of it can go stale. -/
+def memoryDocAgrees : Check Unit := do
+  let recvCap ← definedNat "memory doc" "zig/src/serve.zig" "const" "recv_cap" "const recv_cap = " ";"
+  let c := commas
+  let conns := ({} : Transport.Options).maxConns
+  let (ns, nq) := (H1Adapter.maxPathSegments, H1Adapter.maxQueryParams)
+  let terms := (targetTerms.drop 3).map c
+  let memory := [
+    s!"most {c readingBound} bytes ({kib readingBound} KiB) of live blocks",
+    s!"{gib (readingBound * conns)} GiB at the default {c conns} connections",
+    s!"`inCap` = {c inCap} bytes", s!"`maxResponseBytes` = {c maxResponseBytes}.",
+    s!"a {c connBlock}-byte malloc block",
+    s!"2 × `inCap` = {c (2 * inCap)}: a block of at most {c grownBufferBlock} bytes",
+    s!"capacity is at most {c maxResponseBytes}: a block of at most {c responseBlock} bytes",
+    s!"exactly {c maxResponseBytes} bytes: one {c responseBlock}-byte block",
+    s!"at most {c connBlock} + {c grownBufferBlock} = {c (connBlock + grownBufferBlock)} bytes, plus the adapter's state, with H1 at most {c adapterBound} (below): {c readingBound} bytes ({kib readingBound} KiB)",
+    s!"at most {c connBlock} + {c sendBufferBlock} + {c responseBlock} = {c sendingBytes} bytes ({kib sendingBytes} KiB)",
+    s!"a block of at most {c grownBufferBlock}, and a {iteratorBytes}-byte iterator",
+    s!"under `maxBodyBytes`, a block of at most {c bodyBound};",
+    s!"until the request completes: at most {c targetBound}.",
+    s!"`maxPathSegments` = {c ns} path segments and `maxQueryParams` = {c nq} query parameters",
+    s!"`maxUriLength` = {c H1Adapter.config.maxUriLength}.",
+    s!"{segmentFixed} × {c ns} + {paramFixed} × {c nq} + {targetStrings} × {stringFixed} + {" + ".intercalate terms};",
+    s!"at most {segmentFixed} bytes plus 5/4 of its bytes", s!"at most {paramFixed} plus 5/4 of its bytes",
+    s!"strings, {stringFixed} each plus 5/4 of their bytes", s!"constructors take {targetCtors}:",
+    s!"`maxHeaders` = {c maxHeaders} pairs of a name and a value string, whose bytes total at most `maxHeadBytes`: at most {c headersBound};",
+    s!"writer and head: at most {c fixedBound}.",
+    s!"In all at most {c adapterBound} bytes ({kib adapterBound} KiB).",
+    s!"against the {kib sendingBytes} KiB derived above plus an allowance of {kib sendingAllowance} KiB"] ++
+    (recvCap.map fun r => s!"under {c r} bytes (below), copied exactly: a block of at most {c sendBufferBlock}.").toList
+  let readme := [s!"at most about {kib readingBound} KiB of live blocks",
+    s!"(at most {c ns} path segments and {c nq} query parameters; more get 414)"]
+  let own := [c readingBound, kib readingBound, c adapterBound, kib adapterBound, c targetBound,
+    c headersBound, c sendingBytes, c (connBlock + grownBufferBlock), c grownBufferBlock, c responseBlock]
+  for (file, phrases) in [("docs/memory.md", memory), ("README.md", readme)] do
+    match ← (IO.FS.readFile file).toBaseIO with
+    | .error e => fail s!"memory doc: cannot read {file}: {e}"
+    | .ok src =>
+      let text := " ".intercalate ((src.splitToList Char.isWhitespace).filter (· ≠ ""))
+      let count (t n : String) := (t.splitOn n).length - 1
+      for p in phrases do
+        unless count text p > 0 do fail s!"memory doc: {file} does not print `{p}`"
+      for n in own do
+        let want := (phrases.map (count · n)).sum
+        if count text n != want then
+          fail s!"memory doc: {file} prints {n} {count text n} times, {want} of them in the phrases checked"
 
 /-- Pins stated in more than one file, each copy checked against its source
 of truth: linux/Dockerfile's debian:trixie digest in the two images of
@@ -1523,6 +1652,8 @@ def main : IO UInt32 := do
     transportCodesAgree
     errorStatusAgrees
     benchValuesAgree
+    blocksAgree
+    memoryDocAgrees
     pinsAgree
     rawTargetCases
     retainedScenario

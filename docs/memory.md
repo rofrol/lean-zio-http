@@ -12,6 +12,14 @@ target's path segments and query parameters (2026-11-19), which replaced the
 statement of about 98 KiB per connection, withdrawn when the adapter's state
 was measured.
 
+The derived numbers below have one source each, the definitions in
+`Test.lean`, "The H1 adapter's retained state" (`readingBound`,
+`sendingBytes`, `adapterBound` and their parts); `lsrv-test` checks that this
+document and README.md print what they give (`memoryDocAgrees`), measures the
+mimalloc blocks they state (`blocksAgree`; the malloc block of the loop's
+connection is stated, not measured), and checks `bench/boundary`'s
+`sendingBound` against them (`benchValuesAgree`).
+
 **Lengths** (proved, `Conn.step_inv`): the Lean buffer of unconsumed bytes
 holds at most `inCap` = 16,388 bytes and a response being sent at most
 `maxResponseBytes` = 65,536.
