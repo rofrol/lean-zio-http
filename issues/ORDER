@@ -1,6 +1,5 @@
 ## Next, in order
 
-ciuzai Fail zsrvTarget's Linux build when the Lean toolchain has no lib/glibc/libc.so instead of building for the host
 6lqxi5 Wait for perf record's acknowledgement that it records before bench/arena/local-inner.sh runs the load
 2re4bg Reconcile docs/memory.md's "at least 7,300 bytes buffered" with bench/boundary's sending scenario, which printed 6,734 and 6,761 on 2026-11-20
 
