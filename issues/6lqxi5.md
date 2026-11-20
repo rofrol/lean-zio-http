@@ -23,3 +23,5 @@ it predates cmb7vk.
   exited and was reaped before the SIGINT, a reused pid would take the
   signal instead of the "exited before SIGINT" branch. Whether to accept
   that for the diagnostic is part of this item.
+
+Approved by the models under the user's delegation of 2026-11-20 to decide the queue (consult round 20261120-183340-59f4; sol call 07e46b10, hydrogen call a8d8e1d1), both agreeing: option (a), perf's enable acknowledgement as the positive event before the load, or the supervisor's recorded exit aborting the sample; stress the early-exit case without a FIFO deadlock (sol: signal through stable process handles, not recycled pids).
