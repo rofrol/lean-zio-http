@@ -11,6 +11,7 @@ cmb7vk Stop discarding bpftrace's and perf's exit statuses in bench/arena/local-
 
 q2g4am Act on leanprover/lean4's answers to the Std.Http questions 16522 and 16523
 o3rltf Decide whether bytes pipelined behind a request that got 100 Continue start their head budget at their receive
+ciuzai Fail zsrvTarget's Linux build when the Lean toolchain has no lib/glibc/libc.so instead of building for the host
 
 ## Needs a decision
 
