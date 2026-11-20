@@ -1,6 +1,5 @@
 ## Next, in order
 
-fbqrqb Run bench/arena/build.sh and local.sh end to end on the run-scoped image tags, and record amjip6's accepted limits
 cmb7vk Stop discarding bpftrace's and perf's exit statuses in bench/arena/local-inner.sh
 
 ## Proposed
@@ -9,6 +8,7 @@ q2g4am Act on leanprover/lean4's answers to the Std.Http questions 16522 and 165
 o3rltf Decide whether bytes pipelined behind a request that got 100 Continue start their head budget at their receive
 ciuzai Fail zsrvTarget's Linux build when the Lean toolchain has no lib/glibc/libc.so instead of building for the host
 2re4bg Reconcile docs/memory.md's "at least 7,300 bytes buffered" with bench/boundary's sending scenario, which printed 6,734 and 6,761 on 2026-11-20
+oe6mbs Quiet bench/arena/local.sh's tar warnings and "Terminated" lines, and name where its HttpArena checkout lives
 
 ## Needs a decision
 
