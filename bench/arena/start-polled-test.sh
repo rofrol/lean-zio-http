@@ -1,5 +1,5 @@
 #!/bin/sh
-# The check of start-polled.sh (item 4fued7), which ./check.sh runs; it needs
+# The check of start-polled.sh (items 4fued7, cmb7vk), which ./check.sh runs; it needs
 # only a POSIX shell. A stand-in curl on PATH fails until its OK_AT-th call
 # (never with OK_AT=0) and counts its calls, so no network is used.
 # - An early exit: a server that exits 7 at once, never answering. The wait
@@ -63,4 +63,15 @@ wait "$reap" || status=$?
 pid=
 [ $status -eq 143 ] || fail "readiness: the supervisor exited $status after SIGTERM to the server, want 143"
 [ "$(cat "$scratch/exit")" = 143 ] || fail "readiness: the supervisor recorded $(cat "$scratch/exit"), want 143"
+# start_supervised alone, as local-inner.sh starts bpftrace: readiness is
+# CMD's own output, and the record must hold CMD's status, not the
+# supervisor's shell's.
+start_supervised "$scratch" "$scratch/sv.log" sh -c 'echo sv-out; exit 3' >"$scratch/sv.out" ||
+  fail "start_supervised failed: $(cat "$scratch/sv.out")"
+[ "$sv_pid" != "$sv_reap" ] || fail "start_supervised: sv_pid is the supervisor's"
+status=0
+wait "$sv_reap" || status=$?
+[ $status -eq 3 ] || fail "start_supervised: the supervisor exited $status, want 3"
+[ "$(cat "$scratch/exit")" = 3 ] || fail "start_supervised: the supervisor recorded $(cat "$scratch/exit"), want 3"
+[ "$(cat "$scratch/sv.log")" = sv-out ] || fail "start_supervised: the log holds: $(cat "$scratch/sv.log")"
 echo "start-polled-test: ok"

@@ -122,3 +122,30 @@ when about half the connections were accepted during the load; the median
 rose as in the diagnostic build, since twice the connections share the two
 CPUs. Item dtlin3 re-measured the VPS after the fix
 ([HttpArena on the VPS](httparena-vps.md)).
+
+## The tracers' exit statuses (item cmb7vk, 2026-11-20)
+
+`local-inner.sh` used to discard bpftrace's and perf record's exit statuses
+after the SIGINT that ends them. Measured on 2026-11-20 in local.sh's
+privileged container (`local.Dockerfile`: bpftrace 0.23.2, perf 6.12.117,
+dash 0.5.12) in OrbStack's arm64 VM on the M1 (kernel 7.2.12), each tool
+started from dash in the background and signalled by it:
+
+| tool and case | exit status |
+|---|---:|
+| bpftrace, SIGINT once its probes are attached (after BEGIN ran; `trace.bt` with a BEGIN added, and a `-e` script) | 0, maps printed |
+| bpftrace, SIGINT while it attaches (after "Attaching N probes...", before BEGIN; 4 of 4 runs) | 255, nothing else printed |
+| bpftrace, a script error | 1 |
+| bpftrace, SIGKILL | 137 |
+| perf record -q -F 999 -g -p PID, SIGINT while recording | 130, data written (977 and 985 samples) |
+| perf record, its target exits first | 0 |
+| perf record, no such PID | 244 |
+| perf record, output path unwritable | 255 |
+
+`local-inner.sh` now requires 0 from bpftrace and 130 from perf record after
+its SIGINT, and stops the run with the status otherwise; bpftrace runs under
+start-polled.sh's supervisor (`start_supervised`), whose record of its exit
+ends the wait for its attach with that status. `PERF=1 bench/arena/local.sh`
+then ran one round end to end at commit 648ef2e plus this change, with every
+check passing and a profile of each lsrv-arena sample. Its figures are not
+recorded: the change touches only the tracers' handling.
