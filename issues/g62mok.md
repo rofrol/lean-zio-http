@@ -7,3 +7,5 @@ Options considered: run the same A/B (two lsrv-db builds differing only in `Slot
 Decided 2026-11-19 by the coordinating session with sol and hydrogen (consult round 20261119-131820-9a89; calls 2457b2df, db84fdb7) under the user's delegation to decide the next items with the models: needs the owner (VPS load).
 Question: How much Linux evidence for the pool's peek against NetPoll?
 Options: container A/B only, then decide | container and VPS A/B (your go for VPS load) | keep peek and note Linux unmeasured
+
+Decided 2026-11-20 by the coordinating session with sol and hydrogen (consult round 20261120-024100-ec06; calls 722834f8, e97c0537) at the user's request to set the queue with the models: approved into Next, third, limited to the container A/B (sol approved it; hydrogen also wants the VPS, which needs the owner): production stays unchanged, results labelled as preliminary under host contention; whether to add the VPS A/B is asked afterwards.
