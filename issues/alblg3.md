@@ -9,5 +9,5 @@ Needs a decision (meant for "Needs a decision"; rr2 files proposals under "Propo
 
 Documented (no decision needed): point 1 (lean_initialize_thread/lean_finalize_thread: Reference Manual, FFI, "Initialization"; the hand declaration's signature is checked against the pinned runtime only) and point 5's `abort` (C11 7.1.4p2). Point 4 was measured; see the separate proposal about Linux.
 
-Question: For points 2, 3, 5 and 6 (each may differ), approve a supported-subset contract, ask upstream, or stop relying on it?
-Options: approve supported-subset contracts for all four (recommended: guards exist, each is rechecked at updates) | ask zio upstream about points 2 and 3 (outward, your go) | stop relying where possible (point 5: use lean.h's declaration)
+
+Decided by the models under the user's delegation of 2026-11-20 to decide the queue (consult round 20261120-155056-df17; sol call 421584d0, hydrogen call 69355b88), both agreeing: approve supported-subset contracts for points 2, 3, 5 and 6, each written next to our code with the pinned version's implementation and tests as references, marked as not an upstream guarantee and rechecked at each dependency update; for point 5 use lean.h's own declaration where it exists (first check that lean.h still declares mi_usable_size). This unblocks rvi53e and gihgde.
