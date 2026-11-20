@@ -12,6 +12,9 @@
 #   server's process: SIGTERM to pid ends it, and the supervisor records and
 #   returns 128 + 15. The supervisor's shell may report that SIGTERM on
 #   stderr ("Terminated"): it is this case's own signal.
+# - bpftrace's stop fifo and perf record's control protocol (item 6lqxi5),
+#   with grep and a stand-in, below. The shell may report the SIGKILL of the
+#   "wrapper killed" case on stderr ("Killed"): it is that case's own signal.
 set -eu
 here=$(cd "$(dirname "$0")" && pwd)
 scratch=$(mktemp -d)
@@ -74,4 +77,86 @@ wait "$sv_reap" || status=$?
 [ $status -eq 3 ] || fail "start_supervised: the supervisor exited $status, want 3"
 [ "$(cat "$scratch/exit")" = 3 ] || fail "start_supervised: the supervisor recorded $(cat "$scratch/exit"), want 3"
 [ "$(cat "$scratch/sv.log")" = sv-out ] || fail "start_supervised: the log holds: $(cat "$scratch/sv.log")"
+
+# bpftrace's stop in local-inner.sh: its -c command, grep, ends on the line
+# "stop" written to a fifo the caller holds read-write. Written here before
+# grep starts, so the line must wait in the fifo for grep's open.
+mkfifo "$scratch/stop"
+exec 6<>"$scratch/stop"
+echo stop >&6
+start_supervised "$scratch" "$scratch/stop.log" grep -qx stop "$scratch/stop" >"$scratch/stop.out" ||
+  fail "stop fifo: start_supervised failed: $(cat "$scratch/stop.out")"
+status=0
+wait "$sv_reap" || status=$?
+exec 6>&-
+[ $status -eq 0 ] || fail "stop fifo: grep exited $status, want 0"
+
+# start_controlled and stop_controlled, as local-inner.sh drives perf record:
+# a stand-in takes its commands on DIR/ctl and answers on DIR/ack, as MODE
+# says; every exit, early or late, must end the caller's wait with the
+# stand-in's status, and an exit before the "ack" fails even with status 0.
+cat >"$scratch/bin/ctlstub" <<'EOF'
+#!/bin/sh
+mode=$1
+[ "$mode" != early ] || { echo early-out; exit 7; }
+exec 7<"$2" 8>"$3"
+while IFS= read -r c <&7; do
+  case $mode:$c in
+    noack:enable | nostopack:stop) exit 0 ;;
+    bogus:stop) echo bogus >&8; exit 6 ;;
+    *:enable) echo ack >&8; [ "$mode" != dies ] || exit 3 ;;
+    *:stop) echo ack >&8; [ "$mode" != failafterstop ] || exit 5; exit 0 ;;
+  esac
+done
+exit 9
+EOF
+chmod +x "$scratch/bin/ctlstub"
+ctl() { start_controlled "$scratch" "$scratch/ctl.log" ctlstub "$1" "$scratch/ctl" "$scratch/ack"; }
+# Exits 7 before it opens either fifo.
+status=0; ctl early || status=$?
+[ $status -eq 1 ] && [ "$sc_exit" = 7 ] || fail "early: start_controlled returned $status, sc_exit $sc_exit; want 1 and 7"
+status=0; wait "$sc_reap" || status=$?
+[ $status -eq 7 ] || fail "early: the wrapper exited $status, want 7"
+[ "$(cat "$scratch/ctl.log")" = early-out ] || fail "early: the log holds: $(cat "$scratch/ctl.log")"
+exec 4>&- 5>&-
+# Reads "enable", exits 0 without acknowledging it.
+status=0; ctl noack || status=$?
+[ $status -eq 1 ] && [ "$sc_exit" = 0 ] || fail "noack: start_controlled returned $status, sc_exit $sc_exit; want 1 and 0"
+wait "$sc_reap" || true
+exec 4>&- 5>&-
+# Acknowledges "enable" and "stop", then exits 0.
+ctl ok || fail "ok: start_controlled failed, sc_exit $sc_exit"
+stop_controlled || fail "ok: stop_controlled failed, sc_exit $sc_exit"
+[ "$sc_exit" = 0 ] || fail "ok: sc_exit $sc_exit, want 0"
+# Acknowledges "enable", then exits 3 before the stop. Started outside an
+# `||` list, so set -e holds in the wrapper: its record must still come.
+ctl dies
+status=0; stop_controlled || status=$?
+[ $status -eq 1 ] && [ "$sc_exit" = 3 ] || fail "dies: stop_controlled returned $status, sc_exit $sc_exit; want 1 and 3"
+# Exits 0 on "stop" without acknowledging it.
+ctl nostopack || fail "nostopack: start_controlled failed, sc_exit $sc_exit"
+status=0; stop_controlled || status=$?
+[ $status -eq 1 ] && [ "$sc_exit" = 0 ] || fail "nostopack: stop_controlled returned $status, sc_exit $sc_exit; want 1 and 0"
+# Acknowledges "stop", then exits 5.
+ctl failafterstop || fail "failafterstop: start_controlled failed, sc_exit $sc_exit"
+status=0; stop_controlled || status=$?
+[ $status -eq 1 ] && [ "$sc_exit" = 5 ] || fail "failafterstop: stop_controlled returned $status, sc_exit $sc_exit; want 1 and 5"
+# Answers "stop" with something else, then exits 6: the answer, not the
+# status behind it, is what the caller must report.
+ctl bogus || fail "bogus: start_controlled failed, sc_exit $sc_exit"
+status=0; stop_controlled || status=$?
+[ $status -eq 1 ] && [ "$sc_exit" = 'unknown (it answered "bogus" to stop)' ] ||
+  fail "bogus: stop_controlled returned $status, sc_exit $sc_exit"
+# The wrapper killed while the stand-in runs, so no record comes: once the
+# stand-in exits (on "stop", unacknowledged), the read ends at the end of
+# file instead of waiting.
+ctl nostopack || fail "wrapper killed: start_controlled failed, sc_exit $sc_exit"
+kill -KILL "$sc_reap"
+status=0; wait "$sc_reap" || status=$?
+[ $status -eq 137 ] || fail "wrapper killed: the wrapper exited $status, want 137"
+status=0; stop_controlled || status=$?
+case $status:$sc_exit in
+  "1:unknown ($scratch/ack ended without the wrapper's record)") ;;
+  *) fail "wrapper killed: stop_controlled returned $status, sc_exit $sc_exit" ;;
+esac
 echo "start-polled-test: ok"

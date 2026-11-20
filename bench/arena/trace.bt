@@ -1,7 +1,8 @@
 // bench/arena/local-inner.sh runs this beside each sample (item 6p6tu6;
 // docs/reports/over-5s-tail.md). $1: the server's
 // process name, of which the first 6 characters are compared; $2: the inode
-// of the sample's network namespace (the kernel probes see every namespace).
+// of the sample's network namespace (the kernel probes see every namespace);
+// $3: the process name of the command bpftrace runs with -c (below).
 //
 // Accept delay of each server-side connection on port 8080: from the
 // handshake's completion (the child socket going SYN_RECV -> ESTABLISHED) to
@@ -47,5 +48,17 @@ tracepoint:raw_syscalls:sys_enter
 {
   @sys_seen = 1;
   if (@ready) { @sys[args->id] = count(); }
+}
+// The end of the trace: bpftrace runs with -c, and its command (local-inner.sh's
+// grep, run under a name of its own, $3) exits 0 once it reads the line
+// "stop", written after the load; bpftrace then ends as if exit() had been
+// called. This line shows the trace ran up to that point and did not end
+// before (item 6lqxi5). Matched by name, not by pid == cpid: in the
+// container's pid namespace `pid` fails for other namespaces' tasks, with a
+// warning in the trace.
+tracepoint:syscalls:sys_enter_exit_group
+/strncmp(comm, str($3), 16) == 0 && args.error_code == 0/
+{
+  printf("stopped\n");
 }
 END { clear(@est); clear(@ready); clear(@sys_seen); }

@@ -149,3 +149,46 @@ ends the wait for its attach with that status. `PERF=1 bench/arena/local.sh`
 then ran one round end to end at commit 648ef2e plus this change, with every
 check passing and a profile of each lsrv-arena sample. Its figures are not
 recorded: the change touches only the tracers' handling.
+
+## The tracers' ends without signals (item 6lqxi5, 2026-11-20)
+
+This replaces the SIGINT handling of the section above. A SIGINT could reach
+perf record before the load was profiled, or before perf installed its
+handler (a background job of a non-interactive dash starts with SIGINT
+ignored, so `wait` would hang), and a `kill` by pid could hit another
+process once the tool had exited and been reaped. `local-inner.sh` now
+signals neither tool:
+
+- perf record runs with `-D -1 --control fifo:CTL,ACK` under
+  start-polled.sh's `start_controlled`: the load starts only after perf
+  answered `enable` with `ack` (perf-record(1)); after the load it is sent
+  `stop`, must answer `ack` and exit 0. Its exit at any point before ends
+  the wait with its status, from a line its wrapper writes to ACK.
+- bpftrace runs with `-c "grep -qx stop FIFO"` and ends, printing its maps,
+  when that grep reads the line `stop` the script writes after the load
+  (bpftrace(8), `-c`). grep runs under a name of its own (a symlink named
+  after the run's `mktemp` directory, unique by its random suffix), and
+  `trace.bt` prints `stopped` when a process of that name calls
+  `exit_group(0)`, which grep -qx does only on a match; the sample requires
+  the line besides bpftrace's exit 0, so a trace that ended before the stop,
+  a grep that ended any other way, or a dropped event fails it. Matching `pid == cpid`
+  instead printed `get_ns_current_pid_tgid` warnings (EINVAL) into the
+  trace for other pid namespaces' tasks.
+
+Measured on 2026-11-20 in the same container (bpftrace 0.23.2, perf
+6.12.117), by hand and in the run below:
+
+| tool and case | result |
+|---|---|
+| perf record -D -1 --control, `enable` | `ack` |
+| perf record, `stop` while recording | `ack`, exit 0, data written |
+| perf record -D -1 --control, no such PID | exit 244 at once |
+| bpftrace -c, its command ends | END runs, maps printed, exit 0 |
+| bpftrace -c, a line printed at the exit of `cpid` (`sched_process_exit`; not kept, see above) | printed before END, 40 of 40 runs |
+| bpftrace -c, the line printed at `exit_group(0)` of the named grep | printed before END: 1 of 1 by hand, 6 of 6 samples of the run below |
+| bpftrace -c, its command fails (grep of a missing file, exit 2) | bpftrace exits 0; no `exit_group(0)` line |
+
+`PERF=1 bench/arena/local.sh` then ran one round end to end at commit
+323477d plus this change, with every check passing and a profile of each
+lsrv-arena sample (8K and 9K samples). Its figures are not recorded: the
+change touches only the tracers' handling.
