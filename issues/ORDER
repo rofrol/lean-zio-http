@@ -5,6 +5,7 @@ alblg3 Decide what to do with the dependency assumptions that rest on upstream c
 gaf5x5 Decide whether a pipelined batch is bounded by maxResponseBytes (65,536) or by the transport's out_cap (8,192)
 gihgde Check zig/src/pg.c's model of a query result's Lean allocation cost against the runtime's real block sizes
 rvi53e Derive or check the memory bounds docs/memory.md repeats (163,880, 1,024, 81,920 bytes) once jexowc decides the allocator dependency
+5f54l4 Should H1Adapter decode chunked request bodies, so HttpArena's baseline and limited-conn run with their whole request mix?
 
 ## Proposed
 
@@ -19,7 +20,6 @@ b3lisr Retire or record the local workarounds in the HttpArena build: the Rosett
 dhosug Decide whether bench/mdlinks keeps its own CommonMark subset parser or uses a CommonMark library
 2mb4o4 Decide whether to propose cheaper head parsing to leanprover/lean4's Std.Http, or accept H1's parse cost
 ov7ele Decide how to report Zig's "failed command:" line printed for a passing test step (an upstream bug)
-5f54l4 Should H1Adapter decode chunked request bodies, so HttpArena's baseline and limited-conn run with their whole request mix?
 qipzi4 Confirm bench/fairness's probe maxima on an idle host or on Linux?
 63cdgt Open the zio PR with the accept documentation wording asked for in issue 937
 cmb7vk Stop discarding bpftrace's and perf's exit statuses in bench/arena/local-inner.sh
