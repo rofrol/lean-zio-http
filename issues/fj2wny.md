@@ -1,0 +1,8 @@
+Decide whether to run the pool's peek against NetPoll A/B on the VPS
+
+Found by item g62mok (docs/reports/postgresql-throughput.md, section "2026-11-20: the peeking receive against NetPoll in the Linux container"; docs/reports/dependency-assumptions.md, point 4). In OrbStack's Linux VM on the shared M1 (aarch64, AF_UNIX to the cluster, host load average 18 to 21), lsrv-db with the pool's one-byte MSG_PEEK receive (zig/src/pg.zig, `Slot.rpoll`) and with `ev.NetPoll.init(self.fd, .recv)` cost the same CPU per request within noise on both backends: medians 23.25 against 23.25 µs (epoll) and 22.8 against 22.55 µs (io_uring) at c=64, 37.15 against 36.5 and 36.5 against 37.35 at c=1, ten interleaved rounds each; neither build won a clear majority except the peek at c=1 on io_uring. The macOS result (NetPoll about a quarter more CPU at c=64) did not reproduce on Linux, so on the evidence so far the probe matters only on kqueue and the peek is not worse on Linux. Production is unchanged. Not measured: the VPS (x86-64, the production kernel and backend), bare metal, a TCP connection to the database.
+
+The coordinating session's 2026-11-20 ruling (item g62mok) asked whether to add the VPS A/B afterwards; that needs the owner's go for load on the production host.
+
+Question: Is a VPS A/B of the pool's readiness probe worth the production host's load, given the container showed no difference?
+Options: run it on the VPS (owner's go; the same four builds and rounds as the container run, through bench/arena/run.sh db's way of running on the VPS) | keep the peek everywhere and record the VPS as unmeasured (no further work) | revisit only if a change of zio or of the deployment's backend makes the probe's cost relevant
