@@ -1,11 +1,12 @@
 ## Next, in order
 
+auhogk Explain the map_update_elem EEXIST warning at trace.bt's accept histogram
+
 ## Proposed
 
 q2g4am Act on leanprover/lean4's answers to the Std.Http questions 16522 and 16523
 o3rltf Decide whether bytes pipelined behind a request that got 100 Continue start their head budget at their receive
 oe6mbs Quiet bench/arena/local.sh's tar warnings and "Terminated" lines, and name where its HttpArena checkout lives
-auhogk Explain the map_update_elem EEXIST warning at trace.bt's accept histogram
 
 ## Needs a decision
 
