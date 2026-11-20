@@ -25,3 +25,5 @@ first insert from two CPUs at once, at the pinned 0.23.2) and, if counts
 can be lost, change trace.bt so they cannot, or make local-inner.sh fail
 a sample whose trace holds a helper warning; (b) record it as a known
 limit of the diagnostic in the report.
+
+Approved by the models under the user's delegation of 2026-11-20 to decide the queue (consult round 20261120-201420-8ae4; sol call 47866e82, hydrogen call de487da4), both agreeing: option (b), state in the report that the warning appeared and that whether accept counts are lost is unverified; do not change the probes or reject samples on two warnings. Reopen if it recurs in a run the report's conclusions rest on.
