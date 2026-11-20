@@ -12,3 +12,5 @@ Sol and hydrogen (consult round 20261119-075953-d7f4, 2026-11-19) both left this
 Question: Should bench/mdlinks keep its own CommonMark subset parser or use a CommonMark library?
 Options: keep the subset parser, fixing a difference when a document meets it | use goldmark (a Go dependency fetched by check.sh)
 Checked: bench/mdlinks/main.go header lists the known differences; none occurs in today's documents.
+
+Consult round 20261120-155056-df17 (2026-11-20, under the user's delegation to decide the queue): split, so it stays with the owner. sol (421584d0) chose goldmark, fewer silently passing broken links being worth one pinned dependency; hydrogen (69355b88) chose the subset parser, no document hitting a difference and no new check.sh dependency. Adding a dependency is non-trivial under Rule 6.
