@@ -192,12 +192,14 @@ pub const Slot = struct {
     /// Readability: a receive of one byte with MSG_PEEK, which leaves the
     /// bytes to libpq. zio tries a receive first and parks on its kqueue or
     /// epoll registration only when nothing is there; NetPoll would probe
-    /// with poll(2) instead (pinned zio src/ev/sockreg.zig:431-450). The
-    /// server comparison was run on the shared M1 only (GET /db?id=42): there
-    /// NetPoll cost lsrv-db about a quarter more CPU per request at 64
-    /// connections, and poll(2) on an empty AF_UNIX socket about 7 µs against
-    /// a quarter of one for the receive; in the Linux container the two
-    /// syscalls cost about the same and no server comparison was run
+    /// with poll(2) instead (pinned zio src/ev/sockreg.zig:431-450). On
+    /// macOS (the shared M1, GET /db?id=42) NetPoll cost lsrv-db about a
+    /// quarter more CPU per request at 64 connections, and poll(2) on an
+    /// empty AF_UNIX socket about 7 µs against a quarter of one for the
+    /// receive. In a preliminary run in the Linux container (OrbStack on the
+    /// same, loaded M1) the two syscalls cost about the same and the two
+    /// probes' CPU medians per request differed by less than 1 µs on epoll
+    /// and io_uring; the VPS, bare metal and x86-64 were not measured
     /// (docs/reports/dependency-assumptions.md, point 4).
     rpoll: ev.NetRecv = undefined,
     peek: [1]u8 = undefined,

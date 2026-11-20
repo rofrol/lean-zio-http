@@ -115,6 +115,17 @@ comparison was run on Linux (in a container, on bare metal or on x86-64),
 and the M1 comparison used the cluster's Unix socket, not a TCP connection
 to the database.
 
+2026-11-20 (item g62mok): the same server comparison in that container
+(OrbStack, aarch64, the shared M1 under load), on epoll and on io_uring,
+ten interleaved rounds each, did not observe the M1's gap: the medians of
+the server CPU time per request differed by less than 1 µs (at most 2.3%)
+in both directions, 23.25 against 23.25 µs on epoll and 22.8 against
+22.55 µs on io_uring at 64 connections; only at one connection on io_uring
+did one probe win most rounds (the peek, 8 of 10, its median 0.85 µs
+lower). Preliminary (a VM on a loaded host); the
+VPS, bare metal and x86-64 were not measured. The figures are in
+[PostgreSQL measurements](postgresql-throughput.md#2026-11-20-the-peeking-receive-against-netpoll-in-the-linux-container-item-g62mok).
+
 ## 5. `test/retained.c` declares `calloc`, `realloc`, `abort` and `mi_usable_size` (test/retained.c:13-25)
 
 - `abort`: **documented** by the C standard (C11 7.1.4p2): "Provided that

@@ -204,3 +204,84 @@ c=1 35.9 against 37.7 µs and 12,208 against 10,270. One shared, loaded
 machine and one query; the syscall measurements and the limits of this
 result are in
 [What the dependency assumptions rest on](dependency-assumptions.md), point 4.
+
+## 2026-11-20: the peeking receive against NetPoll in the Linux container (item g62mok)
+
+The previous section's comparison, rerun on Linux; it replaces nothing (the
+M1 result stands for macOS). Preliminary: the container is OrbStack's VM
+(kernel 7.2.12, aarch64, 10 CPUs) on the same shared M1, whose one-minute
+load average was 18 to 21 before and after the run; the VM's own was 4.7 to
+11.0 during it. Commit 4b2e1a4, zio f8ca47367765, `linux/Dockerfile`'s
+image (Zig 0.17.1, Lean nightly-2026-11-19, PostgreSQL 17 from Debian's
+archive), the container's seccomp filter off for both backends (io_uring
+needs it). `lsrv-db` built four times in the container, "peek" as it is and
+"NetPoll" with `Slot.rpoll` declared as `ev.NetPoll` and armed with
+`ev.NetPoll.init(self.fd, .recv)` (nothing else changed), each on epoll and
+on io_uring (`LSRV_LINUX_BACKEND`). Per backend both processes ran for the
+whole session against one private cluster (`bench/lib.sh`, Unix socket),
+8 loops with 4 connections each; only one received load at a time. `GET
+/db?id=42` with bench/load, each sample ending after the same number of
+completed requests as in `bench/dbpairs.sh` (30,000 at c=1, 200,000 at
+c=64), after one unprinted warm-up of each server; ten rounds, c=1 before
+c=64, the server named first ran first. Requests per second and server CPU
+time per request (µs, from `/proc` before and after; the clock tick, 10 ms,
+is about 0.3 µs per request at c=1 and 0.05 at c=64). The script was not
+kept in the repository.
+
+epoll:
+
+| round, first | c=1 peek | c=1 NetPoll | c=64 peek | c=64 NetPoll |
+|---|---|---|---|---|
+| 1, peek | 8,884; 39.3 | 8,555; 40.7 | 84,143; 22.4 | 83,072; 23.5 |
+| 2, NetPoll | 9,376; 38.3 | 9,632; 36.7 | 80,076; 23.6 | 82,828; 22.9 |
+| 3, peek | 9,632; 36.7 | 9,725; 36.3 | 83,210; 23.2 | 80,391; 23.4 |
+| 4, NetPoll | 9,675; 36.7 | 9,522; 36.3 | 83,567; 22.8 | 66,066; 25.5 |
+| 5, peek | 9,544; 37.0 | 7,509; 46.7 | 79,684; 23.4 | 77,624; 23.8 |
+| 6, NetPoll | 8,555; 41.7 | 8,138; 42.3 | 81,244; 23.3 | 82,283; 23.1 |
+| 7, peek | 9,106; 38.3 | 10,370; 35.0 | 84,963; 22.5 | 84,904; 22.3 |
+| 8, NetPoll | 10,160; 35.0 | 9,994; 36.0 | 84,277; 22.6 | 91,256; 22.0 |
+| 9, peek | 10,228; 35.3 | 8,891; 39.7 | 80,297; 23.6 | 87,110; 22.9 |
+| 10, NetPoll | 9,410; 37.3 | 9,740; 36.0 | 60,588; 28.6 | 69,279; 26.3 |
+
+io_uring:
+
+| round, first | c=1 peek | c=1 NetPoll | c=64 peek | c=64 NetPoll |
+|---|---|---|---|---|
+| 1, peek | 7,917; 44.3 | 8,789; 41.0 | 83,368; 23.6 | 87,952; 22.4 |
+| 2, NetPoll | 9,807; 36.7 | 9,142; 39.0 | 91,069; 21.9 | 87,309; 22.1 |
+| 3, peek | 10,193; 35.3 | 10,081; 36.0 | 86,995; 23.0 | 90,260; 22.5 |
+| 4, NetPoll | 9,877; 36.3 | 9,979; 36.7 | 86,515; 22.6 | 84,848; 22.6 |
+| 5, peek | 10,014; 36.0 | 7,443; 50.3 | 89,224; 22.7 | 84,348; 22.5 |
+| 6, NetPoll | 9,868; 36.3 | 9,643; 37.0 | 88,242; 23.0 | 87,178; 23.3 |
+| 7, peek | 10,263; 35.7 | 9,750; 37.0 | 86,680; 22.9 | 95,744; 21.7 |
+| 8, NetPoll | 9,810; 36.7 | 9,707; 37.0 | 93,814; 21.8 | 88,588; 22.6 |
+| 9, peek | 9,670; 37.3 | 9,762; 37.7 | 90,018; 22.4 | 71,277; 24.8 |
+| 10, NetPoll | 9,038; 39.7 | 8,921; 39.7 | 64,427; 28.0 | 82,069; 23.6 |
+
+Medians of CPU time per request, peek against NetPoll: on epoll 37.15
+against 36.5 µs at c=1 and 23.25 against 23.25 at c=64; on io_uring 36.5
+against 37.35 at c=1 and 22.8 against 22.55 at c=64. The peek cost less CPU
+per request in 5 of 10 rounds on epoll at c=1, 4 of 10 at c=64 (NetPoll in
+the other 6), and on io_uring in 8 of 10 at c=1 (one tie) and 4 of 10 at
+c=64 (one tie); there the peek's wins were by 0.3 to 2.3 µs (14.3 in round 5) and
+NetPoll's one, round 1, by 3.3, against a clock tick of about 0.3 µs. Requests
+per second, medians, peek against NetPoll: epoll 9,477 against 9,577 (c=1)
+and 82,227 against 82,556 (c=64); io_uring 9,839 against 9,675 and 87,619
+against 87,244. Some samples fell well below their build's median
+throughput at that backend and concurrency: at c=64 epoll round 4's NetPoll
+(20% below), round 10's peek on both backends (26%) and io_uring round 9's
+NetPoll (18%); at c=1 round 5's NetPoll on both backends (22 and 23%). They
+hit either build; leaving out round 10 moves no c=64 CPU median by more
+than 0.2 µs (epoll 23.2 against 23.1, io_uring 22.7 against 22.5).
+
+So in this preliminary run the CPU medians of the two probes differed by
+less than 1 µs per request (2.3% at most, against the smaller median) in
+both directions on both backends, and neither build won a clear majority of
+rounds except the peek at c=1 on io_uring (8 of 10, one tie; its median
+0.85 µs lower, about three clock ticks per request). The M1's quarter more
+CPU for NetPoll at c=64 (previous section) was not observed, which agrees
+with the container's `poll(2)` costing about what the receive costs
+([What the dependency assumptions rest on](dependency-assumptions.md),
+point 4). Ten rounds under this load rule out a difference of that size,
+not a small one hidden by the VM's scheduling noise. Not measured: bare metal, x86-64, the VPS, a TCP connection to
+the database, how often a wait parks.
