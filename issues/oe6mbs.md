@@ -7,3 +7,5 @@ Seen in item fbqrqb's run of `bench/arena/local.sh` on the M1 (2026-11-20, commi
 - No place names where the pinned HttpArena checkout lives on this machine. Item fbqrqb made it at `${XDG_CACHE_HOME:-~/.cache}/lean-zio-http/httparena` (a depth-1 fetch of da3ded60952b), next to the PostgreSQL checkout AGENTS.project.md names; item cmb7vk needs it. Whether to write that location into docs/running.md (with how to make it) is the owner's choice.
 
 Options: add `--warning=no-unknown-keyword` to that extraction; send the supervisor's stderr to the server's log or leave it; document the checkout's location or keep it per run.
+
+Consult round 20261120-183340-59f4 (sol 07e46b10, hydrogen a8d8e1d1): split, so it stays Proposed. sol approves matching the adjacent tar extraction and routing the supervisor's stderr to the server log; hydrogen keeps it as cosmetic, silencing that stderr risking hidden crashes.
