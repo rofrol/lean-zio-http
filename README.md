@@ -122,6 +122,7 @@ naming its date and what it measured):
 - [The dusty failure at 256 connections](docs/reports/dusty-256-connections.md)
 - [dusty on the real zio](docs/reports/dusty-real-zio.md)
 - [Why the 7-byte receive row of Memory grew](docs/reports/chunked-receive-memory.md)
+- [A query result's charged cost against the runtime's real blocks](docs/reports/result-cost-blocks.md)
 
 Decisions: decision D1 (the HTTP/1.1 parser) is recorded in ekklesiai.org,
 in its decision record 0001
