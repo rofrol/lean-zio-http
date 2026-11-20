@@ -7,3 +7,5 @@ What the work is, after jexowc: give each bound one source (a Lean definition th
 Owner's choice: check the numbers in docs/memory.md mechanically, or remove them from the document in favour of naming the definitions.
 
 Decided 2026-11-19 by the coordinating session with sol and hydrogen (consult round 20261119-131820-9a89; calls 2457b2df, db84fdb7) under the user's delegation to decide the next items with the models: stays Proposed until alblg3 decides the allocator dependency.
+
+Approved by the models under the user's delegation of 2026-11-20 to decide the queue (consult round 20261120-155056-df17; sol call 421584d0, hydrogen call 69355b88), both agreeing, after alblg3: check the numbers mechanically (or name their definitions instead of repeating them), keeping the Go agreement check.
