@@ -11,5 +11,5 @@ Options considered:
 Recommendation: 1, unless "one system call per batch" is the property wanted.
 
 Decided 2026-11-19 by the coordinating session with sol and hydrogen (consult round 20261119-131820-9a89; calls 2457b2df, db84fdb7) under the user's delegation to decide the next items with the models: needs the owner (a contract choice).
-Question: Is a pipelined batch bounded by maxResponseBytes (65,536, proved today) or by the transport's out_cap (8,192)?
-Options: keep maxResponseBytes (recommended by sol) | bound by out_cap with a cross-language check
+
+Decided by the models under the user's delegation of 2026-11-20 to decide the queue (consult round 20261120-155056-df17; sol call 421584d0, hydrogen call 69355b88), both agreeing: keep maxResponseBytes (65,536) as the bound of a pipelined batch, the proved bound; document that it is separate from the 64-request cap (umtm4l, 927698a) and from the transport's 8,192-byte out_cap, after checking the code still matches.
