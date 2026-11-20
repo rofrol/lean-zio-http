@@ -44,6 +44,10 @@ bench/arena/start-polled-test.sh
 # lake builds the Zig library (extern_lib zsrv in lakefile.lean, ZIG_OPTIMIZE
 # picks its optimization) and links it into the servers.
 lake build
+# lakefile.lean's zsrvTarget on fixture sysroots (item ciuzai): on Linux a
+# toolchain without lib/glibc/libc.so fails the build instead of building zig/
+# for the host's glibc.
+lake script run zsrv-target-check
 (cd bench/check && go build -o check .)
 (cd bench/boundary && go build -o boundary .)
 (cd bench/dbcheck && go build -o dbcheck .)

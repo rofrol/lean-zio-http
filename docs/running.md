@@ -19,7 +19,9 @@ validation, `100-continue`, the response checks, and connections through
 `Conn.step`, and that `zig/src/pg.c`'s result bound equals
 `Query.maxResultBytes`), the module boundary check (`lsrv-arch`), a check that `zig/`
 built for x86_64 Linux at the Lean toolchain's glibc references no libc
-symbol that glibc lacks (and that the same build for glibc 2.41 does), the parser comparison
+symbol that glibc lacks (and that the same build for glibc 2.41 does), that
+on Linux a Lean toolchain without `lib/glibc/libc.so` fails the build
+(`lake script run zsrv-target-check`), the parser comparison
 (`lsrv-compare`), the boundary tests and the
 end-to-end checks (the last two against both parsers), then measures both
 parsers' cost per request in isolation (`lsrv-bench`, which prints each row

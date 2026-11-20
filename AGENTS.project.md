@@ -152,7 +152,7 @@ references in those comments: drop a contract that upstream now documents
 (cite the passage instead), and bring one that no longer holds to the
 owner. The repository's checks cover them only in part (serve_test.zig's
 LoopGroup checks, `pg.ownLoop`, the `#error` in `test/retained.c`, and
-`zsrvTarget`'s error when `libc.so` defines no version; a toolchain that
-moves or drops `lib/glibc/libc.so` is not detected: `zsrvTarget` then
-builds for the host). `zig/build.zig.zon` points here beside the zio pin;
+`zsrvTarget`'s errors, on Linux, when `lib/glibc/libc.so` is missing or
+defines no version, which `lake script run zsrv-target-check` in
+`./check.sh` tests). `zig/build.zig.zon` points here beside the zio pin;
 `lean-toolchain` cannot hold a comment.

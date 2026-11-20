@@ -51,7 +51,7 @@ ReleaseSafe by default) and Lake links `libzsrv.a` into every executable of
 the requiring package. On Linux it builds for the glibc the Lean toolchain
 links programs against (`lib/glibc/libc.so` of the toolchain, 2.26 for the
 pinned one), not the host's, so the archive calls no libc function that glibc
-lacks. An executable that runs the transport also links
+lacks; a toolchain without that file fails the build. An executable that runs the transport also links
 libpq: give it `moreLinkArgs := #["-lpq"]` and put `pg_config --libdir` on
 `LIBRARY_PATH`. Its composition root imports `Server.Transport`, one adapter
 (`Server.H1Adapter`) and the application, and declares

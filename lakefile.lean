@@ -49,10 +49,14 @@ def glibcVersion (libc : ByteArray) : Option String := Id.run do
       i := i + 1
   return best.map fun (m, p) => if p == 0 then s!"2.{m}" else s!"2.{m}.{p}"
 
-/-- The `zig build -Dtarget` of `libzsrv.a`: the host's (`none`, Zig's native
-target), except under a Lean toolchain that ships the glibc its programs link
-against (`lib/glibc/libc.so`, Linux), where it is the host's architecture on
-Linux with that glibc. Zig's std calls a libc function only when the target's
+/-- The `zig build -Dtarget` of `libzsrv.a`, given whether Lake runs on Linux
+(`linux`, `System.Platform.isLinux`; a parameter so the `zsrv-target-check`
+script can test both cases) and the Lean toolchain's sysroot. Elsewhere
+(macOS) it is the host's (`none`, Zig's native target). On Linux it is the
+host's architecture on Linux with the glibc the toolchain ships, which its
+programs link against (`lib/glibc/libc.so`); a toolchain without that file
+fails the build, naming the path and this contract, rather than building for
+the host's glibc. Zig's std calls a libc function only when the target's
 glibc has it, so the archive then references no symbol the linker Lean runs
 cannot resolve; with the host's newer glibc it references `copy_file_range`,
 `statx`, `execveat` and `arc4random_buf`, which glibc 2.26 (Lean's
@@ -65,9 +69,13 @@ not on documentation; the Reference Manual documents only the supported floor
 point 6. It is a supported-subset contract, not an upstream guarantee
 (approved 2026-11-20, item alblg3; `AGENTS.project.md`, "Supported-subset
 contracts"); recheck at each update of the Lean toolchain. -/
-def zsrvTarget (sysroot : FilePath) : IO (Option String) := do
+def zsrvTarget (linux : Bool) (sysroot : FilePath) : IO (Option String) := do
+  unless linux do return none
   let libc := sysroot / "lib" / "glibc" / "libc.so"
-  unless ← libc.pathExists do return none
+  unless ← libc.pathExists do
+    throw <| IO.userError s!"{libc} does not exist: on Linux zsrv is built for the glibc the Lean \
+      toolchain ships there (lakefile.lean, zsrvTarget; AGENTS.project.md, \
+      \"Supported-subset contracts\"); recheck that contract against this toolchain"
   match glibcVersion (← IO.FS.readBinFile libc) with
   | some v => return some s!"native-linux-gnu.{v}"
   | none => throw <| IO.userError s!"{libc} defines no GLIBC_2.* version"
@@ -97,7 +105,7 @@ extern_lib zsrv (pkg) := do
   let backend := (← IO.getEnv "LSRV_LINUX_BACKEND").getD "epoll"
   unless backend == "epoll" || backend == "io_uring" do
     error s!"LSRV_LINUX_BACKEND is {backend}: it must be epoll or io_uring"
-  let zigTarget ← zsrvTarget (← getLeanSysroot)
+  let zigTarget ← zsrvTarget System.Platform.isLinux (← getLeanSysroot)
   let zigVersion := (← captureProc { cmd := "zig", args := #["version"] }).trimAscii.toString
   let pqVersion := (← captureProc { cmd := "pg_config", args := #["--version"] }).trimAscii.toString
   -- Every Lean header (lean.h includes config.h, version.h and mimalloc.h),
@@ -119,6 +127,41 @@ extern_lib zsrv (pkg) := do
                      s!"-Dpq-include={pqInclude}", "--prefix", (pkg.staticLibDir.parent.getD pkg.dir).toString,
                      "--prefix-lib-dir", pkg.staticLibDir.fileName.getD "lib"] ++
                    (zigTarget.map (#[s!"-Dtarget={·}"])).getD #[] }
+
+/-- `zsrvTarget` on fixture sysroots (`lake script run zsrv-target-check`, run by
+check.sh): on Linux, a sysroot without `lib/glibc/libc.so` fails naming that
+path and the contract, one whose `libc.so` defines no `GLIBC_2.*` version fails
+naming it, and one whose `libc.so` defines `GLIBC_2.26` gives
+`native-linux-gnu.2.26`; elsewhere each gives the host's target. -/
+script «zsrv-target-check» do
+  IO.FS.withTempDir fun dir => do
+    let fail (msg : String) : IO UInt32 := do IO.eprintln s!"zsrv-target-check: {msg}"; return 1
+    -- A sysroot whose `lib/glibc/libc.so` holds `contents`, or none.
+    let sysroot (name : String) (contents : Option String) : IO FilePath := do
+      let s := dir / name
+      IO.FS.createDirAll (s / "lib" / "glibc")
+      if let some c := contents then IO.FS.writeBinFile (s / "lib" / "glibc" / "libc.so") c.toUTF8
+      return s
+    let bare ← sysroot "bare" none
+    let unversioned ← sysroot "unversioned" (some "\x00GLIBC_PRIVATE\x00")
+    let shipped ← sysroot "shipped" (some "\x00GLIBC_2.17\x00GLIBC_2.26\x00")
+    -- Each Linux failure: the sysroot, and what its message must start with and contain.
+    let libc (s : FilePath) := s / "lib" / "glibc" / "libc.so"
+    for (s, start, part) in [(bare, s!"{libc bare} does not exist", "\"Supported-subset contracts\""),
+        (unversioned, s!"{libc unversioned} defines no GLIBC_2.* version", "")] do
+      match ← (zsrvTarget true s).toBaseIO with
+      | .ok t => return ← fail s!"on Linux with {s} it gave {t} instead of failing"
+      | .error e =>
+        let m := toString e
+        unless m.startsWith start && (part.isEmpty || (m.splitOn part).length > 1) do
+          return ← fail s!"on Linux with {s} it failed with: {m}"
+    let t ← zsrvTarget true shipped
+    unless t == some "native-linux-gnu.2.26" do return ← fail s!"on Linux with glibc 2.26 it gave {t}"
+    for s in [bare, unversioned, shipped] do
+      let t ← zsrvTarget false s
+      unless t.isNone do return ← fail s!"off Linux with {s} it gave {t}"
+    IO.println "zsrv-target-check: ok"
+    return 0
 
 -- The contracts: Query (database queries and results as values), Wire
 -- (connection <-> protocol adapter) and Handler (adapter <-> application).
