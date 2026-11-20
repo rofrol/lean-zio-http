@@ -11,6 +11,12 @@
 # With a tag fixed across runs, A would run B's base (B retagged it) and
 # build on it. Needs docker and, for a first build of the images, network
 # access; later runs take every layer from docker's build cache.
+#
+# An accepted limit (decided 2026-11-19 by the coordinating session on item
+# amjip6, recorded by item fbqrqb; docs/running.md): when mktemp fails in one
+# run (a broken TMPDIR), that run ends in linux/run-images.sh before it sets
+# the trap that writes `end STATUS`, so the other run waits on its FIFO until
+# the script is interrupted.
 set -eu
 cd "$(dirname "$0")/.."
 

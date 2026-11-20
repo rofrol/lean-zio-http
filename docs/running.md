@@ -157,6 +157,14 @@ read a profile again, build the image as the script does.
 mix them up with a shared tag: each run's containers must report its own
 marker, and each run's tags must be gone after it. Run it for every change
 to how those scripts build or name images; it needs docker.
+Three limits of this are accepted (decided 2026-11-19 by the coordinating
+session on item amjip6): the tag the daemon sets after an interrupted
+export, above, which is never another run's; when `docker image inspect`
+fails because the daemon cannot be reached, the cleanup takes a tag as
+absent and leaves it without a message (`docker image ls '*:run-*'` lists
+it once the daemon is back); and when `mktemp` fails in one of
+`linux/run-images-test.sh`'s two runs (a broken `TMPDIR`), the other run
+waits until the test is interrupted.
 
 `./bench.sh` runs in the same image (it has `bc`, which
 `bench.sh` needs for the CPU per request and lean's share of Go).

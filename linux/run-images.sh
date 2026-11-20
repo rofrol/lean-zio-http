@@ -18,7 +18,12 @@
 # on exit and turns SIGINT and SIGTERM into an exit, so the cleanup runs
 # once, and is not cut short by another signal. A tag the daemon sets after
 # the cleanup, when an interrupt stopped `docker build` as it exported the
-# image, is left behind: `docker image ls '*:run-*'` lists them.
+# image, is left behind: `docker image ls '*:run-*'` lists them. Such a tag
+# is never another run's: no other run uses this run's tag. And when
+# `docker image inspect` fails because the daemon cannot be reached, the
+# cleanup takes the tag as absent and leaves it, without saying so. Both are
+# accepted limits (decided 2026-11-19 by the coordinating session on item
+# amjip6, recorded by item fbqrqb; docs/running.md).
 tmp=
 run_images=
 # run_images_cleanup: removes this run's tags and $tmp; returns 0 when it
